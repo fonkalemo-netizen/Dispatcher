@@ -12,6 +12,7 @@ from pathlib import Path
 
 EXAMPLE_ROOT = Path(__file__).resolve().parent
 PACKAGE_ROOT = EXAMPLE_ROOT.parent
+# Allow running without `pip install -e .` from a checkout.
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
@@ -24,13 +25,14 @@ try:  # noqa: E402
 except ImportError:  # The complete demo can still run through its local fallback.
     ray = None
 
-from demo_source import DemoSourceClient  # noqa: E402
+from demo_source import DemoSourceObserver  # noqa: E402
 from local_backend import LocalThreadBackend  # noqa: E402
 from ray_dispatcher import (  # noqa: E402
     NativeRayBackend,
     RayDispatcher,
     SchedulingPolicy,
     SQLiteCheckpointStore,
+    SQLiteFailureStore,
 )
 
 
@@ -56,11 +58,12 @@ def clear_previous_demo_state() -> None:
     for pattern in ("demo_output/jsonl/*.jsonl", "demo_output/csv/*.csv"):
         for path in EXAMPLE_ROOT.glob(pattern):
             path.unlink()
-    checkpoint = EXAMPLE_ROOT / "demo_state/checkpoints.sqlite3"
-    for suffix in ("", "-wal", "-shm"):
-        path = Path(f"{checkpoint}{suffix}")
-        if path.exists():
-            path.unlink()
+    for stem in ("checkpoints.sqlite3", "failures.sqlite3"):
+        base = EXAMPLE_ROOT / "demo_state" / stem
+        for suffix in ("", "-wal", "-shm"):
+            path = Path(f"{base}{suffix}")
+            if path.exists():
+                path.unlink()
 
 
 async def main() -> None:
@@ -90,31 +93,33 @@ async def main() -> None:
         backend = local_backend
         print("Ray is not installed; using thread fallback")
 
-    source_client = DemoSourceClient(high_offset=25)
-    dispatcher = RayDispatcher.from_worker_directory(
+    source_observer = DemoSourceObserver(high_offset=25)
+    dispatcher = RayDispatcher(
         EXAMPLE_ROOT / "workers",
-        backend,
-        source_client=source_client,
+        ray_backend=backend,
         checkpoint_store=SQLiteCheckpointStore(
             EXAMPLE_ROOT / "demo_state/checkpoints.sqlite3"
+        ),
+        failure_store=SQLiteFailureStore(
+            EXAMPLE_ROOT / "demo_state/failures.sqlite3"
         ),
         policy=SchedulingPolicy(max_in_flight=8),
         listener_interval=0.1,
         trigger_interval=0.05,
         status_interval=0.05,
     )
+    dispatcher.source_observer = source_observer
 
-    await dispatcher.start()
     try:
-        await wait_until_complete(dispatcher)
+        async with dispatcher:
+            await wait_until_complete(dispatcher)
     finally:
-        await dispatcher.stop()
         if local_backend is not None:
             local_backend.close()
         elif ray is not None:
             ray.shutdown()
 
-    print(f"physical Kafka watermark queries: {source_client.kafka_queries}")
+    print(f"physical Kafka watermark queries: {source_observer.kafka_queries}")
     print(
         "shared source fetches: "
         f"{sum(run.kind == 'fetch' for run in dispatcher.state.runs.values())}"

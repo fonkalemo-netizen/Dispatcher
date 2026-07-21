@@ -1,15 +1,24 @@
 # RayDispatcher
 
-`ray_dispatcher.py` 提供三个单次轮询函数及对应的后台循环：
+`ray_dispatcher` 包提供三个单次轮询函数及对应的后台循环：
 
 - `data_listener()`：读取 Kafka 分区 high watermark，或 Postgres 稳定复合游标和窗口 count。
 - `ray_trigger()`：结合 backlog、Handler/输出端并发限制、全局 in-flight 限制和当前可用 CPU，生成 Ray task/Actor 调用。
-- `ray_status()`：非阻塞轮询 ObjectRef，失败重试，整批成功后推进 checkpoint。
+- `ray_status()`：非阻塞轮询 ObjectRef，失败重试；永久失败写入 FailureStore 后跳过区间并推进 checkpoint。
 - `start()` / `stop()`：定时并发运行上述三个循环。
 
-核心调度见 [ray_dispatcher.py](./ray_dispatcher.py)，目录扫描见
-[worker_discovery.py](./worker_discovery.py)，真实数据源查询见
-[source_clients.py](./source_clients.py)，测试位于 `tests/`。调度核心没有强制第三方依赖，生产数据源适配器按需加载对应客户端。
+包布局：
+
+| 模块 | 职责 |
+|---|---|
+| [`ray_dispatcher/dispatcher.py`](./ray_dispatcher/dispatcher.py) | 调度核心 |
+| [`ray_dispatcher/discovery.py`](./ray_dispatcher/discovery.py) | workers 目录扫描 |
+| [`ray_dispatcher/sources.py`](./ray_dispatcher/sources.py) | 固定 SourceObserver（水位/切分） |
+| [`ray_dispatcher/backend.py`](./ray_dispatcher/backend.py) | Native Ray 执行后端 |
+| [`ray_dispatcher/failures.py`](./ray_dispatcher/failures.py) | 永久失败区间落盘 |
+| [`ray_dispatcher/policy.py`](./ray_dispatcher/policy.py) | 渐进式调度策略 |
+
+调度核心没有强制第三方依赖；生产适配器按需加载。可用 `pip install -e .` 安装本包。
 
 ## 推荐方式：扫描 workers 目录
 
@@ -17,13 +26,18 @@
 
 ```text
 app/
-├── main.py
-├── ray_dispatcher.py
-├── source_clients.py
-├── worker_discovery.py
-└── workers/
-    ├── events.py
-    └── orders.py
+├── pyproject.toml
+├── ray_dispatcher/
+│   ├── __init__.py
+│   ├── dispatcher.py
+│   ├── discovery.py
+│   ├── sources.py
+│   └── ...
+├── example_app/
+│   ├── main.py
+│   └── workers/
+│       └── orders.py
+└── tests/
 ```
 
 `workers/events.py` 可以声明多个处理函数。下面两个 Handler 加入同一个共享来源组：Kafka 区间只由
@@ -105,35 +119,27 @@ from pathlib import Path
 
 import ray
 
-from ray_dispatcher import (
-    NativeRayBackend,
-    RayDispatcher,
-    SchedulingPolicy,
-    SQLiteCheckpointStore,
-)
+from ray_dispatcher import RayDispatcher, SchedulingPolicy, SQLiteCheckpointStore, SQLiteFailureStore
 
 
 async def main():
     ray.init()
-    dispatcher = RayDispatcher.from_worker_directory(
+    async with RayDispatcher(
         Path(__file__).parent / "workers",
-        ray_backend=NativeRayBackend(ray),
         checkpoint_store=SQLiteCheckpointStore("dispatcher-checkpoints.sqlite3"),
+        failure_store=SQLiteFailureStore("dispatcher-failures.sqlite3"),
         policy=SchedulingPolicy(max_in_flight=64),
-    )
-    await dispatcher.start()
-    try:
+    ) as dispatcher:
         await asyncio.Event().wait()
-    finally:
-        await dispatcher.stop()
 
 
 asyncio.run(main())
 ```
 
 启动过程为：扫描所有 `workers/*.py` → 展开每个模块的 `HANDLERS` → 每个普通函数自动包装成
-独立 Ray remote function → 汇总并去重所有 Kafka topic/Postgres table。默认使用内建
-`KafkaPostgresSourceClient` 观察水位（也可传入自定义 `source_client=`）。之后每次 `data_listener()` 都会主动：
+独立 Ray remote function → 汇总并去重所有 Kafka topic/Postgres table。`ray_backend` 为关键字参数且可省略；
+水位观察固定为包内 `SourceObserver`。也可用 `async with dispatcher` 代替手动 `start()` / `stop()`。
+之后每次 `data_listener()` 都会主动：
 
 - 调用 Kafka `list_topics()` 发现分区；
 - 对每个分区调用 `get_watermark_offsets(..., cached=False)` 获取实时 low/high offset；
@@ -141,7 +147,7 @@ asyncio.run(main())
 - 对 Postgres 查询最大 `(timestamp_column, primary_key_column)`，并统计游标窗口内的 count。
 
 这里的 offset 不是 worker 传进来的。worker 只负责声明自己关注哪些来源，实际 offset 由
-`KafkaPostgresSourceClient` 主动向 broker 查询，然后由 Dispatcher 切分并传给 worker。
+`SourceObserver` 主动向 broker 查询，然后由 Dispatcher 切分并传给 worker。
 
 生产数据源实现需要可选依赖：
 
@@ -175,7 +181,8 @@ pip install ray confluent-kafka asyncpg
 ```
 
 Handler 业务失败重试会复用原 fetch ObjectRef，不会再次读取 Kafka。fetch 自身失败则按
-`fetch_max_retries` 重试；永久失败会跳过该区间、推进 checkpoint，并解除来源阻塞。成功提交 checkpoint 后 Dispatcher 会释放本批
+`fetch_max_retries` 重试；永久失败会先写入 `FailureStore`（区间元信息 + 可物化的 fetch payload），
+再跳过该区间、推进 checkpoint，并解除来源阻塞。成功提交 checkpoint 后 Dispatcher 会释放本批
 ObjectRef，避免历史数据长期占用 Object Store。
 
 同组 Handler 必须声明同一个物理来源、`source_id`、`fetcher_id`、首次 offset 和 retention 策略；
@@ -200,6 +207,7 @@ from ray_dispatcher import (
     RayDispatcher,
     SchedulingPolicy,
     SQLiteCheckpointStore,
+    SQLiteFailureStore,
     WorkerSpec,
 )
 
@@ -291,19 +299,15 @@ worker = WorkerSpec(
 
 async def main():
     ray.init()
-    dispatcher = RayDispatcher(
+    async with RayDispatcher(
         workers=(worker,),
-        ray_backend=NativeRayBackend(ray),
-        # source_client 可省略；默认 KafkaPostgresSourceClient
+        # ray_backend 可省略；默认 NativeRayBackend。水位观察固定为 SourceObserver
         checkpoint_store=SQLiteCheckpointStore("dispatcher-checkpoints.sqlite3"),
+        failure_store=SQLiteFailureStore("dispatcher-failures.sqlite3"),
         policy=SchedulingPolicy(max_in_flight=64),
-        operation_timeout=30,                 # 外部 I/O 最长等待时间
-    )
-    await dispatcher.start()
-    try:
+        operation_timeout=30,
+    ) as dispatcher:
         await asyncio.Event().wait()
-    finally:
-        await dispatcher.stop()
 
 
 asyncio.run(main())
@@ -324,23 +328,15 @@ Postgres、ClickHouse、对象存储或调用后续计算。建议 `persist_even
 `worker(startoffset, endoffset, n, task_index, partition, topic, dispatch_id)`，在
 `WorkerSpec` 上设置 `args_builder=offset_kwargs_builder` 即可。
 
-## SourceClient 契约
+## SourceObserver（固定水位观察）
 
-```python
-class MySourceClient:
-    async def kafka_watermarks(self, source):
-        # 每个 partition 返回 (low_watermark, high_watermark)
-        # high 是下一个可读 offset，不是最后一条消息的 offset。
-        return {0: (100, 180), 1: (50, 75)}
+水位观察与 Postgres 区间规划由包内固定的 `SourceObserver` 完成，不是可插拔扩展点；业务 Handler /
+`data_fetcher` 负责读写真实数据。`SourceObserver` 会：
 
-    async def postgres_high_watermark(self, source):
-        # 使用数据库侧查询得到当前稳定上界，返回 PostgresCursor。
-        ...
-
-    async def postgres_count(self, source, start_exclusive, end_inclusive):
-        # 只用于估算 task 数，处理窗口为 start < (updated_at, id) <= end。
-        ...
-```
+1. 查询 Kafka 分区 low/high watermark；
+2. 查询 Postgres 稳定上界游标，并统计窗口 count；
+3. 在数据库内按 `(timestamp, primary_key)` 排序，为最多 `n × batch_size` 行生成有序且不重叠的
+   复合游标范围（每个 task 处理自己的 `(start, end]`）。
 
 Postgres 推荐查询形式（表名和列名只能来自受信配置，不能作为 SQL 参数）：
 
@@ -356,10 +352,7 @@ WHERE (updated_at, id) > ($1, $2)
   AND (updated_at, id) <= ($3, $4);
 ```
 
-生产 SourceClient 会在数据库内按 `(updated_at, primary_key)` 排序，为最多
-`n × batch_size` 行生成有序且不重叠的复合游标范围；每个 task 处理自己的 `(start, end]`。
-这避免了 Python 进程随机 hash 导致的重叠或漏行。未实现 `postgres_ranges()` 的自定义
-SourceClient 会安全降级为单 task。单纯比较两次全表 count 会被 update/delete 抵消，因此实现没有采用该方式。
+单纯比较两次全表 count 会被 update/delete 抵消，因此实现没有采用该方式。
 
 ## Task 还是 Actor
 
@@ -368,17 +361,6 @@ SourceClient 会安全降级为单 task。单纯比较两次全表 count 会被 
   `mode=ExecutionMode.ACTOR, remote_method="process"` 后，每个 Handler 只创建并复用
   **一个** Actor；`max_parallelism` 限制该 Actor 上的 in-flight method 数。
 - 影响正确性的历史状态不能只放 Actor 内存；Actor 重启后必须能从外部 checkpoint/snapshot 恢复。
-
-## SourceClient 做什么
-
-`SourceClient` 是 Dispatcher 的 **水位观察 / 区间规划** 适配层，不是业务 Handler：
-
-- `data_listener` 用它主动查 Kafka low/high 或 Postgres 上界与窗口 count；
-- `ray_trigger` 可选调用 `postgres_ranges` 切稳定任务区间；
-- 真正读消息、写下游仍由 `data_fetcher` / Handler 完成。
-
-构造 `RayDispatcher` 时一般不用传：默认创建并托管 `KafkaPostgresSourceClient`，
-`stop()` 时自动 `close()`。测试或 demo 仍可通过 `source_client=` 注入替身。
 
 ## 状态、失败与一致性
 
@@ -390,10 +372,17 @@ SourceClient 会安全降级为单 task。单纯比较两次全表 count 会被 
 - `state.refs`：当前进程已记录的 Ray ref。
 - `dispatcher.snapshot()`：适合日志或监控输出的无敏感连接信息快照。
 
+构造时 `ray_backend` 可省略（默认 `NativeRayBackend`）；水位观察固定使用 `SourceObserver`。
+失败落盘默认 `MemoryFailureStore`，生产可用 `SQLiteFailureStore`。测试/demo 可通过赋值
+`dispatcher.source_observer` 替换观察器（鸭子类型），不作为正式扩展 API。
+
 调度排序为渐进字典序：静态 priority → backlog 最多 → 最慢（积压耗时）→ 等待最久；
-然后再检查 slot / CPU / 输出并发。checkpoint 在一批全部成功时推进；永久失败时同样推进到
-`batch.end`（跳过毒区间）并清除 `active_batch_id`，来源可继续往后调度。Kafka retention gap
-默认抛错，也可显式设置 `retention_policy="reset_to_earliest"`。
+然后再检查 slot / CPU / 输出并发。checkpoint 在一批全部成功时推进；永久失败时先写入
+`FailureStore`（区间、错误摘要；共享模式还会尽量物化 fetch payload），再推进到
+`batch.end`（跳过毒区间）并清除 `active_batch_id`，来源可继续往后调度。独立 Handler 模式
+Driver 侧通常没有行数据，此时 `payload` 为空但仍保存完整区间边界便于事后从源重读。
+`retry_failed_batch()` 为兼容保留的空操作。Kafka retention gap 默认抛错，也可显式设置
+`retention_policy="reset_to_earliest"`。
 
 ### Kafka offset 从哪里来、存到哪里
 
@@ -436,8 +425,9 @@ Handler checkpoint 完全一致，再把该值写入新的 `shared:...` key；�
 
 ```bash
 cd outputs
+python3 -m pip install -e .
 python3 -m unittest discover -s tests -v
-python3 -m py_compile ray_dispatcher.py tests/test_ray_dispatcher.py
+python3 -m py_compile ray_dispatcher/*.py tests/test_ray_dispatcher.py
 ```
 
 覆盖：Kafka 增量切分与整批提交、单次 fetch 多 Handler 扇出、Handler 重试复用 ObjectRef、原始 Ray

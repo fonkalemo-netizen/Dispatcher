@@ -1,613 +1,40 @@
-"""A dependency-injected Ray data dispatcher.
-
-The dispatcher owns source watermarks, reservations, Ray references and
-checkpoints.  Kafka ranges are always half-open: [start_offset, end_offset).
-Postgres ranges use a stable composite cursor: (timestamp, primary key).
-
-The module itself has no mandatory third-party dependencies.  Pass
-``NativeRayBackend`` in production (it imports Ray lazily) and provide a
-``SourceClient`` implemented with your Kafka/Postgres clients.
-"""
+"""RayDispatcher: observe sources, schedule work and monitor Ray refs."""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import inspect
-import json
 import math
-import sqlite3
-import threading
 import time
-from dataclasses import dataclass, field
-from datetime import datetime
-from enum import Enum
-from functools import total_ordering
 from pathlib import Path
-from typing import Any, Callable, Literal, Mapping, Protocol, Sequence, Union
+from typing import Any, Callable, Mapping, Sequence, Union
+
+from ray_dispatcher.checkpoint import MemoryCheckpointStore
+from ray_dispatcher.failures import MemoryFailureStore
+from ray_dispatcher.models import (
+    BatchRun,
+    BatchStatus,
+    DispatchRequest,
+    DispatcherState,
+    ExecutionMode,
+    FailureRecord,
+    FailureRunDetail,
+    HandlerSpec,
+    KafkaSource,
+    PostgresCursor,
+    PostgresSource,
+    RunStatus,
+    SourceKind,
+    SourceSpec,
+    SourceState,
+    TaskRun,
+    WorkerSpec,
+)
+from ray_dispatcher.policy import SchedulingPolicy
+from ray_dispatcher.protocols import CheckpointStore, FailureStore, RayBackend
+from ray_dispatcher.sources import SourceObserver
 
-
-class SourceKind(str, Enum):
-    KAFKA = "kafka"
-    POSTGRES = "postgres"
-
-
-class ExecutionMode(str, Enum):
-    TASK = "task"
-    ACTOR = "actor"
-
-
-class RunStatus(str, Enum):
-    SUBMITTED = "submitted"
-    RUNNING = "running"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-
-
-class BatchStatus(str, Enum):
-    RUNNING = "running"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-
-
-@total_ordering
-@dataclass(frozen=True)
-class PostgresCursor:
-    """A deterministic cursor; timestamps must be timezone-aware."""
-
-    timestamp: datetime
-    primary_key: Any
-
-    def __post_init__(self) -> None:
-        if self.timestamp.tzinfo is None:
-            raise ValueError("PostgresCursor.timestamp must be timezone-aware")
-
-    def __lt__(self, other: Any) -> bool:
-        if not isinstance(other, PostgresCursor):
-            return NotImplemented
-        if self.timestamp != other.timestamp:
-            return self.timestamp < other.timestamp
-        try:
-            return self.primary_key < other.primary_key
-        except TypeError as exc:
-            raise TypeError(
-                "Postgres cursor primary keys must preserve one comparable database type"
-            ) from exc
-
-
-@dataclass(frozen=True)
-class KafkaSource:
-    source_id: str
-    brokers: tuple[str, ...]
-    topic: str
-    initial_offset: Literal["latest", "earliest"] = "latest"
-    retention_policy: Literal["error", "reset_to_earliest"] = "error"
-    connection_id: str | None = None
-    kind: SourceKind = field(default=SourceKind.KAFKA, init=False)
-
-
-@dataclass(frozen=True)
-class PostgresSource:
-    source_id: str
-    dsn: str
-    table: str
-    timestamp_column: str
-    primary_key_column: str
-    initial_cursor: PostgresCursor | None = None
-    connection_id: str | None = None
-    kind: SourceKind = field(default=SourceKind.POSTGRES, init=False)
-
-
-SourceSpec = Union[KafkaSource, PostgresSource]
-
-
-@dataclass(frozen=True)
-class OutputSpec:
-    """Serializable output metadata used for routing and sink backpressure.
-
-    ``connection_id`` references external connection configuration; credentials
-    and live client objects must not be placed in this object or DispatchRequest.
-    """
-
-    connection_id: str
-    target: str
-    output_format: str
-    max_parallelism: int = 8
-
-    def __post_init__(self) -> None:
-        if not self.connection_id or not self.target or not self.output_format:
-            raise ValueError("output connection_id, target and output_format are required")
-        if self.max_parallelism < 1:
-            raise ValueError("output max_parallelism must be positive")
-
-
-@dataclass(frozen=True)
-class DispatchRequest:
-    """The single argument passed to a worker by default.
-
-    Production Postgres observers return disjoint ordered composite-cursor
-    ranges. Custom observers without that capability safely use one task for
-    the full window rather than process-dependent Python hash partitioning.
-    """
-
-    dispatch_id: str
-    worker_name: str
-    source_id: str
-    source_kind: SourceKind
-    task_index: int
-    task_count: int
-    partition: int | None = None
-    start_offset: int | None = None
-    end_offset: int | None = None
-    start_cursor: PostgresCursor | None = None
-    end_cursor: PostgresCursor | None = None
-    output_connection_id: str | None = None
-    output_target: str | None = None
-    output_format: str | None = None
-    source_connection_id: str | None = None
-    topic: str | None = None
-    table: str | None = None
-
-    @property
-    def n(self) -> int:
-        return self.task_count
-
-    @property
-    def handler_id(self) -> str:
-        return self.worker_name
-
-
-ArgsBuilder = Callable[[DispatchRequest], tuple[tuple[Any, ...], dict[str, Any]]]
-
-
-def offset_kwargs_builder(request: DispatchRequest) -> tuple[tuple[Any, ...], dict[str, Any]]:
-    """Compatibility builder for workers accepting startoffset/endoffset/n."""
-
-    return (), {
-        "startoffset": request.start_offset,
-        "endoffset": request.end_offset,
-        "n": request.task_count,
-        "task_index": request.task_index,
-        "partition": request.partition,
-        "topic": request.topic,
-        "dispatch_id": request.dispatch_id,
-    }
-
-
-@dataclass(frozen=True)
-class HandlerSpec:
-    """One independently scheduled processing function.
-
-    A Python module may export many handlers. By default each owns independent
-    source state. Handlers opting into one shared_source_group share source
-    fetches/checkpoints while retaining independent retries and output limits.
-    """
-
-    name: str
-    worker: Any
-    sources: tuple[SourceSpec, ...]
-    mode: ExecutionMode = ExecutionMode.TASK
-    remote_method: str | None = None
-    max_parallelism: int = 4
-    batch_size: int = 10_000
-    cpus_per_task: float = 1.0
-    max_retries: int = 2
-    cache_history: bool = False
-    priority: int = 0
-    args_builder: ArgsBuilder | None = None
-    output: OutputSpec | None = None
-    shared_source_group: str | None = None
-    data_fetcher: Any | None = None
-    fetcher_id: str | None = None
-    fetch_cpus: float = 0.25
-    fetch_max_retries: int = 2
-
-    def __post_init__(self) -> None:
-        if not self.name:
-            raise ValueError("worker name cannot be empty")
-        if self.max_parallelism < 1 or self.batch_size < 1:
-            raise ValueError("max_parallelism and batch_size must be positive")
-        if self.cpus_per_task <= 0:
-            raise ValueError("cpus_per_task must be positive")
-        if self.mode is ExecutionMode.ACTOR and not self.remote_method:
-            raise ValueError("actor workers require remote_method")
-        if self.cache_history and self.mode is not ExecutionMode.ACTOR:
-            raise ValueError("cache_history requires actor mode")
-        if (self.shared_source_group is None) != (self.data_fetcher is None):
-            raise ValueError(
-                "shared_source_group and data_fetcher must be configured together"
-            )
-        if self.shared_source_group is not None:
-            if len(self.sources) != 1:
-                raise ValueError("shared-source handlers must declare exactly one source")
-            if self.args_builder is not None:
-                raise ValueError("shared-source handlers do not support args_builder")
-            if not self.fetcher_id:
-                raise ValueError("shared-source handlers require fetcher_id")
-        if self.fetch_cpus <= 0 or self.fetch_max_retries < 0:
-            raise ValueError("fetch_cpus must be positive and fetch_max_retries non-negative")
-
-    @property
-    def handler_id(self) -> str:
-        return self.name
-
-
-# Backwards-compatible public name for applications using the original API.
-WorkerSpec = HandlerSpec
-
-
-class SourceClient(Protocol):
-    """Watermark observer and range planner for the dispatcher.
-
-    This is not a business Handler and does not read/write payload data for
-    downstream sinks. The dispatcher calls it to:
-
-    1. observe how far each physical source has progressed (Kafka low/high,
-       Postgres upper cursor + window count);
-    2. optionally plan stable Postgres task slices (``postgres_ranges``).
-
-    Handlers / ``data_fetcher`` own actual record I/O. Implementations may keep
-    cached Kafka consumers or Postgres pools keyed by connection.
-    """
-
-    async def kafka_watermarks(
-        self, source: KafkaSource
-    ) -> Mapping[int, tuple[int, int]]:
-        """Return partition -> (low watermark, high watermark)."""
-
-    async def postgres_high_watermark(self, source: PostgresSource) -> PostgresCursor:
-        """Return a stable upper composite cursor using the database clock."""
-
-    async def postgres_count(
-        self,
-        source: PostgresSource,
-        start_exclusive: PostgresCursor,
-        end_inclusive: PostgresCursor,
-    ) -> int:
-        """Count ``start < (timestamp, pk) <= end`` for scheduling only."""
-
-    async def postgres_ranges(
-        self,
-        source: PostgresSource,
-        start_exclusive: PostgresCursor,
-        end_inclusive: PostgresCursor,
-        max_ranges: int,
-        batch_size: int,
-    ) -> Sequence[tuple[PostgresCursor, PostgresCursor, int]]:
-        """Return ordered, disjoint ranges with at most batch_size rows each."""
-
-
-class CheckpointStore(Protocol):
-    async def load(self, key: str) -> int | PostgresCursor | None: ...
-
-    async def save(self, key: str, value: int | PostgresCursor) -> None: ...
-
-
-class MemoryCheckpointStore:
-    """Useful for tests; production should use a durable atomic store."""
-
-    def __init__(self, initial: Mapping[str, int | PostgresCursor] | None = None) -> None:
-        self.values: dict[str, int | PostgresCursor] = dict(initial or {})
-
-    async def load(self, key: str) -> int | PostgresCursor | None:
-        return self.values.get(key)
-
-    async def save(self, key: str, value: int | PostgresCursor) -> None:
-        self.values[key] = value
-
-
-class SQLiteCheckpointStore:
-    """Durable checkpoint store for a single Dispatcher deployment.
-
-    Each operation uses a short SQLite transaction and is moved off the event
-    loop. Postgres primary keys must be JSON-serializable so their original
-    comparison type survives a restart.
-    """
-
-    def __init__(self, path: str | Path) -> None:
-        self.path = str(Path(path).expanduser().resolve())
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
-        self._initialize()
-
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=30.0)
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA synchronous=FULL")
-        return connection
-
-    def _initialize(self) -> None:
-        with self._lock:
-            connection = self._connect()
-            try:
-                connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS ray_dispatcher_checkpoints (
-                        checkpoint_key TEXT PRIMARY KEY,
-                        value_type TEXT NOT NULL,
-                        value_json TEXT NOT NULL,
-                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                    )
-                    """
-                )
-                connection.commit()
-            finally:
-                connection.close()
-
-    @staticmethod
-    def _serialize(value: int | PostgresCursor) -> tuple[str, str]:
-        if isinstance(value, int):
-            return "kafka_offset", json.dumps(value)
-        if isinstance(value, PostgresCursor):
-            try:
-                encoded = json.dumps(
-                    {
-                        "timestamp": value.timestamp.isoformat(),
-                        "primary_key": value.primary_key,
-                    },
-                    ensure_ascii=False,
-                )
-            except TypeError as exc:
-                raise TypeError(
-                    "SQLiteCheckpointStore requires a JSON-serializable "
-                    "Postgres primary key"
-                ) from exc
-            return "postgres_cursor", encoded
-        raise TypeError(f"unsupported checkpoint value: {type(value).__name__}")
-
-    @staticmethod
-    def _deserialize(value_type: str, value_json: str) -> int | PostgresCursor:
-        value = json.loads(value_json)
-        if value_type == "kafka_offset":
-            if not isinstance(value, int):
-                raise TypeError("stored Kafka checkpoint must be an integer")
-            return value
-        if value_type == "postgres_cursor":
-            return PostgresCursor(
-                datetime.fromisoformat(value["timestamp"]), value["primary_key"]
-            )
-        raise ValueError(f"unknown checkpoint value type: {value_type}")
-
-    def _load_sync(self, key: str) -> int | PostgresCursor | None:
-        with self._lock:
-            connection = self._connect()
-            try:
-                row = connection.execute(
-                    "SELECT value_type, value_json "
-                    "FROM ray_dispatcher_checkpoints WHERE checkpoint_key = ?",
-                    (key,),
-                ).fetchone()
-            finally:
-                connection.close()
-        if row is None:
-            return None
-        return self._deserialize(str(row[0]), str(row[1]))
-
-    async def load(self, key: str) -> int | PostgresCursor | None:
-        return await asyncio.to_thread(self._load_sync, key)
-
-    def _save_sync(self, key: str, value: int | PostgresCursor) -> None:
-        value_type, value_json = self._serialize(value)
-        with self._lock:
-            connection = self._connect()
-            try:
-                connection.execute(
-                    """
-                    INSERT INTO ray_dispatcher_checkpoints (
-                        checkpoint_key, value_type, value_json, updated_at
-                    ) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                    ON CONFLICT(checkpoint_key) DO UPDATE SET
-                        value_type = excluded.value_type,
-                        value_json = excluded.value_json,
-                        updated_at = CURRENT_TIMESTAMP
-                    """,
-                    (key, value_type, value_json),
-                )
-                connection.commit()
-            finally:
-                connection.close()
-
-    async def save(self, key: str, value: int | PostgresCursor) -> None:
-        await asyncio.to_thread(self._save_sync, key, value)
-
-
-@dataclass(frozen=True)
-class ExecutionResult:
-    success: bool
-    value: Any = None
-    error: str | None = None
-
-
-class RayBackend(Protocol):
-    def submit(
-        self,
-        worker: WorkerSpec,
-        request: DispatchRequest,
-        data_ref: Any | None = None,
-    ) -> Any: ...
-
-    def submit_fetch(self, worker: WorkerSpec, request: DispatchRequest) -> Any: ...
-
-    def poll(self, refs: Mapping[str, Any]) -> Any: ...
-
-    def available_cpus(self) -> float | None: ...
-
-
-class NativeRayBackend:
-    """Ray adapter supporting remote functions and one cached actor per handler."""
-
-    def __init__(self, ray_module: Any | None = None) -> None:
-        if ray_module is None:
-            try:
-                import ray as ray_module  # type: ignore[import-not-found]
-            except ImportError as exc:
-                raise RuntimeError("Ray is not installed; pass a custom RayBackend") from exc
-        self.ray = ray_module
-        self._actors: dict[str, Any] = {}
-
-    def _actor(self, spec: WorkerSpec) -> Any:
-        # One long-lived actor per handler. Concurrency is limited by
-        # max_parallelism on in-flight method calls; Ray queues extras.
-        actor = self._actors.get(spec.name)
-        if actor is None:
-            actor = spec.worker.options(num_cpus=spec.cpus_per_task).remote()
-            self._actors[spec.name] = actor
-        return actor
-
-    def submit(
-        self,
-        spec: WorkerSpec,
-        request: DispatchRequest,
-        data_ref: Any | None = None,
-    ) -> Any:
-        args, kwargs = spec.args_builder(request) if spec.args_builder else ((request,), {})
-        if data_ref is not None:
-            # Keep the ObjectRef as a top-level Ray argument so Ray resolves the
-            # dependency and all handlers reuse the same object-store value.
-            args = (*args, data_ref)
-        if spec.mode is ExecutionMode.TASK:
-            target = getattr(spec.worker, spec.remote_method) if spec.remote_method else spec.worker
-            return target.options(num_cpus=spec.cpus_per_task).remote(*args, **kwargs)
-
-        actor = self._actor(spec)
-        method = getattr(actor, spec.remote_method or "process")
-        return method.remote(*args, **kwargs)
-
-    def submit_fetch(self, spec: WorkerSpec, request: DispatchRequest) -> Any:
-        if spec.data_fetcher is None:
-            raise ValueError(f"handler {spec.name!r} has no data_fetcher")
-        return spec.data_fetcher.options(
-            num_cpus=spec.fetch_cpus, max_retries=0
-        ).remote(request)
-
-    async def poll(self, refs: Mapping[str, Any]) -> Mapping[str, ExecutionResult]:
-        if not refs:
-            return {}
-        reverse = {ref: run_id for run_id, ref in refs.items()}
-        # asyncio.wait() may return wrapper Tasks instead of the original Ray
-        # ObjectRefs. ray.wait() guarantees that its ready list contains the
-        # original ObjectRefs, so the reverse mapping remains valid.
-        ready, _ = await asyncio.to_thread(
-            self.ray.wait,
-            list(reverse),
-            num_returns=len(reverse),
-            timeout=0,
-        )
-        results: dict[str, ExecutionResult] = {}
-        for ref in ready:
-            run_id = reverse[ref]
-            try:
-                results[run_id] = ExecutionResult(True, value=await ref)
-            except Exception as exc:  # Ray wraps application errors.
-                results[run_id] = ExecutionResult(False, error=f"{type(exc).__name__}: {exc}")
-        return results
-
-    def available_cpus(self) -> float | None:
-        return float(self.ray.available_resources().get("CPU", 0.0))
-
-
-@dataclass
-class SchedulingPolicy:
-    """Progressive backlog-aware policy bounded by capacity checks."""
-
-    max_in_flight: int = 64
-    target_batch_seconds: float = 10.0
-    ewma_alpha: float = 0.3
-
-    def task_count(
-        self,
-        worker: WorkerSpec,
-        backlog: int,
-        free_slots: int,
-        available_cpus: float | None,
-    ) -> int:
-        count = min(worker.max_parallelism, math.ceil(backlog / worker.batch_size), free_slots)
-        if available_cpus is not None:
-            count = min(count, math.floor(available_cpus / worker.cpus_per_task))
-        return max(0, count)
-
-    def priority(
-        self, worker: WorkerSpec, state: "SourceState", now: float
-    ) -> tuple[int, int, float, float]:
-        """Lexicographic schedule key; higher sorts first with ``reverse=True``.
-
-        Order: static handler priority → largest backlog → slowest drain
-        (highest backlog/processing_rate) → longest wait. Capacity (slots,
-        CPU, output limits) is checked after ranking, not folded into the key.
-        """
-
-        throughput = max(state.processing_rate, 1e-6)
-        backlog_seconds = (
-            state.backlog / throughput if state.processing_rate else float(state.backlog)
-        )
-        age = max(0.0, now - state.last_scheduled_at)
-        return (worker.priority, state.backlog, backlog_seconds, age)
-
-
-@dataclass
-class SourceState:
-    key: str
-    worker_name: str
-    source_id: str
-    kind: SourceKind
-    shard: str
-    committed: int | PostgresCursor
-    observed: int | PostgresCursor
-    backlog: int = 0
-    arrival_rate: float = 0.0
-    processing_rate: float = 0.0
-    last_observed_at: float = field(default_factory=time.monotonic)
-    last_scheduled_at: float = field(default_factory=time.monotonic)
-    active_batch_id: str | None = None
-    retention_gap: str | None = None
-    shared_source_group: str | None = None
-
-
-@dataclass
-class TaskRun:
-    run_id: str
-    batch_id: str
-    worker_name: str
-    request: DispatchRequest
-    ref: Any
-    status: RunStatus = RunStatus.SUBMITTED
-    attempt: int = 1
-    submitted_at: float = field(default_factory=time.monotonic)
-    finished_at: float | None = None
-    result: Any = None
-    error: str | None = None
-    kind: Literal["fetch", "handler"] = "handler"
-    data_ref: Any = None
-
-
-@dataclass
-class BatchRun:
-    batch_id: str
-    source_state_key: str
-    worker_name: str
-    start: int | PostgresCursor
-    end: int | PostgresCursor
-    item_count: int
-    run_ids: list[str]
-    status: BatchStatus = BatchStatus.RUNNING
-    started_at: float = field(default_factory=time.monotonic)
-    finished_at: float | None = None
-    shared_source_group: str | None = None
-    worker_names: tuple[str, ...] = ()
-    fetch_run_ids: list[str] = field(default_factory=list)
-    reserved_handler_count: int = 0
-
-
-@dataclass
-class DispatcherState:
-    sources: dict[str, SourceState] = field(default_factory=dict)
-    batches: dict[str, BatchRun] = field(default_factory=dict)
-    runs: dict[str, TaskRun] = field(default_factory=dict)
-    loop_errors: list[str] = field(default_factory=list)
-
-    @property
-    def refs(self) -> dict[str, Any]:
-        return {run_id: run.ref for run_id, run in self.runs.items() if run.ref is not None}
 
 
 class KafkaRetentionGap(RuntimeError):
@@ -623,21 +50,38 @@ class RayDispatcher:
 
     The public methods perform one non-blocking cycle each. ``start`` runs the
     three cycles periodically until ``stop`` is called.
+
+    ``workers`` may be a sequence of ``WorkerSpec`` or a directory path; a path
+    is scanned with :func:`ray_dispatcher.discovery.discover_workers`.
     """
 
     def __init__(
         self,
-        workers: Sequence[WorkerSpec],
-        ray_backend: RayBackend,
+        workers: Union[Sequence[WorkerSpec], str, Path],
         *,
-        source_client: SourceClient | None = None,
+        ray_backend: RayBackend | None = None,
         checkpoint_store: CheckpointStore | None = None,
+        failure_store: FailureStore | None = None,
         policy: SchedulingPolicy | None = None,
         listener_interval: float = 5.0,
         trigger_interval: float = 1.0,
         status_interval: float = 1.0,
         operation_timeout: float = 30.0,
     ) -> None:
+        if ray_backend is None:
+            from ray_dispatcher.backend import NativeRayBackend
+
+            ray_backend = NativeRayBackend()
+        self.ray_backend = ray_backend
+
+        if isinstance(workers, (str, Path)):
+            from ray_dispatcher.discovery import discover_workers
+
+            workers = discover_workers(
+                workers,
+                ray_module=getattr(ray_backend, "ray", None),
+            )
+
         if not workers:
             raise ValueError("at least one worker is required")
         names = [worker.name for worker in workers]
@@ -720,16 +164,9 @@ class RayDispatcher:
                 if configured is None
                 else min(configured, worker.output.max_parallelism)
             )
-        if source_client is None:
-            from source_clients import KafkaPostgresSourceClient
-
-            self.source_client: SourceClient = KafkaPostgresSourceClient()
-            self._owns_source_client = True
-        else:
-            self.source_client = source_client
-            self._owns_source_client = False
-        self.ray_backend = ray_backend
+        self.source_observer = SourceObserver()
         self.checkpoint_store = checkpoint_store or MemoryCheckpointStore()
+        self.failure_store = failure_store or MemoryFailureStore()
         self.policy = policy or SchedulingPolicy()
         self.listener_interval = listener_interval
         self.trigger_interval = trigger_interval
@@ -739,33 +176,6 @@ class RayDispatcher:
         self._lock = asyncio.Lock()
         self._tasks: list[asyncio.Task[None]] = []
         self._stopping = asyncio.Event()
-
-    @classmethod
-    def from_worker_directory(
-        cls,
-        worker_directory: Any,
-        ray_backend: RayBackend,
-        *,
-        source_client: SourceClient | None = None,
-        **kwargs: Any,
-    ) -> "RayDispatcher":
-        """Scan trusted ``workers/*.py`` modules and construct a dispatcher.
-
-        ``NativeRayBackend`` supplies its Ray module so ordinary Python
-        functions/classes discovered in the directory are automatically wrapped
-        with ``ray.remote``. Custom backends may execute the plain targets.
-
-        When ``source_client`` is omitted, a production
-        ``KafkaPostgresSourceClient`` is created and owned by the dispatcher.
-        """
-
-        from worker_discovery import discover_workers
-
-        workers = discover_workers(
-            worker_directory,
-            ray_module=getattr(ray_backend, "ray", None),
-        )
-        return cls(workers, ray_backend, source_client=source_client, **kwargs)
 
     @staticmethod
     def _state_key(worker: str, source: str, shard: str) -> str:
@@ -801,7 +211,7 @@ class RayDispatcher:
                 try:
                     if isinstance(representative, KafkaSource):
                         watermarks = await self._io(
-                            self.source_client.kafka_watermarks(representative)
+                            self.source_observer.kafka_watermarks(representative)
                         )
                         observed_shared_groups: set[str] = set()
                         for worker, source in bindings:
@@ -816,7 +226,7 @@ class RayDispatcher:
                                 errors.append(exc)
                     else:
                         upper = await self._io(
-                            self.source_client.postgres_high_watermark(representative)
+                            self.source_observer.postgres_high_watermark(representative)
                         )
                         observed_shared_groups = set()
                         for worker, source in bindings:
@@ -862,7 +272,7 @@ class RayDispatcher:
         watermarks: Mapping[int, tuple[int, int]] | None = None,
     ) -> None:
         if watermarks is None:
-            watermarks = await self._io(self.source_client.kafka_watermarks(source))
+            watermarks = await self._io(self.source_observer.kafka_watermarks(source))
         now = time.monotonic()
         for partition, (low, high) in watermarks.items():
             if low < 0 or high < low:
@@ -936,7 +346,7 @@ class RayDispatcher:
         upper: PostgresCursor | None = None,
     ) -> None:
         if upper is None:
-            upper = await self._io(self.source_client.postgres_high_watermark(source))
+            upper = await self._io(self.source_observer.postgres_high_watermark(source))
         key = (
             self._shared_state_key(
                 worker.shared_source_group, source.source_id, source.table
@@ -968,7 +378,7 @@ class RayDispatcher:
         if not isinstance(committed, PostgresCursor):
             raise TypeError(f"invalid Postgres state for {key}")
         count = 0 if upper <= committed else await self._io(
-            self.source_client.postgres_count(source, committed, upper)
+            self.source_observer.postgres_count(source, committed, upper)
         )
         now = time.monotonic()
         elapsed = max(now - state.last_observed_at, 1e-6)
@@ -1175,7 +585,7 @@ class RayDispatcher:
                 observed, PostgresCursor
             ):
                 raise TypeError("Postgres shared batch requires cursor bounds")
-            splitter = getattr(self.source_client, "postgres_ranges", None)
+            splitter = getattr(self.source_observer, "postgres_ranges", None)
             if splitter is None:
                 ranges = [(start, observed, source_state.backlog)]
             else:
@@ -1315,7 +725,7 @@ class RayDispatcher:
                 and candidate.source_id == source_state.source_id
                 and candidate.table == source_state.shard
             )
-            splitter = getattr(self.source_client, "postgres_ranges", None)
+            splitter = getattr(self.source_observer, "postgres_ranges", None)
             if splitter is None:
                 postgres_ranges = [(start, end, source_state.backlog)]
             else:
@@ -1432,6 +842,7 @@ class RayDispatcher:
                     if fetch_runs and self._all_terminal(fetch_runs):
                         if any(run.status is RunStatus.FAILED for run in fetch_runs):
                             batch.reserved_handler_count = 0
+                            await self._record_failed_batch(batch)
                             await self._skip_failed_batch(batch)
                             continue
                     if (
@@ -1446,6 +857,7 @@ class RayDispatcher:
                 if not runs or not self._all_terminal(runs):
                     continue
                 if any(run.status is RunStatus.FAILED for run in runs):
+                    await self._record_failed_batch(batch)
                     await self._skip_failed_batch(batch)
                 else:
                     await self._commit_batch(batch)
@@ -1581,6 +993,98 @@ class RayDispatcher:
             run.ref = None
             run.data_ref = None
 
+    async def _record_failed_batch(self, batch: BatchRun) -> None:
+        """Persist failure metadata and any recoverable payload before skip."""
+
+        run_ids = [*batch.fetch_run_ids, *batch.run_ids]
+        runs = [self.state.runs[run_id] for run_id in run_ids if run_id in self.state.runs]
+        payload: Any = None
+        payload_error: str | None = None
+        fetch_payloads: list[Any] = []
+        for run in runs:
+            if run.kind != "fetch" or run.status is not RunStatus.SUCCEEDED:
+                continue
+            if run.ref is None:
+                continue
+            try:
+                fetch_payloads.append(await self.ray_backend.get(run.ref))
+            except Exception as exc:
+                payload_error = (
+                    f"failed to materialize fetch {run.run_id}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                break
+        if payload_error is None and fetch_payloads:
+            payload = fetch_payloads[0] if len(fetch_payloads) == 1 else fetch_payloads
+
+        record = FailureRecord(
+            failure_id=self._stable_id("failure", batch.batch_id, batch.start, batch.end),
+            batch_id=batch.batch_id,
+            source_state_key=batch.source_state_key,
+            shared_source_group=batch.shared_source_group,
+            start=batch.start,
+            end=batch.end,
+            item_count=batch.item_count,
+            worker_names=batch.worker_names
+            or ((batch.worker_name,) if batch.worker_name else ()),
+            runs=tuple(
+                FailureRunDetail(
+                    run_id=run.run_id,
+                    kind=run.kind,
+                    worker_name=run.worker_name,
+                    status=run.status.value,
+                    attempt=run.attempt,
+                    error=run.error,
+                    request=self._request_summary(run.request),
+                )
+                for run in runs
+            ),
+            payload=payload,
+            payload_error=payload_error,
+        )
+        try:
+            await self._io(self.failure_store.save_failure(record))
+        except Exception as exc:
+            self.state.loop_errors.append(
+                f"failure_store: {type(exc).__name__}: {exc}"
+            )
+
+    @staticmethod
+    def _request_summary(request: DispatchRequest) -> dict[str, Any]:
+        return {
+            "dispatch_id": request.dispatch_id,
+            "worker_name": request.worker_name,
+            "source_id": request.source_id,
+            "source_kind": request.source_kind.value,
+            "task_index": request.task_index,
+            "task_count": request.task_count,
+            "partition": request.partition,
+            "start_offset": request.start_offset,
+            "end_offset": request.end_offset,
+            "start_cursor": (
+                None
+                if request.start_cursor is None
+                else {
+                    "timestamp": request.start_cursor.timestamp.isoformat(),
+                    "primary_key": request.start_cursor.primary_key,
+                }
+            ),
+            "end_cursor": (
+                None
+                if request.end_cursor is None
+                else {
+                    "timestamp": request.end_cursor.timestamp.isoformat(),
+                    "primary_key": request.end_cursor.primary_key,
+                }
+            ),
+            "output_connection_id": request.output_connection_id,
+            "output_target": request.output_target,
+            "output_format": request.output_format,
+            "source_connection_id": request.source_connection_id,
+            "topic": request.topic,
+            "table": request.table,
+        }
+
     async def _skip_failed_batch(self, batch: BatchRun) -> None:
         """Mark the batch failed, advance past its range, and unblock the source."""
 
@@ -1606,10 +1110,10 @@ class RayDispatcher:
             run.data_ref = None
 
     async def retry_failed_batch(self, batch_id: str) -> list[str]:
-        """No-op: permanent failures skip the range and unblock the source.
+        """No-op: permanent failures are recorded then skipped to unblock the source.
 
-        Kept for API compatibility. Reprocessing a skipped range requires
-        manually rewinding the checkpoint and re-dispatching.
+        Kept for API compatibility. Reprocess via FailureStore payload/range
+        data (rewind checkpoint manually if needed); this method does not resubmit.
         """
 
         return []
@@ -1629,6 +1133,13 @@ class RayDispatcher:
             asyncio.create_task(self._periodic(name, callback, interval), name=name)
             for name, callback, interval in loops
         ]
+
+    async def __aenter__(self) -> "RayDispatcher":
+        await self.start()
+        return self
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        await self.stop()
 
     async def _periodic(
         self, name: str, callback: Callable[[], Any], interval: float
@@ -1657,12 +1168,11 @@ class RayDispatcher:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        if self._owns_source_client:
-            close = getattr(self.source_client, "close", None)
-            if close is not None:
-                result = close()
-                if inspect.isawaitable(result):
-                    await result
+        close = getattr(self.source_observer, "close", None)
+        if close is not None:
+            result = close()
+            if inspect.isawaitable(result):
+                await result
 
     def snapshot(self) -> dict[str, Any]:
         """Return a JSON-friendly operational snapshot (refs are represented)."""
@@ -1714,27 +1224,7 @@ class RayDispatcher:
                 for key, run in self.state.runs.items()
             },
             "loop_errors": list(self.state.loop_errors),
+            "failures": {
+                "store": type(self.failure_store).__name__,
+            },
         }
-
-
-__all__ = [
-    "BatchStatus",
-    "DispatchRequest",
-    "ExecutionMode",
-    "ExecutionResult",
-    "HandlerSpec",
-    "KafkaRetentionGap",
-    "KafkaSource",
-    "MemoryCheckpointStore",
-    "NativeRayBackend",
-    "OutputSpec",
-    "PostgresCursor",
-    "PostgresSource",
-    "RayDispatcher",
-    "RunStatus",
-    "SchedulingPolicy",
-    "SQLiteCheckpointStore",
-    "StaleBatchError",
-    "WorkerSpec",
-    "offset_kwargs_builder",
-]

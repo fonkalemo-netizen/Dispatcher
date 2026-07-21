@@ -12,7 +12,9 @@ Ray Object Store 后，同一个 ObjectRef 会传给 JSONL 和 CSV Handler。两
 安装并运行：
 
 ```bash
-python3 -m pip install ray
+cd ..
+python3 -m pip install -e ".[ray]"
+cd example_app
 python3 main.py
 ```
 
@@ -24,8 +26,8 @@ Dispatcher 分配的范围生成一次订单记录，两个处理函数复用它
 
 生产环境替换点：
 
-- 把 `DemoSourceClient` 换成 `KafkaPostgresSourceClient`；
+- 把 `DemoSourceObserver` 换成生产路径下内置的 `SourceObserver`（去掉 demo 赋值即可）；
 - 把 `fetch_orders()` 换成指定 Kafka/Postgres 区间读取；
 - 把本地文件输出换成 ClickHouse、Postgres、对象存储等输出连接；
-- 示例使用 `demo_state/checkpoints.sqlite3` 保存真实 checkpoint；为保证每次演示都重新处理 25 条，
-  `main.py` 启动时会清理它。生产代码必须删除这个演示清理步骤并保留数据库文件。
+- 示例使用 `demo_state/checkpoints.sqlite3` 与 `demo_state/failures.sqlite3`；
+  为保证每次演示都重新处理 25 条，`main.py` 启动时会清理它们。生产代码必须删除这个演示清理步骤并保留数据库文件。

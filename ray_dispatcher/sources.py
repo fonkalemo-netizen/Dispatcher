@@ -11,7 +11,7 @@ import asyncio
 import re
 from typing import Any, Mapping
 
-from ray_dispatcher import KafkaSource, PostgresCursor, PostgresSource
+from ray_dispatcher.models import KafkaSource, PostgresCursor, PostgresSource
 
 
 class SourceDependencyError(RuntimeError):
@@ -22,12 +22,12 @@ class EmptyPostgresSource(RuntimeError):
     pass
 
 
-class KafkaPostgresSourceClient:
-    """Watermark observer / range planner used by RayDispatcher.
+class SourceObserver:
+    """Fixed watermark observer / range planner used by RayDispatcher.
 
     Not a payload reader: handlers and ``data_fetcher`` still perform record I/O.
-    This client only answers "how far has the source progressed?" and optionally
-    plans Postgres task slices.
+    This observer only answers "how far has the source progressed?" and optionally
+    plans Postgres task slices. It is not a user-facing extension point.
     """
 
     def __init__(
@@ -258,6 +258,6 @@ def _quote_qualified_identifier(value: str) -> str:
 
 __all__ = [
     "EmptyPostgresSource",
-    "KafkaPostgresSourceClient",
     "SourceDependencyError",
+    "SourceObserver",
 ]

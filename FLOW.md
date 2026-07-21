@@ -4,7 +4,7 @@
 
 ```mermaid
 flowchart TD
-    A["main.py"] --> B["RayDispatcher.from_worker_directory(workers)"]
+    A["main.py"] --> B["RayDispatcher(workers目录或WorkerSpec列表)"]
     B --> C["扫描 workers/*.py"]
     C --> D["展开 HANDLERS；兼容 WORKER_CONFIG / WORKER_SPEC"]
     D --> E["每个函数生成 HandlerSpec 并包装 Ray remote function/Actor"]
@@ -43,9 +43,10 @@ flowchart TD
 
 ## 1. Worker 扫描
 
-入口：`RayDispatcher.from_worker_directory()`。
+入口：`RayDispatcher(workers_dir_or_specs, ...)`。传入目录路径时内部调用
+`discover_workers()`（见 `ray_dispatcher/discovery.py`）。
 
-1. 调用 `discover_workers(directory)`（也可使用语义别名 `discover_handlers`）。
+1. 若构造参数是目录路径，调用 `discover_workers(directory)`（也可使用语义别名 `discover_handlers`）。
 2. 扫描目录下所有非下划线开头的 `*.py`。
 3. 导入模块。导入会执行模块顶层代码，因此 workers 目录必须可信。
 4. 优先展开模块的 `HANDLERS`；每一项代表一个独立调度函数。旧的 `get_worker_spec()`、`WORKER_SPEC`、`WORKER_CONFIG` 兼容为单 Handler。
@@ -82,7 +83,7 @@ for physical source:
 
 ### Kafka
 
-1. `KafkaPostgresSourceClient.kafka_watermarks(source)` 根据该 source 的 brokers 获取/创建 Consumer。
+1. `SourceObserver.kafka_watermarks(source)` 根据该 source 的 brokers 获取/创建 Consumer。
 2. 调用 `list_topics(topic)` 获取全部分区。
 3. 每个分区调用 `get_watermark_offsets(..., cached=False)`，得到 `(low, high)`。
 4. 状态键为：
@@ -211,7 +212,7 @@ Handler 自动重试继续复用该 ObjectRef。只有所有 fetch 和所有 Han
 
 ### Postgres
 
-生产 SourceClient 在数据库内按 `(timestamp, primary_key)` 排序，取得最多 `n × batch_size` 行的边界，并返回有序、不重叠的复合游标范围。每个 task 只处理自己的 `(start, end]`；不使用跨进程不稳定的 Python `hash()`。未实现 `postgres_ranges()` 的自定义 SourceClient 安全降级为单 task。
+固定的 `SourceObserver` 在数据库内按 `(timestamp, primary_key)` 排序，取得最多 `n × batch_size` 行的边界，并返回有序、不重叠的复合游标范围。每个 task 只处理自己的 `(start, end]`；不使用跨进程不稳定的 Python `hash()`。
 
 ### 状态写入
 
@@ -231,7 +232,8 @@ state.sources[handler_source_key].active_batch_id = batch_id
 3. fetch 成功：保留原始 ObjectRef 并扇出下游；Handler 成功：TaskRun 变为 `SUCCEEDED`。
 4. 失败：
    - `attempt <= max_retries`：同一个 DispatchRequest、同一个 dispatch_id 重新提交；
-   - 超过次数：TaskRun 变为 `FAILED`；同批全部终态且存在失败时调用 `_skip_failed_batch()`。
+   - 超过次数：TaskRun 变为 `FAILED`；同批全部终态且存在失败时先 `_record_failed_batch()`
+     （写入 FailureStore：区间、错误；共享模式尽量物化 fetch payload），再调用 `_skip_failed_batch()`。
 5. 同一个 batch 的所有 task 成功后调用 `_commit_batch()`。
 6. commit / skip 前校验：
 
@@ -250,7 +252,8 @@ batch.status = SUCCEEDED
 ```
 
 永久失败时同样推进 committed 到 batch.end 并清除 `active_batch_id`（跳过毒区间），
-`batch.status = FAILED`，不更新 processing_rate。来源可继续调度后续区间。
+`batch.status = FAILED`，不更新 processing_rate。来源可继续调度后续区间。失败详情留在
+FailureStore，供事后查询或按区间重读。
 
 8. checkpoint 持久化成功后清除本批 `ref/data_ref`，释放 Ray Object Store 数据。
 
@@ -262,6 +265,9 @@ DispatcherState
 ├── batches  # 一批区间的整体状态
 ├── runs     # 每个 Ray task/Actor method 的 ref、attempt、结果、错误
 └── loop_errors
+
+FailureStore（构造注入，默认 MemoryFailureStore）
+└── 永久失败批次的区间、错误摘要、可物化的 payload
 ```
 
 `state.refs` 可以取得当前仍被 Dispatcher 持有的 Ray ObjectRef；已成功提交的批次会释放 ref。

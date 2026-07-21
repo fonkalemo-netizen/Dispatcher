@@ -11,17 +11,18 @@ from unittest.mock import patch
 
 from ray_dispatcher import (
     ExecutionResult,
+    SourceObserver,
     KafkaSource,
     PostgresCursor,
     PostgresSource,
     RayDispatcher,
+    WorkerDiscoveryError,
     WorkerSpec,
+    discover_workers,
 )
-from source_clients import KafkaPostgresSourceClient
-from worker_discovery import WorkerDiscoveryError, discover_workers
 
 
-class RecordingSourceClient:
+class RecordingSourceObserver:
     def __init__(self) -> None:
         self.kafka_calls: list[tuple[tuple[str, ...], str]] = []
 
@@ -40,10 +41,14 @@ class FakeRayBackend:
     def __init__(self) -> None:
         self.submissions: list[Any] = []
         self.ready: dict[str, ExecutionResult] = {}
+        self.values: dict[str, Any] = {}
 
-    def submit(self, worker: WorkerSpec, request: Any) -> str:
+    def submit(self, worker: WorkerSpec, request: Any, data_ref: Any = None) -> str:
         self.submissions.append(request)
         return f"ref-{len(self.submissions)}"
+
+    def submit_fetch(self, worker: WorkerSpec, request: Any) -> str:
+        return f"fetch-ref-{len(self.submissions) + 1}"
 
     def poll(self, refs: Mapping[str, Any]):
         outcomes = {
@@ -56,12 +61,17 @@ class FakeRayBackend:
     def available_cpus(self) -> float:
         return 8.0
 
-    def finish(self, ref: str, *, error: str | None = None) -> None:
+    async def get(self, ref: Any) -> Any:
+        return self.values[ref]
+
+    def finish(self, ref: str, *, error: str | None = None, value: Any = "ok") -> None:
         self.ready[ref] = ExecutionResult(
             success=error is None,
-            value="ok" if error is None else None,
+            value=value if error is None else None,
             error=error,
         )
+        if error is None:
+            self.values[ref] = value
 
 
 class WorkerDiscoveryTests(unittest.IsolatedAsyncioTestCase):
@@ -120,11 +130,10 @@ def to_csv(request):
 ''',
                 encoding="utf-8",
             )
-            source_client = RecordingSourceClient()
+            source_observer = RecordingSourceObserver()
             backend = FakeRayBackend()
-            dispatcher = RayDispatcher.from_worker_directory(
-                directory, backend, source_client=source_client
-            )
+            dispatcher = RayDispatcher(directory, ray_backend=backend)
+            dispatcher.source_observer = source_observer
 
             backlog = await dispatcher.data_listener()
             run_ids = await dispatcher.ray_trigger()
@@ -140,7 +149,7 @@ def to_csv(request):
                 )
             await dispatcher.ray_status()
 
-        self.assertEqual(1, len(source_client.kafka_calls))
+        self.assertEqual(1, len(source_observer.kafka_calls))
         self.assertEqual(
             {"orders:to_jsonl", "orders:to_csv"}, set(dispatcher.workers)
         )
@@ -195,18 +204,16 @@ def process(request):
 ''',
                 encoding="utf-8",
             )
-            source_client = RecordingSourceClient()
-            dispatcher = RayDispatcher.from_worker_directory(
-                directory,
-                FakeRayBackend(),
-                source_client=source_client,
-            )
+            source_observer = RecordingSourceObserver()
+            backend = FakeRayBackend()
+            dispatcher = RayDispatcher(directory, ray_backend=backend)
+            dispatcher.source_observer = source_observer
 
             backlog = await dispatcher.data_listener()
 
         self.assertEqual(
             [(('kafka-a:9092', 'kafka-b:9092'), 'events')],
-            source_client.kafka_calls,
+            source_observer.kafka_calls,
         )
         self.assertEqual(7, backlog["events-worker:events-v1:0"])
         self.assertEqual(6, backlog["events-worker:events-v1:1"])
@@ -254,7 +261,7 @@ def process(request):
         fake_module.KafkaException = RuntimeError
         fake_module.TopicPartition = TopicPartition
         source = KafkaSource("events", ("broker:9092",), "events")
-        client = KafkaPostgresSourceClient()
+        client = SourceObserver()
 
         with patch.dict(sys.modules, {"confluent_kafka": fake_module}):
             result = await client.kafka_watermarks(source)
@@ -321,7 +328,7 @@ def process(request):
             "id",
             initial_cursor=start,
         )
-        client = KafkaPostgresSourceClient()
+        client = SourceObserver()
 
         with patch.dict(sys.modules, {"asyncpg": fake_module}):
             observed = await client.postgres_high_watermark(source)

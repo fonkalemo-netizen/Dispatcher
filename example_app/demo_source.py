@@ -7,7 +7,7 @@ from typing import Mapping
 from ray_dispatcher import KafkaSource, PostgresCursor, PostgresSource
 
 
-class DemoSourceClient:
+class DemoSourceObserver:
     """Expose 25 synthetic Kafka offsets without requiring a broker."""
 
     def __init__(self, high_offset: int = 25) -> None:
@@ -30,4 +30,3 @@ class DemoSourceClient:
         end_inclusive: PostgresCursor,
     ) -> int:
         raise NotImplementedError("the runnable example uses its Kafka source")
-

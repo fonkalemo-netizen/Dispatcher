@@ -58,5 +58,8 @@ class LocalThreadBackend:
     def available_cpus(self) -> float:
         return float(self.max_workers)
 
+    async def get(self, ref: Future[Any]) -> Any:
+        return ref.result()
+
     def close(self) -> None:
         self.executor.shutdown(wait=True)

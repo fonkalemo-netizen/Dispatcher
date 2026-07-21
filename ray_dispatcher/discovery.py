@@ -11,7 +11,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Mapping, Sequence
 
-from ray_dispatcher import (
+from ray_dispatcher.models import (
     ExecutionMode,
     HandlerSpec,
     KafkaSource,

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ray-dispatcher"
+version = "0.1.0"
+description = "Backlog-aware Ray dispatcher for Kafka and Postgres sources"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+ray = ["ray"]
+kafka = ["confluent-kafka"]
+postgres = ["asyncpg"]
+all = ["ray", "confluent-kafka", "asyncpg"]
+
+[tool.setuptools.packages.find]
+include = ["ray_dispatcher*"]
