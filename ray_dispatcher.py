@@ -24,7 +24,7 @@ from datetime import datetime
 from enum import Enum
 from functools import total_ordering
 from pathlib import Path
-from typing import Any, Callable, Literal, Mapping, MutableMapping, Protocol, Sequence, Union
+from typing import Any, Callable, Literal, Mapping, Protocol, Sequence, Union
 
 
 class SourceKind(str, Enum):
@@ -237,6 +237,19 @@ WorkerSpec = HandlerSpec
 
 
 class SourceClient(Protocol):
+    """Watermark observer and range planner for the dispatcher.
+
+    This is not a business Handler and does not read/write payload data for
+    downstream sinks. The dispatcher calls it to:
+
+    1. observe how far each physical source has progressed (Kafka low/high,
+       Postgres upper cursor + window count);
+    2. optionally plan stable Postgres task slices (``postgres_ranges``).
+
+    Handlers / ``data_fetcher`` own actual record I/O. Implementations may keep
+    cached Kafka consumers or Postgres pools keyed by connection.
+    """
+
     async def kafka_watermarks(
         self, source: KafkaSource
     ) -> Mapping[int, tuple[int, int]]:
@@ -421,7 +434,7 @@ class RayBackend(Protocol):
 
 
 class NativeRayBackend:
-    """Ray adapter supporting remote functions and cached actor pools."""
+    """Ray adapter supporting remote functions and one cached actor per handler."""
 
     def __init__(self, ray_module: Any | None = None) -> None:
         if ray_module is None:
@@ -430,21 +443,16 @@ class NativeRayBackend:
             except ImportError as exc:
                 raise RuntimeError("Ray is not installed; pass a custom RayBackend") from exc
         self.ray = ray_module
-        self._actor_pools: dict[str, list[Any]] = {}
-        self._actor_index: MutableMapping[str, int] = {}
+        self._actors: dict[str, Any] = {}
 
-    def _next_actor(self, spec: WorkerSpec) -> Any:
-        actors = self._actor_pools.setdefault(spec.name, [])
-        # Grow lazily: a wave of n requests creates n actors, while later waves
-        # reuse the pool (important when actors cache models, history or DB sessions).
-        if len(actors) < spec.max_parallelism:
+    def _actor(self, spec: WorkerSpec) -> Any:
+        # One long-lived actor per handler. Concurrency is limited by
+        # max_parallelism on in-flight method calls; Ray queues extras.
+        actor = self._actors.get(spec.name)
+        if actor is None:
             actor = spec.worker.options(num_cpus=spec.cpus_per_task).remote()
-            actors.append(actor)
-            self._actor_index.setdefault(spec.name, 0)
-            return actor
-        index = self._actor_index[spec.name] % len(actors)
-        self._actor_index[spec.name] += 1
-        return actors[index]
+            self._actors[spec.name] = actor
+        return actor
 
     def submit(
         self,
@@ -461,7 +469,7 @@ class NativeRayBackend:
             target = getattr(spec.worker, spec.remote_method) if spec.remote_method else spec.worker
             return target.options(num_cpus=spec.cpus_per_task).remote(*args, **kwargs)
 
-        actor = self._next_actor(spec)
+        actor = self._actor(spec)
         method = getattr(actor, spec.remote_method or "process")
         return method.remote(*args, **kwargs)
 
@@ -500,7 +508,7 @@ class NativeRayBackend:
 
 @dataclass
 class SchedulingPolicy:
-    """Backlog-aware policy bounded by worker, global and CPU capacity."""
+    """Progressive backlog-aware policy bounded by capacity checks."""
 
     max_in_flight: int = 64
     target_batch_seconds: float = 10.0
@@ -518,12 +526,22 @@ class SchedulingPolicy:
             count = min(count, math.floor(available_cpus / worker.cpus_per_task))
         return max(0, count)
 
-    def priority(self, worker: WorkerSpec, state: "SourceState", now: float) -> float:
+    def priority(
+        self, worker: WorkerSpec, state: "SourceState", now: float
+    ) -> tuple[int, int, float, float]:
+        """Lexicographic schedule key; higher sorts first with ``reverse=True``.
+
+        Order: static handler priority → largest backlog → slowest drain
+        (highest backlog/processing_rate) → longest wait. Capacity (slots,
+        CPU, output limits) is checked after ranking, not folded into the key.
+        """
+
         throughput = max(state.processing_rate, 1e-6)
-        backlog_seconds = state.backlog / throughput if state.processing_rate else state.backlog
+        backlog_seconds = (
+            state.backlog / throughput if state.processing_rate else float(state.backlog)
+        )
         age = max(0.0, now - state.last_scheduled_at)
-        pressure = max(0.0, state.arrival_rate - state.processing_rate)
-        return worker.priority * 1_000_000 + backlog_seconds + age + pressure * 10
+        return (worker.priority, state.backlog, backlog_seconds, age)
 
 
 @dataclass
@@ -610,9 +628,9 @@ class RayDispatcher:
     def __init__(
         self,
         workers: Sequence[WorkerSpec],
-        source_client: SourceClient,
         ray_backend: RayBackend,
         *,
+        source_client: SourceClient | None = None,
         checkpoint_store: CheckpointStore | None = None,
         policy: SchedulingPolicy | None = None,
         listener_interval: float = 5.0,
@@ -702,7 +720,14 @@ class RayDispatcher:
                 if configured is None
                 else min(configured, worker.output.max_parallelism)
             )
-        self.source_client = source_client
+        if source_client is None:
+            from source_clients import KafkaPostgresSourceClient
+
+            self.source_client: SourceClient = KafkaPostgresSourceClient()
+            self._owns_source_client = True
+        else:
+            self.source_client = source_client
+            self._owns_source_client = False
         self.ray_backend = ray_backend
         self.checkpoint_store = checkpoint_store or MemoryCheckpointStore()
         self.policy = policy or SchedulingPolicy()
@@ -719,8 +744,9 @@ class RayDispatcher:
     def from_worker_directory(
         cls,
         worker_directory: Any,
-        source_client: SourceClient,
         ray_backend: RayBackend,
+        *,
+        source_client: SourceClient | None = None,
         **kwargs: Any,
     ) -> "RayDispatcher":
         """Scan trusted ``workers/*.py`` modules and construct a dispatcher.
@@ -728,6 +754,9 @@ class RayDispatcher:
         ``NativeRayBackend`` supplies its Ray module so ordinary Python
         functions/classes discovered in the directory are automatically wrapped
         with ``ray.remote``. Custom backends may execute the plain targets.
+
+        When ``source_client`` is omitted, a production
+        ``KafkaPostgresSourceClient`` is created and owned by the dispatcher.
         """
 
         from worker_discovery import discover_workers
@@ -736,7 +765,7 @@ class RayDispatcher:
             worker_directory,
             ray_module=getattr(ray_backend, "ray", None),
         )
-        return cls(workers, source_client, ray_backend, **kwargs)
+        return cls(workers, ray_backend, source_client=source_client, **kwargs)
 
     @staticmethod
     def _state_key(worker: str, source: str, shard: str) -> str:
@@ -1400,11 +1429,11 @@ class RayDispatcher:
                         self.state.runs[run_id]
                         for run_id in batch.fetch_run_ids
                     ]
-                    if any(run.status is RunStatus.FAILED for run in fetch_runs):
-                        batch.status = BatchStatus.FAILED
-                        batch.reserved_handler_count = 0
-                        batch.finished_at = time.monotonic()
-                        continue
+                    if fetch_runs and self._all_terminal(fetch_runs):
+                        if any(run.status is RunStatus.FAILED for run in fetch_runs):
+                            batch.reserved_handler_count = 0
+                            await self._skip_failed_batch(batch)
+                            continue
                     if (
                         fetch_runs
                         and all(
@@ -1414,10 +1443,11 @@ class RayDispatcher:
                     ):
                         await self._submit_shared_handlers(batch)
                 runs = [self.state.runs[run_id] for run_id in batch.run_ids]
+                if not runs or not self._all_terminal(runs):
+                    continue
                 if any(run.status is RunStatus.FAILED for run in runs):
-                    batch.status = BatchStatus.FAILED
-                    batch.finished_at = time.monotonic()
-                elif runs and all(run.status is RunStatus.SUCCEEDED for run in runs):
+                    await self._skip_failed_batch(batch)
+                else:
                     await self._commit_batch(batch)
             return {run_id: run.status for run_id, run in self.state.runs.items()}
 
@@ -1516,6 +1546,12 @@ class RayDispatcher:
         run.error = error
         run.finished_at = time.monotonic()
 
+    @staticmethod
+    def _all_terminal(runs: Sequence[TaskRun]) -> bool:
+        return all(
+            run.status in (RunStatus.SUCCEEDED, RunStatus.FAILED) for run in runs
+        )
+
     async def _commit_batch(self, batch: BatchRun) -> None:
         source_state = self.state.sources[batch.source_state_key]
         if (
@@ -1545,40 +1581,38 @@ class RayDispatcher:
             run.ref = None
             run.data_ref = None
 
-    async def retry_failed_batch(self, batch_id: str) -> list[str]:
-        """Retry only permanently failed slices, preserving successful slices."""
+    async def _skip_failed_batch(self, batch: BatchRun) -> None:
+        """Mark the batch failed, advance past its range, and unblock the source."""
 
-        async with self._lock:
-            batch = self.state.batches[batch_id]
-            if batch.status is not BatchStatus.FAILED:
-                return []
-            retried: list[str] = []
-            candidate_ids = [*batch.fetch_run_ids, *batch.run_ids]
-            for run_id in candidate_ids:
-                run = self.state.runs[run_id]
-                if run.status is not RunStatus.FAILED:
-                    continue
-                worker = self.workers[run.worker_name]
-                run.attempt += 1
-                run.ref = (
-                    self.ray_backend.submit_fetch(worker, run.request)
-                    if run.kind == "fetch"
-                    else self.ray_backend.submit(worker, run.request, run.data_ref)
-                    if run.data_ref is not None
-                    else self.ray_backend.submit(worker, run.request)
-                )
-                run.status = RunStatus.SUBMITTED
-                run.error = None
-                run.submitted_at = time.monotonic()
-                retried.append(run_id)
-            if retried:
-                batch.status = BatchStatus.RUNNING
-                batch.finished_at = None
-                if batch.shared_source_group is not None and not batch.run_ids:
-                    batch.reserved_handler_count = len(batch.fetch_run_ids) * len(
-                        batch.worker_names
-                    )
-            return retried
+        source_state = self.state.sources[batch.source_state_key]
+        if source_state.active_batch_id != batch.batch_id:
+            batch.status = BatchStatus.FAILED
+            batch.finished_at = time.monotonic()
+            return
+        if source_state.committed != batch.start:
+            batch.status = BatchStatus.FAILED
+            batch.finished_at = time.monotonic()
+            source_state.active_batch_id = None
+            return
+        await self._io(self.checkpoint_store.save(source_state.key, batch.end))
+        source_state.committed = batch.end
+        source_state.backlog = max(0, source_state.backlog - batch.item_count)
+        source_state.active_batch_id = None
+        batch.status = BatchStatus.FAILED
+        batch.finished_at = time.monotonic()
+        for run_id in [*batch.fetch_run_ids, *batch.run_ids]:
+            run = self.state.runs[run_id]
+            run.ref = None
+            run.data_ref = None
+
+    async def retry_failed_batch(self, batch_id: str) -> list[str]:
+        """No-op: permanent failures skip the range and unblock the source.
+
+        Kept for API compatibility. Reprocessing a skipped range requires
+        manually rewinding the checkpoint and re-dispatching.
+        """
+
+        return []
 
     async def start(self) -> None:
         """Start the listener, trigger and status loops."""
@@ -1623,6 +1657,12 @@ class RayDispatcher:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        if self._owns_source_client:
+            close = getattr(self.source_client, "close", None)
+            if close is not None:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
 
     def snapshot(self) -> dict[str, Any]:
         """Return a JSON-friendly operational snapshot (refs are represented)."""

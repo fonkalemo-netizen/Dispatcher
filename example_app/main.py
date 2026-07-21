@@ -93,8 +93,8 @@ async def main() -> None:
     source_client = DemoSourceClient(high_offset=25)
     dispatcher = RayDispatcher.from_worker_directory(
         EXAMPLE_ROOT / "workers",
+        backend,
         source_client=source_client,
-        ray_backend=backend,
         checkpoint_store=SQLiteCheckpointStore(
             EXAMPLE_ROOT / "demo_state/checkpoints.sqlite3"
         ),

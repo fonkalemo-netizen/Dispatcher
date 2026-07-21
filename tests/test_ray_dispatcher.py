@@ -21,6 +21,7 @@ from ray_dispatcher import (
     RunStatus,
     SchedulingPolicy,
     SourceKind,
+    SourceState,
     SQLiteCheckpointStore,
     WorkerSpec,
 )
@@ -129,6 +130,26 @@ class RecordingRemoteFunction:
         return "object-ref"
 
 
+class RecordingActorClass:
+    def __init__(self) -> None:
+        self.options_calls: list[dict[str, Any]] = []
+        self.remote_instances: list["RecordingActorInstance"] = []
+
+    def options(self, **kwargs: Any) -> "RecordingActorClass":
+        self.options_calls.append(kwargs)
+        return self
+
+    def remote(self) -> "RecordingActorInstance":
+        instance = RecordingActorInstance()
+        self.remote_instances.append(instance)
+        return instance
+
+
+class RecordingActorInstance:
+    def __init__(self) -> None:
+        self.process = RecordingRemoteFunction()
+
+
 class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _shared_workers(source: KafkaSource) -> tuple[WorkerSpec, WorkerSpec]:
@@ -156,8 +177,8 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         workers = self._shared_workers(source)
         dispatcher = RayDispatcher(
             workers,
-            client,
             backend,
+            source_client=client,
             checkpoint_store=checkpoints,
             policy=SchedulingPolicy(max_in_flight=3),
         )
@@ -211,8 +232,8 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         workers = self._shared_workers(source)
         dispatcher = RayDispatcher(
             workers,
-            client,
             backend,
+            source_client=client,
             policy=SchedulingPolicy(max_in_flight=3),
         )
         client.kafka["events"] = {0: (0, 4)}
@@ -258,8 +279,8 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         dispatcher = RayDispatcher(
             (worker,),
-            client,
             backend,
+            source_client=client,
             checkpoint_store=checkpoints,
             policy=SchedulingPolicy(max_in_flight=10),
         )
@@ -305,7 +326,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         worker = WorkerSpec(
             "worker", object(), (source,), max_parallelism=1, batch_size=100, max_retries=1
         )
-        dispatcher = RayDispatcher((worker,), client, backend)
+        dispatcher = RayDispatcher((worker,), backend, source_client=client)
         client.kafka["events"] = {0: (0, 5)}
         await dispatcher.data_listener()
         [run_id] = await dispatcher.ray_trigger()
@@ -329,7 +350,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         worker = WorkerSpec(
             "worker", object(), (source,), max_parallelism=1, max_retries=1
         )
-        dispatcher = RayDispatcher((worker,), client, backend)
+        dispatcher = RayDispatcher((worker,), backend, source_client=client)
         client.kafka["events"] = {0: (0, 5)}
         await dispatcher.data_listener()
         [run_id] = await dispatcher.ray_trigger()
@@ -362,7 +383,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         checkpoints = MemoryCheckpointStore()
         dispatcher = RayDispatcher(
-            (worker,), client, backend, checkpoint_store=checkpoints
+            (worker,), backend, source_client=client, checkpoint_store=checkpoints
         )
         client.pg_upper["orders"] = end
         client.pg_count["orders"] = 25
@@ -393,7 +414,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
             "orders", "dsn", "orders", "updated_at", "id", initial_cursor=start
         )
         worker = WorkerSpec("worker", object(), (source,))
-        dispatcher = RayDispatcher((worker,), client, backend)
+        dispatcher = RayDispatcher((worker,), backend, source_client=client)
         client.pg_upper["orders"] = end
         client.pg_count["orders"] = 1
 
@@ -408,7 +429,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         worker = WorkerSpec("worker", object(), (source,))
         checkpoints = MemoryCheckpointStore({"worker:events:0": 5})
         dispatcher = RayDispatcher(
-            (worker,), client, backend, checkpoint_store=checkpoints
+            (worker,), backend, source_client=client, checkpoint_store=checkpoints
         )
         client.kafka["events"] = {0: (10, 20)}
 
@@ -428,7 +449,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         worker = WorkerSpec("worker", object(), (source,), batch_size=100)
         checkpoints = MemoryCheckpointStore({"worker:events:0": 5})
         dispatcher = RayDispatcher(
-            (worker,), client, backend, checkpoint_store=checkpoints
+            (worker,), backend, source_client=client, checkpoint_store=checkpoints
         )
         client.kafka["events"] = {0: (10, 20)}
 
@@ -451,7 +472,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         worker = WorkerSpec("worker", object(), (source,), max_parallelism=1)
         checkpoints = MemoryCheckpointStore()
         dispatcher = RayDispatcher(
-            (worker,), client, backend, checkpoint_store=checkpoints
+            (worker,), backend, source_client=client, checkpoint_store=checkpoints
         )
         client.kafka["events"] = {0: (0, 20)}
         await dispatcher.data_listener()
@@ -482,7 +503,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
             max_parallelism=1,
             cache_history=True,
         )
-        dispatcher = RayDispatcher((worker,), client, backend)
+        dispatcher = RayDispatcher((worker,), backend, source_client=client)
         client.kafka["events"] = {0: (0, 1)}
         await dispatcher.data_listener()
         await dispatcher.ray_trigger()
@@ -495,6 +516,115 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         second_wave = await dispatcher.ray_trigger()
         self.assertEqual(1, len(second_wave))
 
+    def test_native_backend_reuses_a_single_actor_per_handler(self) -> None:
+        backend = NativeRayBackend(FakeNativeRayModule())
+        actor_cls = RecordingActorClass()
+        source = KafkaSource("events", ("broker",), "events")
+        worker = WorkerSpec(
+            "worker",
+            actor_cls,
+            (source,),
+            mode=ExecutionMode.ACTOR,
+            remote_method="process",
+            max_parallelism=4,
+        )
+        request = DispatchRequest(
+            "dispatch", "worker", "events", SourceKind.KAFKA, 0, 1
+        )
+
+        backend.submit(worker, request)
+        backend.submit(worker, request)
+        backend.submit(worker, request)
+
+        self.assertEqual(1, len(actor_cls.remote_instances))
+        self.assertEqual(3, len(actor_cls.remote_instances[0].process.remote_calls))
+
+    def test_scheduling_priority_is_progressive(self) -> None:
+        policy = SchedulingPolicy()
+        source = KafkaSource("events", ("broker",), "events")
+        high = WorkerSpec("high", object(), (source,), priority=1)
+        low = WorkerSpec("low", object(), (source,), priority=0)
+        now = 100.0
+        most = SourceState(
+            "a", "low", "events", SourceKind.KAFKA, "0", 0, 100, backlog=100
+        )
+        slow = SourceState(
+            "b",
+            "low",
+            "events",
+            SourceKind.KAFKA,
+            "1",
+            0,
+            50,
+            backlog=50,
+            processing_rate=1.0,
+            last_scheduled_at=now,
+        )
+        fast = SourceState(
+            "c",
+            "low",
+            "events",
+            SourceKind.KAFKA,
+            "2",
+            0,
+            50,
+            backlog=50,
+            processing_rate=10.0,
+            last_scheduled_at=now,
+        )
+        ranked = SourceState(
+            "d", "high", "events", SourceKind.KAFKA, "3", 0, 1, backlog=1
+        )
+
+        ordered = sorted(
+            [most, slow, fast, ranked],
+            key=lambda state: policy.priority(
+                high if state.worker_name == "high" else low, state, now
+            ),
+            reverse=True,
+        )
+        self.assertEqual(["d", "a", "b", "c"], [state.key for state in ordered])
+
+    async def test_permanent_failure_skips_range_and_unblocks_source(self) -> None:
+        client = FakeSourceClient()
+        backend = FakeRayBackend()
+        checkpoints = MemoryCheckpointStore()
+        source = KafkaSource("events", ("broker",), "events", initial_offset="earliest")
+        worker = WorkerSpec(
+            "worker",
+            object(),
+            (source,),
+            max_parallelism=1,
+            batch_size=5,
+            max_retries=0,
+        )
+        dispatcher = RayDispatcher(
+            (worker,), backend, source_client=client, checkpoint_store=checkpoints
+        )
+        client.kafka["events"] = {0: (0, 12)}
+        await dispatcher.data_listener()
+        [run_id] = await dispatcher.ray_trigger()
+        key = "worker:events:0"
+        self.assertEqual(0, dispatcher.state.sources[key].committed)
+        self.assertIsNotNone(dispatcher.state.sources[key].active_batch_id)
+
+        backend.finish(backend.submissions[0][2], error="poison")
+        await dispatcher.ray_status()
+
+        state = dispatcher.state.sources[key]
+        batch = next(iter(dispatcher.state.batches.values()))
+        self.assertEqual(RunStatus.FAILED, dispatcher.state.runs[run_id].status)
+        self.assertEqual(BatchStatus.FAILED, batch.status)
+        self.assertEqual(5, state.committed)
+        self.assertEqual(5, checkpoints.values[key])
+        self.assertIsNone(state.active_batch_id)
+        self.assertEqual(7, state.backlog)
+
+        next_ids = await dispatcher.ray_trigger()
+        self.assertEqual(1, len(next_ids))
+        self.assertEqual(5, backend.submissions[-1][1].start_offset)
+        self.assertEqual(10, backend.submissions[-1][1].end_offset)
+
     async def test_periodic_loops_start_and_stop_cleanly(self) -> None:
         client = FakeSourceClient()
         backend = FakeRayBackend()
@@ -502,8 +632,8 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         worker = WorkerSpec("worker", object(), (source,))
         dispatcher = RayDispatcher(
             (worker,),
-            client,
             backend,
+            source_client=client,
             listener_interval=0.01,
             trigger_interval=0.01,
             status_interval=0.01,

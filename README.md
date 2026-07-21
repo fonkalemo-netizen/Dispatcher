@@ -111,15 +111,12 @@ from ray_dispatcher import (
     SchedulingPolicy,
     SQLiteCheckpointStore,
 )
-from source_clients import KafkaPostgresSourceClient
 
 
 async def main():
     ray.init()
-    source_client = KafkaPostgresSourceClient()
     dispatcher = RayDispatcher.from_worker_directory(
         Path(__file__).parent / "workers",
-        source_client=source_client,
         ray_backend=NativeRayBackend(ray),
         checkpoint_store=SQLiteCheckpointStore("dispatcher-checkpoints.sqlite3"),
         policy=SchedulingPolicy(max_in_flight=64),
@@ -129,14 +126,14 @@ async def main():
         await asyncio.Event().wait()
     finally:
         await dispatcher.stop()
-        await source_client.close()
 
 
 asyncio.run(main())
 ```
 
 启动过程为：扫描所有 `workers/*.py` → 展开每个模块的 `HANDLERS` → 每个普通函数自动包装成
-独立 Ray remote function → 汇总并去重所有 Kafka topic/Postgres table。之后每次 `data_listener()` 都会主动：
+独立 Ray remote function → 汇总并去重所有 Kafka topic/Postgres table。默认使用内建
+`KafkaPostgresSourceClient` 观察水位（也可传入自定义 `source_client=`）。之后每次 `data_listener()` 都会主动：
 
 - 调用 Kafka `list_topics()` 发现分区；
 - 对每个分区调用 `get_watermark_offsets(..., cached=False)` 获取实时 low/high offset；
@@ -178,7 +175,7 @@ pip install ray confluent-kafka asyncpg
 ```
 
 Handler 业务失败重试会复用原 fetch ObjectRef，不会再次读取 Kafka。fetch 自身失败则按
-`fetch_max_retries` 重试；永久失败会阻塞该来源。成功提交 checkpoint 后 Dispatcher 会释放本批
+`fetch_max_retries` 重试；永久失败会跳过该区间、推进 checkpoint，并解除来源阻塞。成功提交 checkpoint 后 Dispatcher 会释放本批
 ObjectRef，避免历史数据长期占用 Object Store。
 
 同组 Handler 必须声明同一个物理来源、`source_id`、`fetcher_id`、首次 offset 和 retention 策略；
@@ -296,8 +293,8 @@ async def main():
     ray.init()
     dispatcher = RayDispatcher(
         workers=(worker,),
-        source_client=MySourceClient(),       # 实现下述 SourceClient 协议
         ray_backend=NativeRayBackend(ray),
+        # source_client 可省略；默认 KafkaPostgresSourceClient
         checkpoint_store=SQLiteCheckpointStore("dispatcher-checkpoints.sqlite3"),
         policy=SchedulingPolicy(max_in_flight=64),
         operation_timeout=30,                 # 外部 I/O 最长等待时间
@@ -368,8 +365,20 @@ SourceClient 会安全降级为单 task。单纯比较两次全表 count 会被 
 
 - 默认用 Task：区间相互独立、无状态、易扩缩。
 - 用 Actor：需要缓存模型/历史数据、复用连接、维持分区有序状态。配置
-  `mode=ExecutionMode.ACTOR, remote_method="process"` 后，后端会按需创建并复用固定 Actor 池，不会每轮重建。
+  `mode=ExecutionMode.ACTOR, remote_method="process"` 后，每个 Handler 只创建并复用
+  **一个** Actor；`max_parallelism` 限制该 Actor 上的 in-flight method 数。
 - 影响正确性的历史状态不能只放 Actor 内存；Actor 重启后必须能从外部 checkpoint/snapshot 恢复。
+
+## SourceClient 做什么
+
+`SourceClient` 是 Dispatcher 的 **水位观察 / 区间规划** 适配层，不是业务 Handler：
+
+- `data_listener` 用它主动查 Kafka low/high 或 Postgres 上界与窗口 count；
+- `ray_trigger` 可选调用 `postgres_ranges` 切稳定任务区间；
+- 真正读消息、写下游仍由 `data_fetcher` / Handler 完成。
+
+构造 `RayDispatcher` 时一般不用传：默认创建并托管 `KafkaPostgresSourceClient`，
+`stop()` 时自动 `close()`。测试或 demo 仍可通过 `source_client=` 注入替身。
 
 ## 状态、失败与一致性
 
@@ -381,9 +390,10 @@ SourceClient 会安全降级为单 task。单纯比较两次全表 count 会被 
 - `state.refs`：当前进程已记录的 Ray ref。
 - `dispatcher.snapshot()`：适合日志或监控输出的无敏感连接信息快照。
 
-checkpoint 只在一批所有 slice 都成功后推进。永久失败的批次会阻塞该 shard，修复问题后调用
-`retry_failed_batch(batch_id)`；这样不会跳过毒数据。Kafka retention gap 默认抛错，也可显式设置
-`retention_policy="reset_to_earliest"`。
+调度排序为渐进字典序：静态 priority → backlog 最多 → 最慢（积压耗时）→ 等待最久；
+然后再检查 slot / CPU / 输出并发。checkpoint 在一批全部成功时推进；永久失败时同样推进到
+`batch.end`（跳过毒区间）并清除 `active_batch_id`，来源可继续往后调度。Kafka retention gap
+默认抛错，也可显式设置 `retention_policy="reset_to_earliest"`。
 
 ### Kafka offset 从哪里来、存到哪里
 

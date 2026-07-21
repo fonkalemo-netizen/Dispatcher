@@ -123,7 +123,7 @@ def to_csv(request):
             source_client = RecordingSourceClient()
             backend = FakeRayBackend()
             dispatcher = RayDispatcher.from_worker_directory(
-                directory, source_client, backend
+                directory, backend, source_client=source_client
             )
 
             backlog = await dispatcher.data_listener()
@@ -163,9 +163,13 @@ def to_csv(request):
             2,
             dispatcher.state.sources["orders:to_jsonl:orders:0"].committed,
         )
+        # Permanent csv failure skips its wave and unblocks the source.
         self.assertEqual(
-            0,
+            4,
             dispatcher.state.sources["orders:to_csv:orders:0"].committed,
+        )
+        self.assertIsNone(
+            dispatcher.state.sources["orders:to_csv:orders:0"].active_batch_id
         )
 
     async def test_directory_metadata_drives_active_topic_observation(self) -> None:
@@ -194,8 +198,8 @@ def process(request):
             source_client = RecordingSourceClient()
             dispatcher = RayDispatcher.from_worker_directory(
                 directory,
-                source_client,
                 FakeRayBackend(),
+                source_client=source_client,
             )
 
             backlog = await dispatcher.data_listener()

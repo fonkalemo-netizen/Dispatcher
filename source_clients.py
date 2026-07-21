@@ -23,7 +23,12 @@ class EmptyPostgresSource(RuntimeError):
 
 
 class KafkaPostgresSourceClient:
-    """Actively query Kafka watermarks and Postgres cursor windows."""
+    """Watermark observer / range planner used by RayDispatcher.
+
+    Not a payload reader: handlers and ``data_fetcher`` still perform record I/O.
+    This client only answers "how far has the source progressed?" and optionally
+    plans Postgres task slices.
+    """
 
     def __init__(
         self,

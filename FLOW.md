@@ -21,7 +21,7 @@ flowchart TD
     P --> SS
 
     T --> T1["筛选 backlog > 0 且没有活跃 batch 的来源"]
-    T1 --> T2["按优先级、CPU、并发上限计算 task 数 n"]
+    T1 --> T2["渐进排序：最多积压 → 最慢 → 再算 n"]
     T2 --> T3["创建 BatchRun 和 DispatchRequest"]
     T3 --> T4{"共享来源组?"}
     T4 -->|否| RS["直接提交 Handler task/Actor"]
@@ -32,11 +32,12 @@ flowchart TD
     S --> S1["轮询所有 ObjectRef"]
     S1 --> S2{"执行结果"}
     S2 -->|失败且可重试| S3["使用同一 dispatch_id 重新提交"]
-    S2 -->|永久失败| S4["batch 标记 FAILED，阻塞该来源"]
+    S2 -->|永久失败| S4["batch 标记 FAILED，跳过该区间并推进 checkpoint"]
     S2 -->|成功| S5{"同一 batch 全部成功?"}
     S5 -->|否| S1
     S5 -->|是| S6["保存 checkpoint"]
     S6 --> S7["推进 committed，清除 active_batch_id"]
+    S4 --> S7
     S7 --> T1
 ```
 
@@ -151,12 +152,11 @@ active_batch_id is None
 retention_gap is None
 ```
 
-4. 调度优先级由以下信息构成：
+4. 调度优先级为渐进字典序（容量检查在排序之后单独做）：
    - Handler 静态 priority；
-   - backlog；
-   - backlog / 历史处理速率；
-   - 等待时间；
-   - 到达速率是否超过处理速率。
+   - backlog 最大者优先；
+   - 最慢者优先（backlog / processing_rate 最大）；
+   - 等待时间最长者优先。
 5. task 数约束：
 
 ```text
@@ -171,7 +171,7 @@ n <= output.max_parallelism
 组内每个 Handler 的并发/输出限制约束。组内 `batch_size` 不一致时取最小值，避免任何 Handler
 收到超过其配置的批次。
 
-Actor 已经持有 CPU，后续 Actor method 调用不会再次按空闲 CPU 拦截。
+每个 Actor Handler 只创建并复用一个 Actor；后续 method 调用不会再次按空闲 CPU 拦截。
 
 ## 5. 区间拆分与 Ray 提交
 
@@ -231,16 +231,16 @@ state.sources[handler_source_key].active_batch_id = batch_id
 3. fetch 成功：保留原始 ObjectRef 并扇出下游；Handler 成功：TaskRun 变为 `SUCCEEDED`。
 4. 失败：
    - `attempt <= max_retries`：同一个 DispatchRequest、同一个 dispatch_id 重新提交；
-   - 超过次数：TaskRun 和 BatchRun 变为 `FAILED`。
+   - 超过次数：TaskRun 变为 `FAILED`；同批全部终态且存在失败时调用 `_skip_failed_batch()`。
 5. 同一个 batch 的所有 task 成功后调用 `_commit_batch()`。
-6. commit 前校验：
+6. commit / skip 前校验：
 
 ```text
 source.active_batch_id == batch.batch_id
 source.committed == batch.start
 ```
 
-7. 保存 batch.end 到 checkpoint store，再更新：
+7. 成功时保存 batch.end 到 checkpoint store，再更新：
 
 ```text
 source.committed = batch.end
@@ -249,9 +249,10 @@ source.processing_rate = EWMA(本批处理速度)
 batch.status = SUCCEEDED
 ```
 
-8. checkpoint 持久化成功后清除本批 `ref/data_ref`，释放 Ray Object Store 数据。
+永久失败时同样推进 committed 到 batch.end 并清除 `active_batch_id`（跳过毒区间），
+`batch.status = FAILED`，不更新 processing_rate。来源可继续调度后续区间。
 
-永久失败的 batch 不会自动跳过，修复后调用 `retry_failed_batch(batch_id)`。
+8. checkpoint 持久化成功后清除本批 `ref/data_ref`，释放 Ray Object Store 数据。
 
 ## 7. 内部状态
 
