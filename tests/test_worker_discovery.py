@@ -10,6 +10,7 @@ from typing import Any, Mapping
 from unittest.mock import patch
 
 from ray_dispatcher import (
+    ExecutionMode,
     ExecutionResult,
     KafkaSource,
     PostgresCursor,
@@ -39,7 +40,7 @@ class RecordingSourceObserver:
         raise AssertionError("not used")
 
 
-class FakeRayBackend:
+class FakeRayAdapter:
     def __init__(self) -> None:
         self.submissions: list[Any] = []
         self.fetch_submissions: list[tuple[Any, Any, Any]] = []
@@ -143,10 +144,10 @@ def to_csv(request, records):
                 return {0: (0, 7)}
 
             source_observer.kafka_watermarks = single_partition  # type: ignore[method-assign]
-            backend = FakeRayBackend()
+            backend = FakeRayAdapter()
             dispatcher = RayDispatcher(
                 directory,
-                ray_backend=backend,
+                ray_adapter=backend,
                 source_registry=ORDERS_REGISTRY,
             )
             dispatcher.source_observer = source_observer
@@ -222,10 +223,10 @@ def process(request, records):
                 encoding="utf-8",
             )
             source_observer = RecordingSourceObserver()
-            backend = FakeRayBackend()
+            backend = FakeRayAdapter()
             dispatcher = RayDispatcher(
                 directory,
-                ray_backend=backend,
+                ray_adapter=backend,
                 source_registry=EVENTS_REGISTRY,
             )
             dispatcher.source_observer = source_observer
@@ -242,7 +243,7 @@ def process(request, records):
             "events", dispatcher.workers["events-worker"].sources[0].topic
         )
 
-    def test_legacy_worker_config_is_rejected(self) -> None:
+    def test_modules_without_handlers_are_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             Path(directory, "legacy.py").write_text(
                 '''
@@ -256,8 +257,47 @@ def process(request, records):
 ''',
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(WorkerDiscoveryError, "must export HANDLERS"):
-                discover_workers(directory, source_registry=ORDERS_REGISTRY)
+            Path(directory, "helpers.py").write_text(
+                '''
+SOURCES = {
+    "shared-orders": {
+        "kind": "kafka",
+        "brokers": ["broker:9092"],
+        "topic": "orders",
+    }
+}
+RESOURCES = {
+    "dim": {"kind": "static", "data": {1: {"name": "a"}}},
+}
+HANDLERS = []
+''',
+                encoding="utf-8",
+            )
+            Path(directory, "worker.py").write_text(
+                '''
+HANDLERS = [{
+    "entrypoint": "process",
+    "sources": ["shared-orders"],
+    "resources": ["dim"],
+}]
+
+def process(request, records, resources):
+    return resources["dim"]
+''',
+                encoding="utf-8",
+            )
+            workers, sources, resources = discover_workers(directory)
+        self.assertEqual(1, len(workers))
+        self.assertEqual("shared-orders", workers[0].sources[0].source_id)
+        self.assertEqual("orders", sources["shared-orders"].topic)
+        self.assertEqual({1: {"name": "a"}}, resources["dim"].data)
+
+    def test_directory_with_only_handlerless_modules_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "bad.py").write_text("VALUE = 1\n", encoding="utf-8")
+            Path(directory, "empty.py").write_text("HANDLERS = []\n", encoding="utf-8")
+            with self.assertRaisesRegex(WorkerDiscoveryError, "no worker modules found"):
+                discover_workers(directory)
 
     def test_resource_registry_resolves_named_resources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -540,8 +580,155 @@ def join(request, records):
     def test_bad_worker_module_reports_its_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory, "bad.py")
-            path.write_text("VALUE = 1\n", encoding="utf-8")
+            path.write_text("HANDLERS = [{'entrypoint': 1}]\n", encoding="utf-8")
             with self.assertRaisesRegex(WorkerDiscoveryError, "bad.py"):
+                discover_workers(directory)
+
+    def test_task_with_resources_requires_three_params(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "bad_task.py").write_text(
+                '''
+SOURCES = {
+    "orders": {"kind": "kafka", "brokers": ["b:1"], "topic": "orders"}
+}
+RESOURCES = {"dim": {"kind": "static", "data": {1: 1}}}
+HANDLERS = [{
+    "entrypoint": "process",
+    "sources": ["orders"],
+    "resources": ["dim"],
+}]
+
+def process(request, records):
+    return records
+''',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                WorkerDiscoveryError, "request, records, resources"
+            ):
+                discover_workers(directory)
+
+    def test_task_without_resources_rejects_required_resources_param(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "bad_arity.py").write_text(
+                '''
+SOURCES = {
+    "orders": {"kind": "kafka", "brokers": ["b:1"], "topic": "orders"}
+}
+HANDLERS = [{"entrypoint": "process", "sources": ["orders"]}]
+
+def process(request, records, resources):
+    return records
+''',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                WorkerDiscoveryError, "without resources must accept"
+            ):
+                discover_workers(directory)
+
+    def test_actor_with_resources_validates_init_and_process(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "ok_actor.py").write_text(
+                '''
+SOURCES = {
+    "orders": {"kind": "kafka", "brokers": ["b:1"], "topic": "orders"}
+}
+RESOURCES = {"dim": {"kind": "static", "data": {1: 1}}}
+HANDLERS = [{
+    "entrypoint": "Worker",
+    "sources": ["orders"],
+    "resources": ["dim"],
+    "mode": "actor",
+}]
+
+class Worker:
+    def __init__(self, resources):
+        self.resources = resources
+
+    def process(self, request, records):
+        return records
+''',
+                encoding="utf-8",
+            )
+            workers, _, _ = discover_workers(directory)
+        self.assertEqual(ExecutionMode.ACTOR, workers[0].mode)
+        self.assertEqual(("dim",), workers[0].resource_ids)
+
+    def test_actor_rejects_function_entrypoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "fn_actor.py").write_text(
+                '''
+SOURCES = {
+    "orders": {"kind": "kafka", "brokers": ["b:1"], "topic": "orders"}
+}
+HANDLERS = [{
+    "entrypoint": "process",
+    "sources": ["orders"],
+    "mode": "actor",
+}]
+
+def process(request, records):
+    return records
+''',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(WorkerDiscoveryError, "class entrypoint"):
+                discover_workers(directory)
+
+    def test_actor_with_resources_requires_init(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "no_init.py").write_text(
+                '''
+SOURCES = {
+    "orders": {"kind": "kafka", "brokers": ["b:1"], "topic": "orders"}
+}
+RESOURCES = {"dim": {"kind": "static", "data": {1: 1}}}
+HANDLERS = [{
+    "entrypoint": "Worker",
+    "sources": ["orders"],
+    "resources": ["dim"],
+    "mode": "actor",
+}]
+
+class Worker:
+    def process(self, request, records):
+        return records
+''',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                WorkerDiscoveryError, "__init__\\(self, resources\\)"
+            ):
+                discover_workers(directory)
+
+    def test_actor_process_must_not_require_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "bad_process.py").write_text(
+                '''
+SOURCES = {
+    "orders": {"kind": "kafka", "brokers": ["b:1"], "topic": "orders"}
+}
+RESOURCES = {"dim": {"kind": "static", "data": {1: 1}}}
+HANDLERS = [{
+    "entrypoint": "Worker",
+    "sources": ["orders"],
+    "resources": ["dim"],
+    "mode": "actor",
+}]
+
+class Worker:
+    def __init__(self, resources):
+        self.resources = resources
+
+    def process(self, request, records, resources):
+        return records
+''',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                WorkerDiscoveryError, "must not require resources"
+            ):
                 discover_workers(directory)
 
     async def test_production_kafka_client_queries_every_discovered_partition(self) -> None:

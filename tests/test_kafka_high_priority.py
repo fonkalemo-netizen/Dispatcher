@@ -83,7 +83,7 @@ class SourceObserverLockTests(unittest.TestCase):
         consumer = MagicMock()
         consumer.list_topics.return_value = metadata
         consumer.get_watermark_offsets.return_value = (1, 4)
-        observer._kafka_consumers[(None, "broker")] = consumer
+        observer._kafka_consumers[("broker",)] = consumer
 
         fake = ModuleType("confluent_kafka")
         fake.KafkaException = RuntimeError  # type: ignore[attr-defined]

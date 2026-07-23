@@ -19,7 +19,7 @@
 | [`ray_dispatcher/readers.py`](./ray_dispatcher/readers.py) | 框架侧 PayloadReader（fetch） |
 | [`ray_dispatcher/resources.py`](./ray_dispatcher/resources.py) | worker 作用域 ResourceLoader |
 | [`ray_dispatcher/sources.py`](./ray_dispatcher/sources.py) | 固定 SourceObserver（水位/切分） |
-| [`ray_dispatcher/backend.py`](./ray_dispatcher/backend.py) | Native Ray 执行后端 |
+| [`ray_dispatcher/adapter.py`](./ray_dispatcher/adapter.py) | Native Ray 执行适配 |
 | [`ray_dispatcher/checkpoint.py`](./ray_dispatcher/checkpoint.py) | 进度 + 可选 Actor state |
 | [`ray_dispatcher/event_log.py`](./ray_dispatcher/event_log.py) | 运行事件钩子（函数登记） |
 | [`ray_dispatcher/failures.py`](./ray_dispatcher/failures.py) | 永久失败区间落盘 |
@@ -74,7 +74,6 @@ Dispatcher **不按 batch_size 切多片**（每轮每源最多一波 fetch）�
 SOURCES = {
     "events-v1": {
         "kind": "kafka",
-        "connection_id": "events-kafka",
         "brokers": ["kafka-1:9092", "kafka-2:9092"],
         "topic": "events",
         "initial_offset": "latest",
@@ -151,7 +150,9 @@ def join_orders_payments(request, records):
     ...
 ```
 
-Worker 模块只导出 `HANDLERS`（必选）以及旁路 `SOURCES` / `RESOURCES`（纯配置，无 callable）。
+Worker 模块可导出 `HANDLERS` 以及旁路 `SOURCES` / `RESOURCES`（纯配置，无 callable）。
+无 `HANDLERS` 或 `HANDLERS = []` 的 `.py` 会被跳过（仍可贡献 SOURCES/RESOURCES）；
+目录内最终至少一个 Handler，否则启动失败。
 启动扫描时先合并各模块声明（可选构造注入 registry 为底表；同名且配置不等价则失败），再统一解析
 Handler 名字。
 
@@ -198,7 +199,7 @@ asyncio.run(main())
 启动过程为：扫描所有 `workers/*.py` → 合并 `SOURCES` / `RESOURCES` → 展开 `HANDLERS` 并解析
 名字 → 每个普通函数自动包装成独立 Ray remote function。区间读取由框架
 `PayloadReader`（或注入的自定义 reader）完成，Handler 只处理已读出的 `records`。
-`ray_backend` 为关键字参数且可省略；水位观察固定为包内 `SourceObserver`。也可用
+`ray_adapter` 为关键字参数且可省略；水位观察固定为包内 `SourceObserver`。也可用
 `async with dispatcher` 代替手动 `start()` / `stop()`。
 
 之后每次 `data_listener()` 都会主动：
@@ -228,17 +229,21 @@ pip install ray confluent-kafka asyncpg
 - 每个 offset slice 一次框架 fetch
 - 同一 ObjectRef 扇出给组内所有 Handler
 
-Handler 签名为 `handler(request, records)`，需要快照/客户端时再加 `resources`：
-`handler(request, records, resources)`。Dispatcher 的执行顺序是：
+Handler 签名为 `handler(request, records)`，需要快照时再加 `resources`：
+`handler(request, records, resources)`（Task）。Dispatcher 的执行顺序是：
 
 ```text
 一个 offset slice
   -> 一个 fetch task（PayloadReader.fetch）
   -> 一个 Ray ObjectRef
-  -> N 个 Handler task（ObjectRef 作为顶层第二参数；可选 resources）
+  -> N 个 Handler task（records ObjectRef 顶层第二参数；
+     resources 经 Driver ray.put 一次后以共享 ObjectRef 注入）
   -> N 个 Handler 全部成功
   -> 推进共享 checkpoint
 ```
+
+Actor 模式：`resources` 在 Actor `__init__(resources)` 注入一次，
+`process(request, records)` 不再传 resources，应从 `self` 读取。
 
 Handler 业务失败重试会复用原 fetch ObjectRef，不会再次读取 Kafka。fetch 自身失败则按
 `DispatcherConfig.fetch_max_retries` 重试；永久失败会先写入 `FailureStore`（区间元信息 + 可物化的 fetch payload），
@@ -304,7 +309,7 @@ async def main():
     ray.init()
     async with RayDispatcher(
         workers=(handler,),
-        # ray_backend 可省略；默认 NativeRayBackend。水位观察固定为 SourceObserver
+        # ray_adapter 可省略；默认 NativeRayAdapter。水位观察固定为 SourceObserver
         # 区间读取默认 CompositePayloadReader（KafkaPayloadReader / PostgresPayloadReader）
         checkpoint_store=SQLiteCheckpointStore("dispatcher-checkpoints.sqlite3"),
         failure_store=SQLiteFailureStore("dispatcher-failures.sqlite3"),
@@ -324,13 +329,14 @@ slice 成功后由 Dispatcher 推进 checkpoint。自定义读取逻辑应实现
 而不是写进业务 Handler。
 
 `DispatchRequest` 供 fetch / merge / 内部状态使用：Kafka 含 `topic`、`partition`、
-offset 边界与 `source_connection_id`；Postgres 含 `table`、游标边界与
-`source_connection_id`；多源时间窗还可带 `window_start` / `window_end` / `source_ids`。
-`source_connection_id` 只是外部连接配置引用，不要塞密码或活连接。业务 Handler 拿到的是
+offset 边界；Postgres 含 `table`、游标边界；多源时间窗还可带
+`window_start` / `window_end` / `source_ids`。业务 Handler 拿到的是
 瘦 `HandlerRequest`，不是 `DispatchRequest`。
 
-Handler 签名为 `handler(request, records)`；声明了 `resources` 时为
-`handler(request, records, resources)`。Kafka 路径下 `records` 为 message value 列表
+Handler 签名为 `handler(request, records)`；声明了 `resources` 时 Task 为
+`handler(request, records, resources)`（第三参为共享 ObjectRef 解引用后的 dict）。
+Actor 应在 `__init__(self, resources)` 保存快照，`process(self, request, records)`
+不再接收 resources。Kafka 路径下 `records` 为 message value 列表
 （多源为 `dict[source_id, list[value]]`）；partition/offset 只用于 Dispatcher 调度与 checkpoint，
 不塞进 payload。下游幂等由业务唯一键负责。
 
@@ -371,6 +377,15 @@ WHERE (updated_at, id) > ($1, $2)
 - 用 Actor：需要缓存模型/历史数据、复用连接、维持分区有序状态。配置
   `mode=ExecutionMode.ACTOR, remote_method="process"` 后，每个 Handler 只创建并复用
   **一个** Actor；in-flight method 数由全局 slot / CPU 限制。
+- **Resources（维表快照）传递：**
+  - Task：Driver `preload` 后对每个 Handler 的 `resource_ids` 集合 `ray.put` **一次**，
+    各次 submit 只传同一 ObjectRef（与 records 一样由 Ray 解析），避免每 task 拷整表。
+  - Actor：构造时 `Actor.remote(resources)` 注入一次；`process(request, records)`
+    **不再**带 resources，业务从实例字段读取。热更新会 `drop_actor` 并换新
+    `resource_loader`（同时清空 put 缓存）。
+  - 目录 discovery 会校验签名：Task±resources 参数个数、Actor 必须是类、
+    `__init__(resources?)` / `process(request, records)` 约定；已 `@ray.remote` 包装的对象跳过。
+  - `checkpoint_state` 只适合小业务状态，不要用来恢复大维表。
 - 影响正确性的历史状态不能只放 Actor 内存。框架把 Actor 缓存写成独立 checkpoint 文档
   （见下节），并在 Actor（重新）创建后的首次 submit 经
   `HandlerRequest.checkpoint_state` 注入恢复。
@@ -389,7 +404,7 @@ WHERE (updated_at, id) > ($1, $2)
 - 目录启动可用 `reload_interval>0` 热加载 workers（有 in-flight batch 时推迟切换）。
 - `event_log`：批提交 / 跳过 / run 永久失败 / 周期 snapshot 的函数钩子（见下节）。
 
-构造时 `ray_backend` 可省略（默认 `NativeRayBackend`）；水位观察固定使用 `SourceObserver`。
+构造时 `ray_adapter` 可省略（默认 `NativeRayAdapter`）；水位观察固定使用 `SourceObserver`。
 失败落盘默认 `MemoryFailureStore`，生产可用 `SQLiteFailureStore`。测试/demo 可通过赋值
 `dispatcher.source_observer` 替换观察器（鸭子类型），不作为正式扩展 API。
 
@@ -491,4 +506,4 @@ python3 -m py_compile ray_dispatcher/*.py tests/test_ray_dispatcher.py
 ```
 
 覆盖：Kafka 增量切分与整批提交、单次 fetch 多 Handler 扇出、Handler 重试复用 ObjectRef、原始 Ray
-ObjectRef 轮询映射、SQLite 重启恢复、稳定 dispatch ID、Postgres 复合游标切片、retention gap 和循环启停。
+ObjectRef 轮询映射、SQLite 重启恢复、稳定 disatch ID、Postgres 复合游标切片、retention gap 和循环启停。

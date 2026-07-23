@@ -18,7 +18,7 @@ from ray_dispatcher import (
 )
 from ray_dispatcher.registries import build_resource_registry, resource_from_mapping
 from ray_dispatcher.resources import ResourceLoader
-from tests.test_ray_dispatcher import FakeRayBackend, FakeSourceObserver
+from tests.test_ray_dispatcher import FakeRayAdapter, FakeSourceObserver
 
 
 class ResourcePreloadTests(unittest.IsolatedAsyncioTestCase):
@@ -113,10 +113,10 @@ class ResourcePreloadTests(unittest.IsolatedAsyncioTestCase):
         worker = HandlerSpec(
             "worker", object(), (source,), resource_ids=("dim",)
         )
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         dispatcher = RayDispatcher(
             (worker,),
-            ray_backend=backend,
+            ray_adapter=backend,
             resource_registry=resources,
             event_log=create_event_log(default_logging=False),
             event_log_interval=0,
@@ -163,10 +163,10 @@ def handle(request, records):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self._write_worker(root, name="worker-a", batch_size=5)
-            backend = FakeRayBackend()
+            backend = FakeRayAdapter()
             dispatcher = RayDispatcher(
                 root,
-                ray_backend=backend,
+                ray_adapter=backend,
                 checkpoint_store=MemoryCheckpointStore(),
                 event_log=create_event_log(default_logging=False),
                 event_log_interval=0,
@@ -188,11 +188,11 @@ def handle(request, records):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self._write_worker(root, name="worker-a", batch_size=5)
-            backend = FakeRayBackend()
+            backend = FakeRayAdapter()
             client = FakeSourceObserver()
             dispatcher = RayDispatcher(
                 root,
-                ray_backend=backend,
+                ray_adapter=backend,
                 checkpoint_store=MemoryCheckpointStore(),
                 event_log=create_event_log(default_logging=False),
                 event_log_interval=0,
@@ -217,10 +217,10 @@ def handle(request, records):
             self._write_worker(root, name="worker-a", batch_size=5)
             path = root / "orders.py"
             original = path.read_text(encoding="utf-8")
-            backend = FakeRayBackend()
+            backend = FakeRayAdapter()
             dispatcher = RayDispatcher(
                 root,
-                ray_backend=backend,
+                ray_adapter=backend,
                 checkpoint_store=MemoryCheckpointStore(),
                 event_log=create_event_log(default_logging=False),
                 event_log_interval=0,
@@ -250,10 +250,10 @@ class SnapshotLockTests(unittest.IsolatedAsyncioTestCase):
             "events", ("broker",), "events", initial_offset="earliest"
         )
         worker = HandlerSpec("worker", object(), (source,), batch_size=5)
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         dispatcher = RayDispatcher(
             (worker,),
-            ray_backend=backend,
+            ray_adapter=backend,
             event_log=create_event_log(default_logging=False),
             event_log_interval=0,
         )

@@ -15,8 +15,8 @@ from ray_dispatcher import (
 from ray_dispatcher.resources import ResourceLoader
 
 
-class LocalThreadBackend:
-    """无 Ray 时的本地线程后端，方法语义与 ``RayBackend`` 一致。"""
+class LocalThreadAdapter:
+    """无 Ray 时的本地线程适配，方法语义与 ``RayAdapter`` 一致。"""
 
     def __init__(
         self,
@@ -39,7 +39,11 @@ class LocalThreadBackend:
         request: HandlerRequest,
         data_ref: Future[Any] | None = None,
     ) -> Future[Any]:
-        """提交业务 Handler：``request`` → ``records`` → ``resources?``。"""
+        """提交业务 Handler：``request`` → ``records`` → ``resources?``。
+
+        本地线程无 Object Store：resources 仍从 ``ResourceLoader`` 缓存读取
+        （同进程共享，不会像 Ray 那样按 task 重复序列化整表）。
+        """
 
         if handler.mode.value != "task":
             raise RuntimeError("the demo fallback supports task handlers only")
@@ -66,8 +70,8 @@ class LocalThreadBackend:
         """提交读数任务：按区间从源拉取 records。"""
 
         if self.payload_reader is None:
-            raise RuntimeError("payload_reader is not configured on LocalThreadBackend")
-        del fetch_cpus  # thread backend does not enforce Ray CPU quotas
+            raise RuntimeError("payload_reader is not configured on LocalThreadAdapter")
+        del fetch_cpus  # thread adapter does not enforce Ray CPU quotas
         return self.executor.submit(self.payload_reader.fetch, request, source)
 
     def poll(

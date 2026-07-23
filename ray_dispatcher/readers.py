@@ -151,6 +151,15 @@ class CompositePayloadReader:
         raise TypeError(f"unsupported source type: {type(source).__name__}")
 
 
+def bind_payload_fetch(payload_reader: PayloadReader):
+    """Return a free function for ``ray.remote`` (bound methods are rejected)."""
+
+    def fetch_payload(request: DispatchRequest, source: SourceSpec) -> Any:
+        return payload_reader.fetch(request, source)
+
+    return fetch_payload
+
+
 def merge_fetch_results(
     source_ids: tuple[str, ...], *payloads: Any
 ) -> dict[str, list[Any]]:
@@ -184,5 +193,6 @@ __all__ = [
     "KafkaPayloadReader",
     "PayloadReader",
     "PostgresPayloadReader",
+    "bind_payload_fetch",
     "merge_fetch_results",
 ]

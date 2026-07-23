@@ -23,7 +23,7 @@ from ray_dispatcher import (
     create_event_log,
     discover_event_hooks,
 )
-from tests.test_ray_dispatcher import FakeRayBackend, FakeSourceObserver
+from tests.test_ray_dispatcher import FakeRayAdapter, FakeSourceObserver
 
 
 class EventLogUnitTests(unittest.IsolatedAsyncioTestCase):
@@ -106,7 +106,7 @@ class EventLogDispatcherTests(unittest.IsolatedAsyncioTestCase):
     async def _complete_fetches(
         self,
         dispatcher: RayDispatcher,
-        backend: FakeRayBackend,
+        backend: FakeRayAdapter,
     ) -> None:
         pending = [
             (request, ref)
@@ -123,7 +123,7 @@ class EventLogDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_batch_committed_and_snapshot_events(self) -> None:
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         events = create_event_log(default_logging=False)
         committed: list[Mapping[str, Any]] = []
         snapshots: list[Mapping[str, Any]] = []
@@ -136,7 +136,7 @@ class EventLogDispatcherTests(unittest.IsolatedAsyncioTestCase):
         worker = HandlerSpec("worker", object(), (source,), batch_size=(1, 5), max_retries=0)
         dispatcher = RayDispatcher(
             (worker,),
-            ray_backend=backend,
+            ray_adapter=backend,
             checkpoint_store=MemoryCheckpointStore(),
             config=DispatcherConfig(max_in_flight=8),
             event_log=events,
@@ -161,7 +161,7 @@ class EventLogDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_run_failed_and_batch_skipped_events(self) -> None:
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         events = create_event_log(default_logging=False)
         failed: list[Mapping[str, Any]] = []
         skipped: list[Mapping[str, Any]] = []
@@ -174,7 +174,7 @@ class EventLogDispatcherTests(unittest.IsolatedAsyncioTestCase):
         worker = HandlerSpec("worker", object(), (source,), batch_size=(1, 5), max_retries=0)
         dispatcher = RayDispatcher(
             (worker,),
-            ray_backend=backend,
+            ray_adapter=backend,
             checkpoint_store=MemoryCheckpointStore(),
             config=DispatcherConfig(max_in_flight=8),
             event_log=events,
@@ -198,7 +198,7 @@ class EventLogDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_hook_error_recorded_without_breaking_commit(self) -> None:
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         events = create_event_log(default_logging=False)
 
         def boom(_: Mapping[str, Any]) -> None:
@@ -211,7 +211,7 @@ class EventLogDispatcherTests(unittest.IsolatedAsyncioTestCase):
         worker = HandlerSpec("worker", object(), (source,), batch_size=(1, 5), max_retries=0)
         dispatcher = RayDispatcher(
             (worker,),
-            ray_backend=backend,
+            ray_adapter=backend,
             checkpoint_store=MemoryCheckpointStore(),
             event_log=events,
             event_log_interval=0,

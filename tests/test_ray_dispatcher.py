@@ -21,7 +21,7 @@ from ray_dispatcher import (
     KafkaSource,
     MemoryCheckpointStore,
     MemoryFailureStore,
-    NativeRayBackend,
+    NativeRayAdapter,
     PostgresCursor,
     PostgresSource,
     RayDispatcher,
@@ -92,7 +92,7 @@ class FakeSourceObserver:
         return self.pg_count[source.source_id]
 
 
-class FakeRayBackend:
+class FakeRayAdapter:
     def __init__(self, cpus: float | None = 100.0) -> None:
         self.cpus = cpus
         self.sequence = 0
@@ -187,6 +187,14 @@ class ReadyObjectRef:
 
 
 class FakeNativeRayModule:
+    def __init__(self) -> None:
+        self.puts: list[tuple[str, Any]] = []
+
+    def put(self, value: Any) -> str:
+        ref = f"put-ref-{len(self.puts) + 1}"
+        self.puts.append((ref, value))
+        return ref
+
     @staticmethod
     def wait(refs: list[Any], *, num_returns: int, timeout: int):
         assert timeout == 0
@@ -215,19 +223,28 @@ class RecordingActorClass:
     def __init__(self) -> None:
         self.options_calls: list[dict[str, Any]] = []
         self.remote_instances: list["RecordingActorInstance"] = []
+        self.constructor_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
 
     def options(self, **kwargs: Any) -> "RecordingActorClass":
         self.options_calls.append(kwargs)
         return self
 
-    def remote(self) -> "RecordingActorInstance":
-        instance = RecordingActorInstance()
+    def remote(self, *args: Any, **kwargs: Any) -> "RecordingActorInstance":
+        self.constructor_calls.append((args, kwargs))
+        instance = RecordingActorInstance(init_args=args, init_kwargs=kwargs)
         self.remote_instances.append(instance)
         return instance
 
 
 class RecordingActorInstance:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        init_args: tuple[Any, ...] = (),
+        init_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        self.init_args = init_args
+        self.init_kwargs = init_kwargs or {}
         self.process = RecordingRemoteFunction()
 
 
@@ -246,7 +263,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
     async def _complete_fetches(
         self,
         dispatcher: RayDispatcher,
-        backend: FakeRayBackend,
+        backend: FakeRayAdapter,
         *,
         value: Any | None = None,
     ) -> None:
@@ -270,7 +287,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_shared_source_fetches_once_and_commits_after_all_handlers(self) -> None:
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         checkpoints = MemoryCheckpointStore()
         source = KafkaSource(
             "events", ("broker",), "events", initial_offset="earliest"
@@ -278,7 +295,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         workers = self._shared_workers(source)
         dispatcher = RayDispatcher(
             workers,
-            ray_backend=backend,
+            ray_adapter=backend,
             checkpoint_store=checkpoints,
             config=DispatcherConfig(max_in_flight=3),
         )
@@ -326,7 +343,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_single_handler_also_uses_fetch_path(self) -> None:
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         checkpoints = MemoryCheckpointStore()
         source = KafkaSource(
             "events", ("broker",), "events", initial_offset="earliest"
@@ -336,7 +353,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         dispatcher = RayDispatcher(
             (worker,),
-            ray_backend=backend,
+            ray_adapter=backend,
             checkpoint_store=checkpoints,
         )
         dispatcher.source_observer = client
@@ -363,14 +380,14 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_shared_handler_retry_reuses_fetch_ref(self) -> None:
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         source = KafkaSource(
             "events", ("broker",), "events", initial_offset="earliest"
         )
         workers = self._shared_workers(source)
         dispatcher = RayDispatcher(
             workers,
-            ray_backend=backend,
+            ray_adapter=backend,
             config=DispatcherConfig(max_in_flight=3),
         )
         dispatcher.source_observer = client
@@ -397,10 +414,10 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_kafka_batch_window_single_wave_and_gates(self) -> None:
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         checkpoints = MemoryCheckpointStore()
         source = KafkaSource(
-            "events", ("broker:9092",), "events", connection_id="primary-kafka"
+            "events", ("broker:9092",), "events"
         )
         worker = HandlerSpec(
             "event-worker",
@@ -410,7 +427,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         dispatcher = RayDispatcher(
             (worker,),
-            ray_backend=backend,
+            ray_adapter=backend,
             checkpoint_store=checkpoints,
             config=DispatcherConfig(max_in_flight=10),
         )
@@ -432,7 +449,6 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((100, 125), (request.start_offset, request.end_offset))
         self.assertEqual(1, request.n)
         self.assertEqual("events", request.topic)
-        self.assertEqual("primary-kafka", request.source_connection_id)
 
         await self._complete_fetches(dispatcher, backend)
         self.assertEqual(1, len(backend.submissions))
@@ -442,10 +458,10 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, dispatcher.state.sources[key].backlog)
 
         # Cap with [,10].
-        backend2 = FakeRayBackend()
+        backend2 = FakeRayAdapter()
         dispatcher2 = RayDispatcher(
             (HandlerSpec("cap", object(), (source,), batch_size=(None, 10)),),
-            ray_backend=backend2,
+            ray_adapter=backend2,
             checkpoint_store=MemoryCheckpointStore({key: 100}),
             config=DispatcherConfig(max_in_flight=10),
         )
@@ -456,10 +472,10 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((100, 110), (capped.start_offset, capped.end_offset))
 
         # Min gate [20,] with backlog 15.
-        backend3 = FakeRayBackend()
+        backend3 = FakeRayAdapter()
         dispatcher3 = RayDispatcher(
             (HandlerSpec("min", object(), (source,), batch_size=(20, None)),),
-            ray_backend=backend3,
+            ray_adapter=backend3,
             checkpoint_store=MemoryCheckpointStore({key: 110}),
             config=DispatcherConfig(max_in_flight=10),
         )
@@ -470,12 +486,12 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_ref_is_retried_with_same_dispatch_id(self) -> None:
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         source = KafkaSource("events", ("broker",), "events", initial_offset="earliest")
         worker = HandlerSpec(
             "worker", object(), (source,), batch_size=(1, 100), max_retries=1
         )
-        dispatcher = RayDispatcher((worker,), ray_backend=backend)
+        dispatcher = RayDispatcher((worker,), ray_adapter=backend)
         dispatcher.source_observer = client
         client.kafka["events"] = {0: (0, 5)}
         await dispatcher.data_listener()
@@ -500,13 +516,13 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_initial_submission_failure_is_automatically_retried(self) -> None:
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         backend.fail_submissions = 1
         source = KafkaSource("events", ("broker",), "events", initial_offset="earliest")
         worker = HandlerSpec(
             "worker", object(), (source,), max_retries=1, batch_size=0
         )
-        dispatcher = RayDispatcher((worker,), ray_backend=backend)
+        dispatcher = RayDispatcher((worker,), ray_adapter=backend)
         dispatcher.source_observer = client
         client.kafka["events"] = {0: (0, 5)}
         await dispatcher.data_listener()
@@ -531,7 +547,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_postgres_composite_cursor_window_uses_task_slices(self) -> None:
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         start = PostgresCursor(datetime(2026, 1, 1, tzinfo=timezone.utc), "0")
         end = PostgresCursor(start.timestamp + timedelta(minutes=1), "999")
         source = PostgresSource(
@@ -547,7 +563,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         checkpoints = MemoryCheckpointStore()
         dispatcher = RayDispatcher(
-            (worker,), ray_backend=backend, checkpoint_store=checkpoints
+            (worker,), ray_adapter=backend, checkpoint_store=checkpoints
         )
         dispatcher.source_observer = client
         client.pg_upper["orders"] = end
@@ -579,7 +595,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_postgres_numeric_primary_keys_keep_database_order(self) -> None:
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         timestamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
         start = PostgresCursor(timestamp, 9)
         end = PostgresCursor(timestamp, 10)
@@ -587,7 +603,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
             "orders", "dsn", "orders", "updated_at", "id", initial_cursor=start
         )
         worker = HandlerSpec("worker", object(), (source,))
-        dispatcher = RayDispatcher((worker,), ray_backend=backend)
+        dispatcher = RayDispatcher((worker,), ray_adapter=backend)
         dispatcher.source_observer = client
         client.pg_upper["orders"] = end
         client.pg_count["orders"] = 1
@@ -598,13 +614,13 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_retention_gap_fails_without_silently_skipping_data(self) -> None:
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         source = KafkaSource("events", ("broker",), "events")
         worker = HandlerSpec("worker", object(), (source,))
         key = "shared:events:0"
         checkpoints = MemoryCheckpointStore({key: 5})
         dispatcher = RayDispatcher(
-            (worker,), ray_backend=backend, checkpoint_store=checkpoints
+            (worker,), ray_adapter=backend, checkpoint_store=checkpoints
         )
         dispatcher.source_observer = client
         client.kafka["events"] = {0: (10, 20)}
@@ -615,7 +631,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_explicit_retention_reset_resumes_from_new_low_watermark(self) -> None:
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         source = KafkaSource(
             "events",
             ("broker",),
@@ -626,7 +642,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         key = "shared:events:0"
         checkpoints = MemoryCheckpointStore({key: 5})
         dispatcher = RayDispatcher(
-            (worker,), ray_backend=backend, checkpoint_store=checkpoints
+            (worker,), ray_adapter=backend, checkpoint_store=checkpoints
         )
         dispatcher.source_observer = client
         client.kafka["events"] = {0: (10, 20)}
@@ -639,7 +655,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_retention_reset_does_not_overwrite_an_active_batch(self) -> None:
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         source = KafkaSource(
             "events",
             ("broker",),
@@ -650,7 +666,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         worker = HandlerSpec("worker", object(), (source,), batch_size=0)
         checkpoints = MemoryCheckpointStore()
         dispatcher = RayDispatcher(
-            (worker,), ray_backend=backend, checkpoint_store=checkpoints
+            (worker,), ray_adapter=backend, checkpoint_store=checkpoints
         )
         dispatcher.source_observer = client
         client.kafka["events"] = {0: (0, 20)}
@@ -673,7 +689,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_actor_pool_can_accept_a_second_wave_when_free_cpu_is_zero(self) -> None:
         client = FakeSourceObserver()
-        backend = FakeRayBackend(cpus=1)
+        backend = FakeRayAdapter(cpus=1)
         source = KafkaSource("events", ("broker",), "events", initial_offset="earliest")
         worker = HandlerSpec(
             "worker",
@@ -683,7 +699,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
             remote_method="process",
             batch_size=0,
         )
-        dispatcher = RayDispatcher((worker,), ray_backend=backend)
+        dispatcher = RayDispatcher((worker,), ray_adapter=backend)
         dispatcher.source_observer = client
         client.kafka["events"] = {0: (0, 1)}
         await dispatcher.data_listener()
@@ -700,8 +716,8 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         second_wave = await dispatcher.ray_trigger()
         self.assertEqual(1, len(second_wave))
 
-    def test_native_backend_reuses_a_single_actor_per_handler(self) -> None:
-        backend = NativeRayBackend(FakeNativeRayModule())
+    def test_native_adapter_reuses_a_single_actor_per_handler(self) -> None:
+        backend = NativeRayAdapter(FakeNativeRayModule())
         actor_cls = RecordingActorClass()
         source = KafkaSource("events", ("broker",), "events")
         worker = HandlerSpec(
@@ -719,13 +735,14 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         backend.submit(worker, request, data_ref)
 
         self.assertEqual(1, len(actor_cls.remote_instances))
+        self.assertEqual((), actor_cls.constructor_calls[0][0])
         self.assertEqual(3, len(actor_cls.remote_instances[0].process.remote_calls))
         self.assertEqual(
             (request, data_ref),
             actor_cls.remote_instances[0].process.remote_calls[0][0],
         )
 
-    def test_native_backend_loads_resource_snapshot_once(self) -> None:
+    def test_native_adapter_puts_task_resources_once(self) -> None:
         data = {1: {"name": "alice"}}
         loader = ResourceLoader(
             {
@@ -734,7 +751,8 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
                 )
             }
         )
-        backend = NativeRayBackend(FakeNativeRayModule(), resource_loader=loader)
+        ray_module = FakeNativeRayModule()
+        backend = NativeRayAdapter(ray_module, resource_loader=loader)
         remote = RecordingRemoteFunction()
         source = KafkaSource("events", ("broker",), "events")
         worker = HandlerSpec(
@@ -750,15 +768,94 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         backend.submit(worker, request, data_ref)
 
         self.assertIs(loader.get("user-dim-v1"), data)
-        resources = {"user-dim-v1": data}
+        self.assertEqual(1, len(ray_module.puts))
+        put_ref, put_value = ray_module.puts[0]
+        self.assertEqual({"user-dim-v1": data}, put_value)
         self.assertEqual(
-            ((request, data_ref, resources), {}),
+            ((request, data_ref, put_ref), {}),
             remote.remote_calls[0],
         )
         self.assertEqual(remote.remote_calls[0][0][2], remote.remote_calls[1][0][2])
-        self.assertIs(
-            remote.remote_calls[0][0][2]["user-dim-v1"],
-            remote.remote_calls[1][0][2]["user-dim-v1"],
+        self.assertIs(remote.remote_calls[0][0][2], put_ref)
+
+    def test_native_adapter_injects_actor_resources_at_construction(self) -> None:
+        data = {1: {"name": "alice"}}
+        loader = ResourceLoader(
+            {
+                "user-dim-v1": ResourceSpec(
+                    "user-dim-v1", kind="static", data=data
+                )
+            }
+        )
+        ray_module = FakeNativeRayModule()
+        backend = NativeRayAdapter(ray_module, resource_loader=loader)
+        actor_cls = RecordingActorClass()
+        source = KafkaSource("events", ("broker",), "events")
+        worker = HandlerSpec(
+            "worker",
+            actor_cls,
+            (source,),
+            mode=ExecutionMode.ACTOR,
+            remote_method="process",
+            resource_ids=("user-dim-v1",),
+        )
+        request = HandlerRequest(dispatch_id="dispatch", handler_id="worker")
+        data_ref = object()
+
+        backend.submit(worker, request, data_ref)
+        backend.submit(worker, request, data_ref)
+
+        self.assertEqual(1, len(actor_cls.remote_instances))
+        self.assertEqual(
+            ({"user-dim-v1": data},),
+            actor_cls.constructor_calls[0][0],
+        )
+        self.assertEqual([], ray_module.puts)
+        self.assertEqual(
+            (request, data_ref),
+            actor_cls.remote_instances[0].process.remote_calls[0][0],
+        )
+        self.assertEqual(
+            (request, data_ref),
+            actor_cls.remote_instances[0].process.remote_calls[1][0],
+        )
+
+    def test_native_adapter_clears_put_cache_when_loader_replaced(self) -> None:
+        loader = ResourceLoader(
+            {
+                "user-dim-v1": ResourceSpec(
+                    "user-dim-v1", kind="static", data={1: {"name": "a"}}
+                )
+            }
+        )
+        ray_module = FakeNativeRayModule()
+        backend = NativeRayAdapter(ray_module, resource_loader=loader)
+        remote = RecordingRemoteFunction()
+        source = KafkaSource("events", ("broker",), "events")
+        worker = HandlerSpec(
+            "worker",
+            remote,
+            (source,),
+            resource_ids=("user-dim-v1",),
+        )
+        request = HandlerRequest(dispatch_id="dispatch", handler_id="worker")
+
+        backend.submit(worker, request, object())
+        backend.resource_loader = ResourceLoader(
+            {
+                "user-dim-v1": ResourceSpec(
+                    "user-dim-v1", kind="static", data={1: {"name": "b"}}
+                )
+            }
+        )
+        backend.submit(worker, request, object())
+
+        self.assertEqual(2, len(ray_module.puts))
+        self.assertEqual({1: {"name": "a"}}, ray_module.puts[0][1]["user-dim-v1"])
+        self.assertEqual({1: {"name": "b"}}, ray_module.puts[1][1]["user-dim-v1"])
+        self.assertNotEqual(
+            remote.remote_calls[0][0][2],
+            remote.remote_calls[1][0][2],
         )
 
     def test_trigger_rank_key_is_progressive(self) -> None:
@@ -809,7 +906,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_permanent_failure_skips_range_and_unblocks_source(self) -> None:
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         checkpoints = MemoryCheckpointStore()
         failures = MemoryFailureStore()
         source = KafkaSource("events", ("broker",), "events", initial_offset="earliest")
@@ -822,7 +919,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         dispatcher = RayDispatcher(
             (worker,),
-            ray_backend=backend,
+            ray_adapter=backend,
             checkpoint_store=checkpoints,
             failure_store=failures,
             # One slice needs fetch + handler; keep a single batch in flight.
@@ -870,7 +967,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_shared_permanent_failure_records_fetch_payload(self) -> None:
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         failures = MemoryFailureStore()
         source = KafkaSource(
             "events", ("broker",), "events", initial_offset="earliest"
@@ -886,7 +983,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         dispatcher = RayDispatcher(
             workers,
-            ray_backend=backend,
+            ray_adapter=backend,
             failure_store=failures,
             config=DispatcherConfig(max_in_flight=8),
         )
@@ -912,12 +1009,12 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_periodic_loops_start_and_stop_cleanly(self) -> None:
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         source = KafkaSource("events", ("broker",), "events")
         worker = HandlerSpec("worker", object(), (source,))
         dispatcher = RayDispatcher(
             (worker,),
-            ray_backend=backend,
+            ray_adapter=backend,
             listener_interval=0.01,
             trigger_interval=0.01,
             status_interval=0.01,
@@ -929,8 +1026,8 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         await dispatcher.stop()
         self.assertEqual([], dispatcher.state.loop_errors)
 
-    async def test_native_backend_poll_maps_original_object_refs(self) -> None:
-        backend = NativeRayBackend(FakeNativeRayModule())
+    async def test_native_adapter_poll_maps_original_object_refs(self) -> None:
+        backend = NativeRayAdapter(FakeNativeRayModule())
         first = ReadyObjectRef("first-result")
         second = ReadyObjectRef("second-result")
 
@@ -940,8 +1037,8 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("first-result", results["run-1"].value)
         self.assertEqual("second-result", results["run-2"].value)
 
-    async def test_native_backend_passes_shared_ref_as_top_level_argument(self) -> None:
-        backend = NativeRayBackend(FakeNativeRayModule())
+    async def test_native_adapter_passes_shared_ref_as_top_level_argument(self) -> None:
+        backend = NativeRayAdapter(FakeNativeRayModule())
         remote = RecordingRemoteFunction()
         source = KafkaSource("events", ("broker",), "events")
         worker = HandlerSpec("worker", remote, (source,))
@@ -977,7 +1074,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_multisource_window_merges_records_dict(self) -> None:
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
         t_right = t0 + timedelta(seconds=100)
         orders = KafkaSource(
@@ -997,7 +1094,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         dispatcher = RayDispatcher(
             (worker,),
-            ray_backend=backend,
+            ray_adapter=backend,
             checkpoint_store=checkpoints,
             config=DispatcherConfig(max_in_flight=16, max_window_seconds=60.0),
         )
@@ -1064,7 +1161,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         """Missing offsets_for_times must not fall back to low (silent catch-up)."""
 
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
         t_right = t0 + timedelta(seconds=100)
         orders = KafkaSource(
@@ -1084,7 +1181,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         dispatcher = RayDispatcher(
             (worker,),
-            ray_backend=backend,
+            ray_adapter=backend,
             checkpoint_store=checkpoints,
             config=DispatcherConfig(max_in_flight=16, max_window_seconds=60.0),
         )
@@ -1160,7 +1257,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_handler_checkpoint_state_commits_and_restores_on_actor(self) -> None:
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         source = KafkaSource(
             "events", ("broker",), "events", initial_offset="earliest"
         )
@@ -1176,7 +1273,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         checkpoints = MemoryCheckpointStore()
         dispatcher = RayDispatcher(
             (worker,),
-            ray_backend=backend,
+            ray_adapter=backend,
             checkpoint_store=checkpoints,
             config=DispatcherConfig(max_in_flight=8),
         )
@@ -1223,7 +1320,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_actor_retry_clears_checkpoint_state(self) -> None:
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         source = KafkaSource(
             "events", ("broker",), "events", initial_offset="earliest"
         )
@@ -1245,7 +1342,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         dispatcher = RayDispatcher(
             (worker,),
-            ray_backend=backend,
+            ray_adapter=backend,
             checkpoint_store=checkpoints,
             config=DispatcherConfig(max_in_flight=8),
         )
@@ -1271,7 +1368,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_multisource_fetch_failure_skips_window(self) -> None:
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         failures = MemoryFailureStore()
         t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
         t_right = t0 + timedelta(seconds=100)
@@ -1293,7 +1390,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         dispatcher = RayDispatcher(
             (worker,),
-            ray_backend=backend,
+            ray_adapter=backend,
             checkpoint_store=checkpoints,
             failure_store=failures,
             config=DispatcherConfig(
@@ -1337,7 +1434,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_multisource_handler_failure_skips_window(self) -> None:
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         failures = MemoryFailureStore()
         t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
         t_right = t0 + timedelta(seconds=100)
@@ -1359,7 +1456,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         dispatcher = RayDispatcher(
             (worker,),
-            ray_backend=backend,
+            ray_adapter=backend,
             checkpoint_store=checkpoints,
             failure_store=failures,
             config=DispatcherConfig(max_in_flight=16, max_window_seconds=60.0),
@@ -1409,14 +1506,14 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
                 return {0: (0, 5)}
 
         client = SlowObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         source = KafkaSource(
             "events", ("broker",), "events", initial_offset="earliest"
         )
         worker = HandlerSpec("worker", object(), (source,), batch_size=(1, 5))
         dispatcher = RayDispatcher(
             (worker,),
-            ray_backend=backend,
+            ray_adapter=backend,
             checkpoint_store=MemoryCheckpointStore(),
         )
         dispatcher.source_observer = client
@@ -1450,7 +1547,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
                 await super().save_many(items)
 
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         checkpoints = SlowCheckpointStore()
         source = KafkaSource(
             "events", ("broker",), "events", initial_offset="earliest"
@@ -1458,7 +1555,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         worker = HandlerSpec("worker", object(), (source,), batch_size=(1, 5), max_retries=0)
         dispatcher = RayDispatcher(
             (worker,),
-            ray_backend=backend,
+            ray_adapter=backend,
             checkpoint_store=checkpoints,
         )
         dispatcher.source_observer = client
@@ -1573,7 +1670,7 @@ class TriggerDispatcherIntegrationTests(unittest.IsolatedAsyncioTestCase):
         from ray_dispatcher import EVENT_TRIGGER_EVALUATED, create_event_log
 
         client = FakeSourceObserver()
-        backend = FakeRayBackend()
+        backend = FakeRayAdapter()
         events = create_event_log(default_logging=False)
         evaluated: list[Mapping[str, Any]] = []
         events.register(EVENT_TRIGGER_EVALUATED, evaluated.append)
@@ -1587,7 +1684,7 @@ class TriggerDispatcherIntegrationTests(unittest.IsolatedAsyncioTestCase):
         # to schedule → BLOCK via HasCapacity.
         dispatcher = RayDispatcher(
             (worker,),
-            ray_backend=backend,
+            ray_adapter=backend,
             checkpoint_store=MemoryCheckpointStore(),
             config=DispatcherConfig(max_in_flight=3),
             event_log=events,

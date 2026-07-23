@@ -1,4 +1,4 @@
-"""Native Ray execution backend."""
+"""Native Ray execution adapter."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from ray_dispatcher.resources import ResourceLoader
 from ray_dispatcher.readers import merge_fetch_results
 
 
-class RayBackend(Protocol):
+class RayAdapter(Protocol):
     """Dispatcher 与执行层之间的适配接口（鸭子类型）。"""
 
     def submit(
@@ -28,8 +28,8 @@ class RayBackend(Protocol):
     ) -> Any:
         """提交业务 Handler 任务。
 
-        参数顺序：``request`` → ``records``（``data_ref``）→ ``resources?``。
-        Task 与 Actor 模式都走此入口；返回可轮询的 ObjectRef / Future。
+        Task：``request`` → ``records``（``data_ref``）→ ``resources?``（共享 ObjectRef）。
+        Actor：``request`` → ``records``；``resources`` 仅在 Actor 构造时注入一次。
         """
         ...
 
@@ -74,7 +74,7 @@ class RayBackend(Protocol):
         ...
 
 
-class NativeRayBackend:
+class NativeRayAdapter:
     """Ray 适配：支持 remote function，以及每个 Handler 复用一个 Actor。"""
 
     def __init__(
@@ -88,13 +88,26 @@ class NativeRayBackend:
             try:
                 import ray as ray_module  # type: ignore[import-not-found]
             except ImportError as exc:
-                raise RuntimeError("Ray is not installed; pass a custom RayBackend") from exc
+                raise RuntimeError(
+                    "Ray is not installed; pass a custom RayAdapter"
+                ) from exc
         self.ray = ray_module
         self._actors: dict[str, Any] = {}
         self._actors_need_restore: set[str] = set()
         self._payload_fetch_remote = payload_fetch_remote
         self._merge_remote = None
-        self.resource_loader = resource_loader or ResourceLoader()
+        self._resource_loader = resource_loader or ResourceLoader()
+        # Task-mode shared puts: resource_ids tuple -> ObjectRef of load_many payload.
+        self._resource_put_refs: dict[tuple[str, ...], Any] = {}
+
+    @property
+    def resource_loader(self) -> ResourceLoader:
+        return self._resource_loader
+
+    @resource_loader.setter
+    def resource_loader(self, value: ResourceLoader) -> None:
+        self._resource_loader = value
+        self._resource_put_refs.clear()
 
     def set_payload_fetch_remote(self, remote_fn: Any) -> None:
         """绑定框架 PayloadReader 的 Ray remote，供 ``submit_fetch`` 使用。"""
@@ -128,20 +141,46 @@ class NativeRayBackend:
         self._actors.pop(handler_name, None)
         self._actors_need_restore.discard(handler_name)
 
-    def _actor(self, spec: HandlerSpec) -> Any:
-        # One long-lived actor per handler. In-flight method concurrency is
-        # limited by global slots / CPUs; Ray queues extras.
-        actor = self._actors.get(spec.name)
-        if actor is None:
-            actor = spec.worker.options(num_cpus=spec.cpus_per_task).remote()
-            self._actors[spec.name] = actor
-            self._actors_need_restore.add(spec.name)
-        return actor
-
-    def _resources_arg(self, spec: HandlerSpec) -> dict[str, Any] | None:
+    def _resources_payload(self, spec: HandlerSpec) -> dict[str, Any] | None:
         if not spec.resource_ids:
             return None
         return self.resource_loader.load_many(spec.resource_ids)
+
+    def _resources_put_ref(self, spec: HandlerSpec) -> Any | None:
+        """Return a cached ``ray.put`` ObjectRef for this handler's resource set."""
+
+        if not spec.resource_ids:
+            return None
+        key = spec.resource_ids
+        cached = self._resource_put_refs.get(key)
+        if cached is not None:
+            return cached
+        payload = self._resources_payload(spec)
+        assert payload is not None
+        put = getattr(self.ray, "put", None)
+        if put is None:
+            raise RuntimeError(
+                "ray.put is required to share Task-mode resources; "
+                "pass a Ray module that implements put()"
+            )
+        ref = put(payload)
+        self._resource_put_refs[key] = ref
+        return ref
+
+    def _actor(self, spec: HandlerSpec) -> Any:
+        # One long-lived actor per handler. Resources are injected once at
+        # construction; process() only receives request / records.
+        actor = self._actors.get(spec.name)
+        if actor is None:
+            resources = self._resources_payload(spec)
+            options = spec.worker.options(num_cpus=spec.cpus_per_task)
+            if resources is not None:
+                actor = options.remote(resources)
+            else:
+                actor = options.remote()
+            self._actors[spec.name] = actor
+            self._actors_need_restore.add(spec.name)
+        return actor
 
     def submit(
         self,
@@ -149,18 +188,22 @@ class NativeRayBackend:
         request: HandlerRequest,
         data_ref: Any | None = None,
     ) -> Any:
-        """提交业务 Handler：``request`` → ``records`` → ``resources?``。"""
+        """提交业务 Handler：Task 共享 resources ObjectRef；Actor 构造期注入。"""
 
         args: tuple[Any, ...] = (request,)
         if data_ref is not None:
             # Keep the ObjectRef as a top-level Ray argument so Ray resolves the
             # dependency and all handlers reuse the same object-store value.
             args = (*args, data_ref)
-        resources = self._resources_arg(spec)
-        if resources is not None:
-            args = (*args, resources)
         if spec.mode is ExecutionMode.TASK:
-            target = getattr(spec.worker, spec.remote_method) if spec.remote_method else spec.worker
+            resources_ref = self._resources_put_ref(spec)
+            if resources_ref is not None:
+                args = (*args, resources_ref)
+            target = (
+                getattr(spec.worker, spec.remote_method)
+                if spec.remote_method
+                else spec.worker
+            )
             return target.options(num_cpus=spec.cpus_per_task).remote(*args)
 
         actor = self._actor(spec)
@@ -238,4 +281,4 @@ class NativeRayBackend:
         return float(self.ray.available_resources().get("CPU", 0.0))
 
 
-__all__ = ["NativeRayBackend", "RayBackend"]
+__all__ = ["NativeRayAdapter", "RayAdapter"]

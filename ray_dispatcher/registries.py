@@ -93,9 +93,6 @@ def source_from_mapping(raw: Mapping[str, Any]) -> SourceSpec:
             topic=str(raw["topic"]),
             initial_offset=str(raw.get("initial_offset", "latest")),
             retention_policy=str(raw.get("retention_policy", "error")),
-            connection_id=(
-                str(raw["connection_id"]) if raw.get("connection_id") else None
-            ),
         )
     if kind == "postgres":
         initial = raw.get("initial_cursor")
@@ -116,9 +113,6 @@ def source_from_mapping(raw: Mapping[str, Any]) -> SourceSpec:
             timestamp_column=str(raw["timestamp_column"]),
             primary_key_column=str(raw["primary_key_column"]),
             initial_cursor=initial_cursor,
-            connection_id=(
-                str(raw["connection_id"]) if raw.get("connection_id") else None
-            ),
         )
     raise ValueError(f"unsupported source kind: {kind!r}")
 
@@ -240,7 +234,6 @@ def source_canonical_dict(source: SourceSpec) -> dict[str, Any]:
             "topic": source.topic,
             "initial_offset": source.initial_offset,
             "retention_policy": source.retention_policy,
-            "connection_id": source.connection_id,
         }
     if isinstance(source, PostgresSource):
         initial: Any = None
@@ -257,7 +250,6 @@ def source_canonical_dict(source: SourceSpec) -> dict[str, Any]:
             "timestamp_column": source.timestamp_column,
             "primary_key_column": source.primary_key_column,
             "initial_cursor": initial,
-            "connection_id": source.connection_id,
         }
     raise TypeError(f"unsupported source type: {type(source).__name__}")
 

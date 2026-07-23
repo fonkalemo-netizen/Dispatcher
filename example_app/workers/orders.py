@@ -17,7 +17,6 @@ OUTPUT_ROOT = Path(
 SOURCES = {
     "demo-orders": {
         "kind": "kafka",
-        "connection_id": "demo-kafka",
         "brokers": ["demo-kafka:9092"],
         "topic": "orders",
         "initial_offset": "earliest",

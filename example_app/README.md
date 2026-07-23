@@ -33,7 +33,7 @@ python3 main.py
 `DemoPayloadReader` 按 Dispatcher 分配的范围生成一次订单记录，两个处理函数复用它，并使用各自的
 `dispatch_id` 命名文件；重试会覆盖同名文件，因此示例写入是幂等的。
 
-如果运行环境不允许 Ray 创建进程或监听端口，示例会自动退化到线程后端（`LocalThreadBackend` 同样走
+如果运行环境不允许 Ray 创建进程或监听端口，示例会自动退化到线程适配（`LocalThreadAdapter` 同样走
 `submit_fetch` + `ResourceLoader`），以便仍能验证完整 Handler/Dispatcher 流程。生产验证可以设置
 `DEMO_REQUIRE_RAY=1`，此时 Ray 启动失败会直接报错而不降级。
 

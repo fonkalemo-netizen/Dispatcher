@@ -49,7 +49,10 @@ flowchart TD
 1. 若构造参数是目录路径，调用 `discover_workers(directory, source_registry=..., resource_registry=...)`。
 2. 扫描目录下所有非下划线开头的 `*.py` 并导入（顶层代码会执行，目录必须可信）。
 3. 收集各模块 `SOURCES` / `RESOURCES`（纯配置 mapping），与可选注入 registry 合并：同名且规范化配置不等价则失败，等价则保留一份。
-4. 每个模块必须导出 `HANDLERS`；每项通常只需 `entrypoint`（默认 ID 为 `{module}:{entrypoint}`，可用 `handler_id` 覆盖）。不再支持 `WORKER_CONFIG` / `WORKER_SPEC` / `get_worker_spec`。
+4. 模块可导出 `HANDLERS`；无 `HANDLERS` 或空列表则跳过该文件的 Handler 展开（仍合并其
+   `SOURCES` / `RESOURCES`）。每项通常只需 `entrypoint`（默认 ID 为
+   `{module}:{entrypoint}`，可用 `handler_id` 覆盖）。不再支持 `WORKER_CONFIG` /
+   `WORKER_SPEC` / `get_worker_spec`。整目录至少一个 Handler，否则报错。
 5. `sources` / `resources` 为合并后注册表中的名字；禁止 HANDLERS 内联 source mapping。
    - **Source**：随时间增量变化、由 Dispatcher 追进度（checkpoint / 窗口）。
    - **Resource**：快照旁路依赖（放进 `RESOURCES` 即快照语义）。`static` 仅小配置；大维表用 `file`；也可用 `postgres`（`query` 或 `table` + `key_column` + `dsn`）。合并完成后由 Dispatcher 在 `start()` 前统一 `ResourceLoader.preload()`；submit 热路径只读 cache。
@@ -112,7 +115,7 @@ backlog = high - committed
 7. 更新 `observed`、`backlog`、EWMA `arrival_rate`。
 8. 如果 checkpoint 落在 Kafka retention 范围外，根据配置报错或重置到 low。
 
-Kafka metadata Consumer 按 `(connection_id, brokers)` 缓存，并用可重入锁串行
+Kafka metadata Consumer 按 `brokers` 缓存，并用可重入锁串行
 `list_topics` / watermark / `offsets_for_times` 等调用（`asyncio.to_thread` 并发时也不共用
 裸 Consumer）。不同地址可并存；相同物理 topic 每个监听周期只查询一次，再共享 observed 水位。
 
@@ -218,25 +221,25 @@ dispatch_id
 worker_name          # handler_id 为其同义 property
 source_id
 source_kind
-source_connection_id
 topic / partition / start_offset / end_offset   # Kafka
 table / start_cursor / end_cursor               # Postgres
 window_start / window_end / source_ids          # 多源时间窗
 task_index
 task_count / n
 ```
-
-连接字段只是外部配置引用，不包含密码或客户端对象。
 可选的 `output`（mapping）进入瘦 `HandlerRequest.output`，供写出侧使用；框架不解释。
 Handler 业务应使用 `dispatch_id`、`handler_id`、`output`（及可选 `checkpoint_state`）与
-`records`/`resources`；offset/window 只在 fetch 用的 `DispatchRequest` 上。
+`records`；Task 可选 `resources`（共享 ObjectRef），Actor 从构造注入的实例字段读维表。
+offset/window 只在 fetch 用的 `DispatchRequest` 上。
 
 ### 共享 fetch 扇出
 
 每个 slice 先提交一次 `PayloadReader.fetch(request, source)`（经 `submit_fetch`）。fetch 成功后，
 原始 ObjectRef 作为顶层第二参数提交给每个 `handler(request, records)`；若 Handler 声明了
-`resources`，再注入 `ResourceLoader` 加载的快照/客户端。Ray 负责解析依赖，多个同 `source_id`
-的 Handler 不再重复读取 Kafka。Handler 自动重试继续复用该 ObjectRef。只有所有 fetch 和所有
+`resources`：Task 模式对 `load_many` 结果 `ray.put` 一次并以共享 ObjectRef 作为第三参数；
+Actor 模式仅在构造 `Actor.remote(resources)` 时注入，`process` 不再传 resources。
+Ray 负责解析顶层 ObjectRef 依赖，多个同 `source_id` 的 Handler 不再重复读取 Kafka。
+Handler 自动重试继续复用该 fetch ObjectRef。只有所有 fetch 和所有
 Handler 都成功，共享 checkpoint 才推进。
 
 ### Postgres

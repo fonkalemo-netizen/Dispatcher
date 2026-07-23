@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence, Union
 
-from ray_dispatcher.backend import RayBackend
+from ray_dispatcher.adapter import RayAdapter
 from ray_dispatcher.checkpoint import (
     CheckpointDocument,
     CheckpointStore,
@@ -182,7 +182,7 @@ class RayDispatcher:
         self,
         workers: Union[Sequence[HandlerSpec], str, Path],
         *,
-        ray_backend: RayBackend | None = None,
+        ray_adapter: RayAdapter | None = None,
         checkpoint_store: CheckpointStore | None = None,
         failure_store: FailureStore | None = None,
         trigger: TriggerPolicy | None = None,
@@ -206,27 +206,31 @@ class RayDispatcher:
         self.resource_loader = ResourceLoader(resource_registry)
         self._workers_dir: Path | None = None
 
-        if ray_backend is None:
-            from ray_dispatcher.backend import NativeRayBackend
+        if ray_adapter is None:
+            from ray_dispatcher.adapter import NativeRayAdapter
 
-            ray_backend = NativeRayBackend(resource_loader=self.resource_loader)
-        self.ray_backend = ray_backend
+            ray_adapter = NativeRayAdapter(resource_loader=self.resource_loader)
+        self.ray_adapter = ray_adapter
 
-        if hasattr(ray_backend, "set_payload_fetch_remote") and getattr(
-            ray_backend, "ray", None
+        if hasattr(ray_adapter, "set_payload_fetch_remote") and getattr(
+            ray_adapter, "ray", None
         ):
-            remote = ray_backend.ray.remote(max_retries=0)(self.payload_reader.fetch)
-            ray_backend.set_payload_fetch_remote(remote)
-        if hasattr(ray_backend, "set_merge_remote") and getattr(
-            ray_backend, "ray", None
+            from ray_dispatcher.readers import bind_payload_fetch
+
+            remote = ray_adapter.ray.remote(max_retries=0)(
+                bind_payload_fetch(self.payload_reader)
+            )
+            ray_adapter.set_payload_fetch_remote(remote)
+        if hasattr(ray_adapter, "set_merge_remote") and getattr(
+            ray_adapter, "ray", None
         ):
             from ray_dispatcher.readers import merge_fetch_results
 
-            ray_backend.set_merge_remote(
-                ray_backend.ray.remote(max_retries=0)(merge_fetch_results)
+            ray_adapter.set_merge_remote(
+                ray_adapter.ray.remote(max_retries=0)(merge_fetch_results)
             )
-        if hasattr(ray_backend, "resource_loader"):
-            ray_backend.resource_loader = self.resource_loader
+        if hasattr(ray_adapter, "resource_loader"):
+            ray_adapter.resource_loader = self.resource_loader
 
         if isinstance(workers, (str, Path)):
             from ray_dispatcher.discovery import discover_workers
@@ -234,15 +238,15 @@ class RayDispatcher:
             self._workers_dir = Path(workers).expanduser().resolve()
             workers, merged_sources, merged_resources = discover_workers(
                 self._workers_dir,
-                ray_module=getattr(ray_backend, "ray", None),
+                ray_module=getattr(ray_adapter, "ray", None),
                 source_registry=source_registry,
                 resource_registry=resource_registry,
             )
             self.source_registry = merged_sources
             self.resource_registry = merged_resources
             self.resource_loader = ResourceLoader(merged_resources)
-            if hasattr(ray_backend, "resource_loader"):
-                ray_backend.resource_loader = self.resource_loader
+            if hasattr(ray_adapter, "resource_loader"):
+                ray_adapter.resource_loader = self.resource_loader
 
         if not workers:
             raise ValueError("at least one worker is required")
@@ -509,11 +513,11 @@ class RayDispatcher:
         checkpoint_state = None
         if member.mode is ExecutionMode.ACTOR:
             needs_restore = False
-            prepare = getattr(self.ray_backend, "prepare_actor_restore", None)
+            prepare = getattr(self.ray_adapter, "prepare_actor_restore", None)
             if callable(prepare):
                 needs_restore = bool(prepare(member))
             else:
-                claim = getattr(self.ray_backend, "claim_actor_restore", None)
+                claim = getattr(self.ray_adapter, "claim_actor_restore", None)
                 if callable(claim):
                     needs_restore = bool(claim(member.name))
             if needs_restore:
@@ -682,13 +686,10 @@ class RayDispatcher:
     @staticmethod
     def _physical_source_key(source: SourceSpec) -> tuple[Any, ...]:
         if isinstance(source, KafkaSource):
-            connection_key: Any = source.connection_id or tuple(
-                sorted(source.brokers)
-            )
-            return (SourceKind.KAFKA, connection_key, source.topic)
+            return (SourceKind.KAFKA, tuple(sorted(source.brokers)), source.topic)
         return (
             SourceKind.POSTGRES,
-            source.connection_id or source.dsn,
+            source.dsn,
             source.table,
             source.timestamp_column,
             source.primary_key_column,
@@ -1112,7 +1113,7 @@ class RayDispatcher:
                 if batch.status is BatchStatus.RUNNING
             )
             free_slots = max(0, self.config.max_in_flight - active_global)
-            available_cpus = self.ray_backend.available_cpus()
+            available_cpus = self.ray_adapter.available_cpus()
             now = time.monotonic()
             # Coarse prefilter; TriggerPolicy is authoritative.
             candidates = [
@@ -1385,12 +1386,11 @@ class RayDispatcher:
                 end_offset=(int(chunk_end) if isinstance(source, KafkaSource) else None),
                 start_cursor=(chunk_start if isinstance(source, PostgresSource) else None),
                 end_cursor=(chunk_end if isinstance(source, PostgresSource) else None),
-                source_connection_id=source.connection_id,
                 topic=source.topic if isinstance(source, KafkaSource) else None,
                 table=source.table if isinstance(source, PostgresSource) else None,
             )
             try:
-                ref = self.ray_backend.submit_fetch(
+                ref = self.ray_adapter.submit_fetch(
                     representative,
                     request,
                     source,
@@ -1536,14 +1536,13 @@ class RayDispatcher:
                 partition=int(state.shard),
                 start_offset=start_offset,
                 end_offset=end_offset,
-                source_connection_id=source.connection_id,
                 topic=source.topic,
                 window_start=t_left,
                 window_end=t_right,
                 source_ids=source_ids,
             )
             try:
-                ref = self.ray_backend.submit_fetch(
+                ref = self.ray_adapter.submit_fetch(
                     representative,
                     request,
                     source,
@@ -1631,7 +1630,7 @@ class RayDispatcher:
             source_ids=merge_source_ids,
         )
         try:
-            ref = self.ray_backend.submit_merge(
+            ref = self.ray_adapter.submit_merge(
                 representative, merge_source_ids, fetch_refs
             )
             run = TaskRun(
@@ -1674,7 +1673,7 @@ class RayDispatcher:
                 member, run_id, actor_progress_key
             )
             try:
-                ref = self.ray_backend.submit(
+                ref = self.ray_adapter.submit(
                     member, handler_request, merge_run.ref
                 )
                 run = TaskRun(
@@ -1727,7 +1726,7 @@ class RayDispatcher:
             for run_id in refs:
                 if self.state.runs[run_id].status is RunStatus.SUBMITTED:
                     self.state.runs[run_id].status = RunStatus.RUNNING
-            outcomes = self.ray_backend.poll(refs)
+            outcomes = self.ray_adapter.poll(refs)
             if inspect.isawaitable(outcomes):
                 outcomes = await outcomes
             for run_id, outcome in outcomes.items():
@@ -1825,7 +1824,7 @@ class RayDispatcher:
                     member, run_id, batch.source_state_key
                 )
                 try:
-                    ref = self.ray_backend.submit(
+                    ref = self.ray_adapter.submit(
                         member, handler_request, fetch_run.ref
                     )
                     run = TaskRun(
@@ -1875,7 +1874,7 @@ class RayDispatcher:
                         ),
                         worker.sources[0],
                     )
-                    run.ref = self.ray_backend.submit_fetch(
+                    run.ref = self.ray_adapter.submit_fetch(
                         worker,
                         run.request,
                         source,
@@ -1887,7 +1886,7 @@ class RayDispatcher:
                         self.state.runs[run_id].ref
                         for run_id in batch.fetch_run_ids
                     ]
-                    run.ref = self.ray_backend.submit_merge(
+                    run.ref = self.ray_adapter.submit_merge(
                         worker,
                         run.request.source_ids or batch.fetch_source_ids,
                         fetch_refs,
@@ -1895,13 +1894,13 @@ class RayDispatcher:
                 elif run.data_ref is not None:
                     assert isinstance(run.request, HandlerRequest)
                     run.request = self._handler_request_for_retry(run.request)
-                    run.ref = self.ray_backend.submit(
+                    run.ref = self.ray_adapter.submit(
                         worker, run.request, run.data_ref
                     )
                 else:
                     assert isinstance(run.request, HandlerRequest)
                     run.request = self._handler_request_for_retry(run.request)
-                    run.ref = self.ray_backend.submit(worker, run.request)
+                    run.ref = self.ray_adapter.submit(worker, run.request)
                 run.status = RunStatus.SUBMITTED
                 run.submitted_at = time.monotonic()
                 return
@@ -2095,7 +2094,7 @@ class RayDispatcher:
                 fetch_payloads: list[Any] = []
                 for ref in pending.fetch_refs:
                     try:
-                        fetch_payloads.append(await self.ray_backend.get(ref))
+                        fetch_payloads.append(await self.ray_adapter.get(ref))
                     except Exception as exc:
                         payload_error = (
                             f"failed to materialize fetch: "
@@ -2347,7 +2346,6 @@ class RayDispatcher:
                     "primary_key": request.end_cursor.primary_key,
                 }
             ),
-            "source_connection_id": request.source_connection_id,
             "topic": request.topic,
             "table": request.table,
             "window_start": (
@@ -2403,7 +2401,7 @@ class RayDispatcher:
 
         workers, merged_sources, merged_resources = discover_workers(
             self._workers_dir,
-            ray_module=getattr(self.ray_backend, "ray", None),
+            ray_module=getattr(self.ray_adapter, "ray", None),
             source_registry=self._injected_source_registry,
             resource_registry=self._injected_resource_registry,
         )
@@ -2440,11 +2438,11 @@ class RayDispatcher:
             self.source_registry = merged_sources
             self.resource_registry = merged_resources
             self.resource_loader = new_loader
-            if hasattr(self.ray_backend, "resource_loader"):
-                self.ray_backend.resource_loader = new_loader
+            if hasattr(self.ray_adapter, "resource_loader"):
+                self.ray_adapter.resource_loader = new_loader
             self._sync_multisource_windows()
             self._config_fingerprint = fingerprint
-            drop = getattr(self.ray_backend, "drop_actor", None)
+            drop = getattr(self.ray_adapter, "drop_actor", None)
             if callable(drop):
                 for name in old_names | set(self.workers):
                     drop(name)
@@ -2540,7 +2538,6 @@ class RayDispatcher:
                         if isinstance(run.request, HandlerRequest)
                         else {
                             "output": None,
-                            "source_connection": run.request.source_connection_id,
                             "topic": run.request.topic,
                             "table": run.request.table,
                         }

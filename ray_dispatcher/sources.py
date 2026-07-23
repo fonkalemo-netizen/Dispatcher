@@ -176,7 +176,7 @@ class SourceObserver:
         """Return a shared metadata consumer. Caller must hold ``_kafka_lock``."""
 
         brokers = tuple(source.brokers)
-        connection_key = (source.connection_id, *sorted(brokers))
+        connection_key = tuple(sorted(brokers))
         consumer = self._kafka_consumers.get(connection_key)
         if consumer is not None:
             return consumer

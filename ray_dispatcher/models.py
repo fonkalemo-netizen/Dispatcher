@@ -118,7 +118,6 @@ class KafkaSource:
     topic: str
     initial_offset: Literal["latest", "earliest"] = "latest"
     retention_policy: Literal["error", "reset_to_earliest"] = "error"
-    connection_id: str | None = None
     kind: SourceKind = field(default=SourceKind.KAFKA, init=False)
 
 
@@ -130,7 +129,6 @@ class PostgresSource:
     timestamp_column: str
     primary_key_column: str
     initial_cursor: PostgresCursor | None = None
-    connection_id: str | None = None
     kind: SourceKind = field(default=SourceKind.POSTGRES, init=False)
 
 
@@ -159,7 +157,6 @@ class DispatchRequest:
     end_offset: int | None = None
     start_cursor: PostgresCursor | None = None
     end_cursor: PostgresCursor | None = None
-    source_connection_id: str | None = None
     topic: str | None = None
     table: str | None = None
     window_start: datetime | None = None

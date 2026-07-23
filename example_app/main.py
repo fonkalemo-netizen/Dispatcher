@@ -27,10 +27,10 @@ except ImportError:  # The complete demo can still run through its local fallbac
 
 from demo_reader import DemoPayloadReader  # noqa: E402
 from demo_source import DemoSourceObserver  # noqa: E402
-from local_backend import LocalThreadBackend  # noqa: E402
+from local_adapter import LocalThreadAdapter  # noqa: E402
 from ray_dispatcher import (  # noqa: E402
     DispatcherConfig,
-    NativeRayBackend,
+    NativeRayAdapter,
     RayDispatcher,
     SQLiteCheckpointStore,
     SQLiteFailureStore,
@@ -72,7 +72,7 @@ async def main() -> None:
     # A production process must keep this file across restarts.
     clear_previous_demo_state()
     payload_reader = DemoPayloadReader()
-    local_backend = None
+    local_adapter = None
     if ray is not None:
         try:
             ray.init(
@@ -81,28 +81,28 @@ async def main() -> None:
                 include_dashboard=False,
                 ignore_reinit_error=True,
             )
-            backend = NativeRayBackend(ray)
-            print("runtime backend: Ray")
+            backend = NativeRayAdapter(ray)
+            print("runtime adapter: Ray")
         except Exception as exc:
             if os.environ.get("DEMO_REQUIRE_RAY") == "1":
                 raise
             ray.shutdown()
             print(f"Ray unavailable ({type(exc).__name__}: {exc}); using thread fallback")
-            local_backend = LocalThreadBackend(
+            local_adapter = LocalThreadAdapter(
                 max_workers=4, payload_reader=payload_reader
             )
-            backend = local_backend
+            backend = local_adapter
     else:
-        local_backend = LocalThreadBackend(
+        local_adapter = LocalThreadAdapter(
             max_workers=4, payload_reader=payload_reader
         )
-        backend = local_backend
+        backend = local_adapter
         print("Ray is not installed; using thread fallback")
 
     source_observer = DemoSourceObserver(high_offset=25)
     dispatcher = RayDispatcher(
         EXAMPLE_ROOT / "workers",
-        ray_backend=backend,
+        ray_adapter=backend,
         checkpoint_store=SQLiteCheckpointStore(
             EXAMPLE_ROOT / "demo_state/checkpoints.sqlite3"
         ),
@@ -121,8 +121,8 @@ async def main() -> None:
         async with dispatcher:
             await wait_until_complete(dispatcher)
     finally:
-        if local_backend is not None:
-            local_backend.close()
+        if local_adapter is not None:
+            local_adapter.close()
         elif ray is not None:
             ray.shutdown()
 

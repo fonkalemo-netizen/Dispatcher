@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ray_dispatcher.backend import NativeRayBackend, RayBackend
+from ray_dispatcher.adapter import NativeRayAdapter, RayAdapter
 from ray_dispatcher.checkpoint import (
     CheckpointDocument,
     MemoryCheckpointStore,
@@ -123,12 +123,12 @@ __all__ = [
     "MemoryCheckpointStore",
     "MemoryFailureStore",
     "MultiSourceWindowState",
-    "NativeRayBackend",
+    "NativeRayAdapter",
     "PayloadReader",
     "PostgresCursor",
     "PostgresPayloadReader",
     "PostgresSource",
-    "RayBackend",
+    "RayAdapter",
     "RayDispatcher",
     "ResourceLoader",
     "ResourceRegistry",

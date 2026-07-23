@@ -45,7 +45,9 @@ def discover_workers(
     """Import ``*.py`` files and build handlers plus merged registries.
 
     Modules are trusted application code and execute during import. Each module
-    must export ``HANDLERS`` (a non-empty sequence of mappings/specs). Each item
+    may export ``HANDLERS`` (a sequence of mappings/specs). Modules without
+    ``HANDLERS`` or with an empty list are skipped for handler discovery (they
+    may still contribute ``SOURCES`` / ``RESOURCES``). Each handler item
     normally only needs ``entrypoint`` (ID defaults to
     ``{module}:{entrypoint}``, override with ``handler_id``).
 
@@ -53,6 +55,8 @@ def discover_workers(
     Those are merged with any injected registries (inject first, then modules).
     Same name with unequal canonical config raises; equal config keeps one copy.
     Handler entries resolve source/resource names against the merged registries.
+    Task/Actor callables are checked against resource injection rules before
+    optional ``ray.remote`` wrapping.
     """
 
     root = Path(directory).expanduser().resolve()
@@ -89,8 +93,13 @@ def discover_workers(
             )
             try:
                 _validate_resolved_resources(spec, merged_resources)
+                _validate_handler_callable(spec)
             except KeyError as exc:
                 raise WorkerDiscoveryError(f"invalid resources in {path}: {exc}") from exc
+            except TypeError as exc:
+                raise WorkerDiscoveryError(
+                    f"invalid handler callable in {path} ({spec.name}): {exc}"
+                ) from exc
             workers.append(_remote_wrap(spec, ray_module))
 
     if not workers:
@@ -133,13 +142,13 @@ def _module_handlers(
     module: ModuleType, path: Path
 ) -> list[HandlerSpec | Mapping[str, Any]]:
     if not hasattr(module, "HANDLERS"):
-        raise WorkerDiscoveryError(f"{path} must export HANDLERS")
+        return []
     raw = module.HANDLERS
     if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
         raise WorkerDiscoveryError(f"HANDLERS in {path} must be a sequence")
     handlers = list(raw)
     if not handlers:
-        raise WorkerDiscoveryError(f"HANDLERS in {path} cannot be empty")
+        return []
     if not all(isinstance(item, (HandlerSpec, Mapping)) for item in handlers):
         raise WorkerDiscoveryError(f"invalid HANDLERS entry in {path}")
     return handlers
@@ -330,6 +339,153 @@ def _validate_resolved_resources(
 ) -> None:
     for resource_id in spec.resource_ids:
         resolve_resource(resource_registry, resource_id)
+
+
+def _validate_handler_callable(spec: HandlerSpec) -> None:
+    """Fail fast when Task/Actor signatures disagree with resource injection."""
+
+    wants_resources = bool(spec.resource_ids)
+    worker = spec.worker
+    if spec.mode is ExecutionMode.ACTOR:
+        _validate_actor_callable(
+            worker,
+            spec.remote_method or "process",
+            wants_resources=wants_resources,
+        )
+        return
+    _validate_task_callable(worker, wants_resources=wants_resources)
+
+
+def _positional_business_params(
+    fn: Any, *, skip_self: bool
+) -> tuple[list[inspect.Parameter], int] | None:
+    """Return (positional params, required_count) or None when uninspectable."""
+
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return None
+    params: list[inspect.Parameter] = []
+    for name, param in signature.parameters.items():
+        if skip_self and name in ("self", "cls"):
+            continue
+        if param.kind is inspect.Parameter.VAR_POSITIONAL:
+            return None
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            continue
+        if param.kind is inspect.Parameter.KEYWORD_ONLY:
+            continue
+        params.append(param)
+    required = sum(1 for param in params if param.default is inspect.Parameter.empty)
+    return params, required
+
+
+def _accepts_business_args(fn: Any, count: int, *, skip_self: bool) -> bool | None:
+    """True/False if ``fn`` can take ``count`` business args; None to skip."""
+
+    info = _positional_business_params(fn, skip_self=skip_self)
+    if info is None:
+        return None
+    params, required = info
+    return required <= count <= len(params)
+
+
+def _requires_business_args(fn: Any, count: int, *, skip_self: bool) -> bool:
+    """True when ``fn`` requires at least ``count`` business positional args."""
+
+    info = _positional_business_params(fn, skip_self=skip_self)
+    if info is None:
+        return False
+    _params, required = info
+    return required >= count
+
+
+def _validate_task_callable(worker: Any, *, wants_resources: bool) -> None:
+    if inspect.isclass(worker):
+        raise TypeError("task mode requires a function entrypoint, not a class")
+    if not callable(worker):
+        raise TypeError("task mode requires a callable entrypoint")
+    # Already Ray-wrapped remote functions are opaque; skip arity checks.
+    if hasattr(worker, "remote") and not inspect.isfunction(worker):
+        return
+    expected = 3 if wants_resources else 2
+    accepted = _accepts_business_args(worker, expected, skip_self=False)
+    if accepted is False:
+        if wants_resources:
+            raise TypeError(
+                "task handlers that declare resources must accept "
+                "(request, records, resources)"
+            )
+        raise TypeError(
+            "task handlers without resources must accept (request, records); "
+            "do not require a resources parameter"
+        )
+
+
+def _validate_actor_callable(
+    worker: Any, method_name: str, *, wants_resources: bool
+) -> None:
+    if hasattr(worker, "remote") and not inspect.isclass(worker):
+        # Already wrapped ActorClass — underlying signature is not available.
+        return
+    if not inspect.isclass(worker):
+        raise TypeError("actor mode requires a class entrypoint")
+    init_fn = _actor_init_function(worker)
+    if wants_resources:
+        if init_fn is None:
+            raise TypeError(
+                "actor handlers that declare resources require "
+                "__init__(self, resources)"
+            )
+        init_ok = _accepts_business_args(init_fn, 1, skip_self=True)
+        if init_ok is False:
+            raise TypeError(
+                "actor handlers that declare resources require "
+                "__init__(self, resources)"
+            )
+    elif init_fn is not None:
+        init_ok = _accepts_business_args(init_fn, 0, skip_self=True)
+        if init_ok is False:
+            raise TypeError(
+                "actor handlers without resources must not require an __init__ "
+                "resources argument"
+            )
+    if not hasattr(worker, method_name):
+        raise TypeError(f"actor class missing method {method_name!r}")
+    raw_method = _class_attr_function(worker, method_name)
+    if raw_method is None or not callable(raw_method):
+        raise TypeError(f"actor method {method_name!r} is not callable")
+    if _requires_business_args(raw_method, 3, skip_self=True):
+        raise TypeError(
+            f"actor method {method_name!r} must not require resources; "
+            "inject snapshots via __init__(self, resources)"
+        )
+    method_ok = _accepts_business_args(raw_method, 2, skip_self=True)
+    if method_ok is False:
+        raise TypeError(
+            f"actor method {method_name!r} must accept (request, records)"
+        )
+
+
+def _actor_init_function(cls: type) -> Any | None:
+    """Return the class's custom ``__init__`` function, or None for ``object.__init__``."""
+
+    return _class_attr_function(cls, "__init__")
+
+
+def _class_attr_function(cls: type, name: str) -> Any | None:
+    """Return the raw function for ``name`` from the class MRO, unwrapping descriptors."""
+
+    for base in cls.__mro__:
+        if base is object and name == "__init__":
+            return None
+        if name not in base.__dict__:
+            continue
+        attr = base.__dict__[name]
+        if isinstance(attr, (staticmethod, classmethod)):
+            return attr.__func__
+        return attr
+    return None
 
 
 def _output_from_config(raw: Any) -> Mapping[str, Any] | None:
