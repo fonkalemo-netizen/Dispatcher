@@ -284,7 +284,7 @@ def _mapping_to_spec(
             output=_output_from_config(config.get("output")),
             mode=mode,
             remote_method=remote_method,
-            batch_size=int(config.get("batch_size", 10_000)),
+            batch_size=_batch_size_from_config(config.get("batch_size", 10_000)),
             cpus_per_task=float(config.get("cpus_per_task", 1.0)),
             max_retries=int(config.get("max_retries", 2)),
             priority=int(config.get("priority", 0)),
@@ -292,6 +292,22 @@ def _mapping_to_spec(
         )
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
         raise WorkerDiscoveryError(f"invalid HANDLERS entry in {path}: {exc}") from exc
+
+
+def _batch_size_from_config(raw: Any) -> int | tuple[int | None, int | None]:
+    if isinstance(raw, bool):
+        raise TypeError("batch_size must be an int or [min, max]")
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, (list, tuple)):
+        if len(raw) != 2:
+            raise ValueError("batch_size range must have length 2")
+        left, right = raw[0], raw[1]
+        return (
+            None if left is None else int(left),
+            None if right is None else int(right),
+        )
+    raise TypeError("batch_size must be an int or [min, max]")
 
 
 def _resolve_source_entry(

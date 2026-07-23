@@ -161,15 +161,19 @@ retention_gap is None
    - backlog 最大者优先；
    - 最慢者优先（backlog / processing_rate 最大）；
    - 等待时间最长者优先。
-5. task 数约束：
+5. task 数约束（单源每波最多 1 个 fetch；容量不够则为 0）：
 
 ```text
-n <= ceil(backlog / batch_size)
-n <= 全局剩余 in-flight slot
-n <= 当前可用 CPU / phase_cpus  # max(config.fetch_cpus, sum task cpus)
+wave = 1 if free_slots / (1+N) and CPUs allow else 0
+backlog >= batch_window.min_items
+take = backlog if max_items is None else min(backlog, max_items)
 ```
 
-同 `source_id` 的 Handler 中，一个 slice 会预留 `1 个 fetch + N 个 Handler` in-flight slot。组内 `batch_size` 不一致时取最小值，避免任何 Handler 收到超过其配置的批次。
+同 `source_id` 的 Handler 中，一波预留 `1 个 fetch + N 个 Handler` in-flight slot。组内
+`batch_size` 区间取最严：`min_items = max(各 min)`，`max_items = min(各有限 max)`。
+
+`batch_size` 语义：`n` / `(n, None)` → `[n,]`；`(None, n)` → `[,n]`；`(n, m)` → `[n, m]`。
+Dispatcher 不按 batch_size 切多片；需要再分片在 Handler 内处理。
 
 排序之后，`TriggerPolicy`（主系统注入；默认 `HasBacklog → SourceIdle → HasCapacity`；多源另含
 `HasTimeWindow`）评估每个候选，输出 `TRIGGER | DEGRADE | SKIP | BLOCK`，并写入
@@ -195,14 +199,17 @@ task 数 `n`。Handler / HANDLERS 不配置触发策略。
 
 ### Kafka
 
-Kafka 使用半开区间并把当前 wave 均匀拆成 n 个不重叠区间。每轮最多处理 `n × batch_size`，剩余 backlog 进入下一轮。例如：
+Kafka 使用半开区间。每轮对每个 source shard 最多提交 **一个** fetch：
+`[committed, committed+take)`（`take` 由 `batch_size` 区间的 max 决定；`None` 则吃到
+observed）。剩余 backlog 进入下一轮。例如 `batch_size=(None, 10)` 且 backlog=25：
 
 ```text
-[100, 125), n=3
--> [100, 109)
--> [109, 117)
--> [117, 125)
+[100, 125), max=10
+-> [100, 110)   # 本波
+# 余 [110, 125) 下轮
 ```
+
+整数 `batch_size=10` 等价 `[10,]`：backlog>=10 后一次取全部，例如 backlog=25 → `[100, 125)`。
 
 每个 `DispatchRequest`（fetch/merge/内部）主要字段：
 
@@ -234,7 +241,9 @@ Handler 都成功，共享 checkpoint 才推进。
 
 ### Postgres
 
-固定的 `SourceObserver` 在数据库内按 `(timestamp, primary_key)` 排序，取得最多 `n × batch_size` 行的边界，并返回有序、不重叠的复合游标范围。每个 task 只处理自己的 `(start, end]`；不使用跨进程不稳定的 Python `hash()`。
+固定的 `SourceObserver` 在数据库内按 `(timestamp, primary_key)` 排序，取得本批上限行数的
+边界，并返回**单一**复合游标范围（`postgres_ranges(..., max_ranges=1, batch_size=take)`）。
+不使用跨进程不稳定的 Python `hash()`。
 
 ### 状态写入
 
@@ -313,4 +322,4 @@ FailureStore（构造注入，默认 MemoryFailureStore）
    读满 `[start, end)` 前遇到 partition EOF 会失败，不会静默提交不完整区间。下游幂等由业务唯一键负责，
    可用 `dispatch_id` 做批次追踪；调度用的 partition/offset 留在 Dispatcher checkpoint。
 5. 为判断 fetch 是否成功，当前状态轮询会短暂解析已完成 fetch 的结果，但不会把 payload 保存在历史
-   state 中；大批量数据仍应控制 batch_size，并配置 Ray object spilling。
+   state 中；大批量数据仍应控制 `batch_size` 上限（或 Handler 内再分片），并配置 Ray object spilling。

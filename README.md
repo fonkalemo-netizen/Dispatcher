@@ -51,8 +51,18 @@ app/
 Handler 自动共享一次 fetch 与同一个 checkpoint。`entrypoint` 指向函数名；调度 ID 默认为
 `{文件名}:{entrypoint}`（可用 `handler_id` 覆盖）。
 
-**单源**（默认）：按 partition offset + `batch_size` 切分，`handler(request, records)` 中
-`records` 为 `list`。
+**单源**（默认）：按 partition offset 调度；`batch_size` 是触发门槛 + 本批上限区间，
+Dispatcher **不按 batch_size 切多片**（每轮每源最多一波 fetch）。`handler(request, records)` 中
+`records` 为 `list`；若需再分片在 Handler 内自行处理。
+
+`batch_size` 写法：
+
+| 配置 | 含义 |
+|---|---|
+| `n` 或 `(n, None)` | `[n,]`：`backlog >= n` 才触发；本批取全部未处理 |
+| `(None, n)` | `[,n]`：有数据即触发；本批最多 `n`，剩余下轮 |
+| `(n, m)` | `[n,m]`：`backlog >= n`；本批最多 `m` |
+| `0` | 等价 `(0, None)`：有 backlog 就一次吃光 |
 
 **多源**（`sources` 长度 ≥ 2，且必须全是 Kafka）：按 **event-time 时间窗** 对齐。右界来自
 `data_listener` 观察到的各源可对齐水位取 `min`，左界为组级 checkpoint
@@ -97,7 +107,7 @@ HANDLERS = [
             "path": "events/jsonl/",
         },
         # Scheduling knobs (write them out so they stay discoverable)
-        "batch_size": 50_000,
+        "batch_size": [1, 50_000],  # 同组取最严：max(min) / min(max)
         "cpus_per_task": 1,
         "max_retries": 2,
         "priority": 0,
@@ -108,7 +118,7 @@ HANDLERS = [
         "output": {
             "path": "events/csv/",
         },
-        "batch_size": 10_000,
+        "batch_size": [1, 50_000],
         "cpus_per_task": 1,
         "max_retries": 2,
         "priority": 0,
@@ -131,7 +141,7 @@ HANDLERS = [
     {
         "entrypoint": "join_orders_payments",
         "sources": ["orders", "payments"],
-        "batch_size": 10_000,  # 单源路径仍用；多源以时间窗为主
+        "batch_size": [1, 10_000],  # 单源门槛/上限；多源另受时间窗约束
     },
 ]
 
@@ -285,7 +295,7 @@ handler = HandlerSpec(
     name="event-normalizer",
     worker=normalize_events,
     sources=(source,),
-    batch_size=50_000,
+    batch_size=(1, 50_000),  # 或整数 50000 表示 [50000,]
     cpus_per_task=1,
 )
 
@@ -336,8 +346,8 @@ Handler 签名为 `handler(request, records)`；声明了 `resources` 时为
 
 1. 查询 Kafka 分区 low/high watermark；
 2. 查询 Postgres 稳定上界游标，并统计窗口 count；
-3. 在数据库内按 `(timestamp, primary_key)` 排序，为最多 `n × batch_size` 行生成有序且不重叠的
-   复合游标范围（每个 task 处理自己的 `(start, end]`）。
+3. 在数据库内按 `(timestamp, primary_key)` 排序，为本批上限（`batch_size` 区间的 max，或全部 backlog）
+   生成**单一**有序游标范围（每个 wave 一个 fetch，不再按 batch_size 切多 task）。
 
 Postgres 推荐查询形式（表名和列名只能来自受信配置，不能作为 SQL 参数）：
 

@@ -114,7 +114,7 @@ HANDLERS = [
         "output": {
             "path": "/tmp/jsonl",
         },
-        "batch_size": 2,
+        "batch_size": 0,
         "max_retries": 0,
     },
     {
@@ -123,7 +123,7 @@ HANDLERS = [
         "output": {
             "path": "/tmp/csv",
         },
-        "batch_size": 2,
+        "batch_size": 0,
         "max_retries": 0,
     },
 ]
@@ -178,8 +178,8 @@ def to_csv(request, records):
             {"orders:to_jsonl", "orders:to_csv"}, set(dispatcher.workers)
         )
         self.assertEqual({"shared:orders:0": 7}, backlog)
-        self.assertEqual(4, len(fetch_ids))
-        self.assertEqual(4, len(backend.fetch_submissions))
+        self.assertEqual(1, len(fetch_ids))
+        self.assertEqual(1, len(backend.fetch_submissions))
         handler_requests = [
             run.request
             for run in dispatcher.state.runs.values()
@@ -195,8 +195,8 @@ def to_csv(request, records):
             for request in handler_requests
             if request.handler_id.endswith("to_csv")
         ]
-        self.assertEqual(4, len(jsonl))
-        self.assertEqual(4, len(csv))
+        self.assertEqual(1, len(jsonl))
+        self.assertEqual(1, len(csv))
         self.assertEqual({"path": "/tmp/jsonl"}, dict(jsonl[0].output or {}))
         self.assertEqual("/tmp/csv", (csv[0].output or {})["path"])
         # Shared permanent failure advances the one source checkpoint.

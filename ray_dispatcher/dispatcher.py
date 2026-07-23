@@ -47,6 +47,7 @@ from ray_dispatcher.models import (
     SourceSpec,
     SourceState,
     TaskRun,
+    merge_batch_windows,
 )
 from ray_dispatcher.policy import (
     Decision,
@@ -390,7 +391,7 @@ class RayDispatcher:
                     "name": worker.name,
                     "mode": worker.mode.value,
                     "remote_method": worker.remote_method,
-                    "batch_size": worker.batch_size,
+                    "batch_size": list(worker.batch_window),
                     "cpus_per_task": worker.cpus_per_task,
                     "max_retries": worker.max_retries,
                     "priority": worker.priority,
@@ -1157,9 +1158,13 @@ class RayDispatcher:
                     continue
                 if decision.decision is Decision.BLOCK:
                     break
-                n = self._shared_task_count(
+                min_items, max_items = merge_batch_windows(
+                    tuple(member.batch_window for member in members)
+                )
+                if source_state.backlog < min_items:
+                    continue
+                n = self._shared_wave_slots(
                     members,
-                    source_state,
                     free_slots,
                     available_cpus,
                 )
@@ -1172,7 +1177,7 @@ class RayDispatcher:
                 if n == 0:
                     continue
                 run_ids = await self._create_shared_batch(
-                    members, source_state, n
+                    members, source_state, max_items=max_items
                 )
                 submitted.extend(run_ids)
                 reserved = len(run_ids) * (len(members) + 1)
@@ -1241,8 +1246,16 @@ class RayDispatcher:
                 if decision.decision is Decision.BLOCK:
                     break
                 assert t_left is not None and t_right is not None
+                min_items, max_items = merge_batch_windows(
+                    tuple(member.batch_window for member in members)
+                )
                 run_ids = await self._create_multisource_window_batch(
-                    members, window, t_left, t_right
+                    members,
+                    window,
+                    t_left,
+                    t_right,
+                    min_items=min_items,
+                    max_items=max_items,
                 )
                 if not run_ids and not any(
                     batch.group_key == group_key
@@ -1273,53 +1286,50 @@ class RayDispatcher:
         )
         return max(self.config.fetch_cpus, downstream_cpus)
 
-    def _shared_task_count(
+    def _shared_wave_slots(
         self,
         members: tuple[HandlerSpec, ...],
-        state: SourceState,
         free_slots: int,
         available_cpus: float | None,
     ) -> int:
-        batch_size = min(member.batch_size for member in members)
+        """Return 1 when capacity allows a single shared wave, else 0."""
+
         per_slice_slots = len(members) + 1
-        count = min(
-            math.ceil(state.backlog / batch_size),
-            free_slots // per_slice_slots,
-        )
+        if free_slots < per_slice_slots:
+            return 0
         if available_cpus is not None:
             phase_cpus = self._phase_cpus(members)
-            count = min(count, math.floor(available_cpus / phase_cpus))
-        return max(0, count)
+            if available_cpus < phase_cpus:
+                return 0
+        return 1
 
     async def _create_shared_batch(
         self,
         members: tuple[HandlerSpec, ...],
         source_state: SourceState,
-        n: int,
+        *,
+        max_items: int | None,
     ) -> list[str]:
         group = source_state.source_id
         representative = members[0]
         source = representative.sources[0]
         start, observed = source_state.committed, source_state.observed
-        batch_size = min(member.batch_size for member in members)
-        item_count = source_state.backlog
+        backlog = source_state.backlog
+        take = backlog if max_items is None else min(backlog, max_items)
+        if take <= 0:
+            return []
         ranges: list[
             tuple[int | PostgresCursor, int | PostgresCursor, int]
         ] = []
 
         if isinstance(source, KafkaSource):
-            start_i, observed_i = int(start), int(observed)
-            end: int | PostgresCursor = min(
-                observed_i, start_i + n * batch_size
-            )
-            item_count = int(end) - start_i
-            n = min(n, item_count)
-            base, remainder = divmod(item_count, n)
-            cursor = start_i
-            for index in range(n):
-                size = base + (1 if index < remainder else 0)
-                ranges.append((cursor, cursor + size, size))
-                cursor += size
+            start_i = int(start)
+            end_i = min(int(observed), start_i + take)
+            item_count = end_i - start_i
+            if item_count <= 0:
+                return []
+            ranges.append((start_i, end_i, item_count))
+            end: int | PostgresCursor = end_i
         else:
             if not isinstance(start, PostgresCursor) or not isinstance(
                 observed, PostgresCursor
@@ -1327,16 +1337,15 @@ class RayDispatcher:
                 raise TypeError("Postgres shared batch requires cursor bounds")
             splitter = getattr(self.source_observer, "postgres_ranges", None)
             if splitter is None:
-                ranges = [(start, observed, source_state.backlog)]
+                ranges = [(start, observed, take)]
             else:
                 ranges = list(
                     await self._io(
-                        splitter(source, start, observed, n, batch_size)
+                        splitter(source, start, observed, 1, take)
                     )
                 )
             if not ranges:
                 return []
-            n = len(ranges)
             end = ranges[-1][1]
             item_count = sum(count for _, _, count in ranges)
 
@@ -1352,7 +1361,7 @@ class RayDispatcher:
             [],
             worker_names=tuple(member.name for member in members),
             fetch_run_ids=fetch_run_ids,
-            reserved_handler_count=n * len(members),
+            reserved_handler_count=len(members),
         )
         self.state.batches[batch_id] = batch
         source_state.active_batch_id = batch_id
@@ -1368,7 +1377,7 @@ class RayDispatcher:
                 source.source_id,
                 source.kind,
                 index,
-                n,
+                1,
                 partition=(
                     int(source_state.shard) if isinstance(source, KafkaSource) else None
                 ),
@@ -1415,6 +1424,9 @@ class RayDispatcher:
         window: MultiSourceWindowState,
         t_left: datetime,
         t_right: datetime,
+        *,
+        min_items: int,
+        max_items: int | None,
     ) -> list[str]:
         representative = members[0]
         group_key = window.group_key
@@ -1467,6 +1479,15 @@ class RayDispatcher:
                 if end_offset > start_offset:
                     item_count += end_offset - start_offset
                     planned.append((source, state, start_offset, end_offset))
+
+        if item_count < min_items:
+            return []
+        if max_items is not None and item_count > max_items:
+            planned, partition_commits, item_count = self._trim_multisource_planned(
+                planned, partition_commits, max_items
+            )
+            if item_count < min_items:
+                return []
 
         batch_id = self._stable_id("mswin", group_key, t_left, t_right)
         fetch_run_ids: list[str] = []
@@ -1551,6 +1572,36 @@ class RayDispatcher:
             fetch_source_ids.append(source.source_id)
         batch.fetch_source_ids = tuple(fetch_source_ids)
         return fetch_run_ids
+
+    @staticmethod
+    def _trim_multisource_planned(
+        planned: list[tuple[KafkaSource, SourceState, int, int]],
+        partition_commits: dict[str, int],
+        max_items: int,
+    ) -> tuple[
+        list[tuple[KafkaSource, SourceState, int, int]],
+        dict[str, int],
+        int,
+    ]:
+        """Cap total multisource items to ``max_items`` without multi-slice waves."""
+
+        remaining = max_items
+        trimmed: list[tuple[KafkaSource, SourceState, int, int]] = []
+        for source, state, start_offset, end_offset in planned:
+            size = end_offset - start_offset
+            if remaining <= 0:
+                partition_commits[state.key] = start_offset
+                continue
+            if size <= remaining:
+                trimmed.append((source, state, start_offset, end_offset))
+                remaining -= size
+                continue
+            new_end = start_offset + remaining
+            trimmed.append((source, state, start_offset, new_end))
+            partition_commits[state.key] = new_end
+            remaining = 0
+        item_count = sum(end - start for _, _, start, end in trimmed)
+        return trimmed, partition_commits, item_count
 
     async def _submit_multisource_merge(self, batch: BatchRun) -> str:
         members = tuple(self.workers[name] for name in batch.worker_names)

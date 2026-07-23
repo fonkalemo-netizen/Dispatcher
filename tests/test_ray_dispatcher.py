@@ -236,7 +236,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
     def _shared_workers(source: KafkaSource) -> tuple[HandlerSpec, HandlerSpec]:
         common = {
             "sources": (source,),
-            "batch_size": 10,
+            "batch_size": (1, 10),
         }
         return (
             HandlerSpec("json-handler", object(), **common),
@@ -332,7 +332,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
             "events", ("broker",), "events", initial_offset="earliest"
         )
         worker = HandlerSpec(
-            "worker", object(), (source,), batch_size=10
+            "worker", object(), (source,), batch_size=(1, 10)
         )
         dispatcher = RayDispatcher(
             (worker,),
@@ -395,7 +395,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         await dispatcher.ray_status()
         self.assertEqual(4, dispatcher.state.sources["shared:events:0"].committed)
 
-    async def test_kafka_increment_is_split_and_committed_after_all_refs_finish(self) -> None:
+    async def test_kafka_batch_window_single_wave_and_gates(self) -> None:
         client = FakeSourceObserver()
         backend = FakeRayBackend()
         checkpoints = MemoryCheckpointStore()
@@ -425,51 +425,55 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         backlog = await dispatcher.data_listener()
         self.assertEqual(25, backlog[key])
 
+        # int 10 => [10,]: one wave takes the full backlog.
         fetch_ids = await dispatcher.ray_trigger()
-        self.assertEqual(3, len(fetch_ids))
-        fetch_requests = [item[1] for item in backend.fetch_submissions]
-        self.assertEqual(
-            [(100, 109), (109, 117), (117, 125)],
-            [(request.start_offset, request.end_offset) for request in fetch_requests],
-        )
-        self.assertEqual({0, 1, 2}, {request.task_index for request in fetch_requests})
-        self.assertTrue(all(request.n == 3 for request in fetch_requests))
-        self.assertTrue(all(request.topic == "events" for request in fetch_requests))
-        self.assertTrue(
-            all(
-                request.source_connection_id == "primary-kafka"
-                for request in fetch_requests
-            )
-        )
+        self.assertEqual(1, len(fetch_ids))
+        request = backend.fetch_submissions[0][1]
+        self.assertEqual((100, 125), (request.start_offset, request.end_offset))
+        self.assertEqual(1, request.n)
+        self.assertEqual("events", request.topic)
+        self.assertEqual("primary-kafka", request.source_connection_id)
 
         await self._complete_fetches(dispatcher, backend)
-        self.assertEqual(3, len(backend.submissions))
-        requests = [submission[1] for submission in backend.submissions]
-        self.assertTrue(all(isinstance(request, HandlerRequest) for request in requests))
-        self.assertEqual(
-            {"event-worker"},
-            {request.handler_id for request in requests},
-        )
-        self.assertEqual(3, len({request.dispatch_id for request in requests}))
-
-        backend.finish(backend.submissions[1][2], value="middle")
-        await dispatcher.ray_status()
-        self.assertEqual(100, checkpoints.values[key].progress)
-
-        backend.finish(backend.submissions[0][2], value="first")
-        backend.finish(backend.submissions[2][2], value="last")
+        self.assertEqual(1, len(backend.submissions))
+        backend.finish(backend.submissions[0][2], value="ok")
         await dispatcher.ray_status()
         self.assertEqual(125, checkpoints.values[key].progress)
         self.assertEqual(0, dispatcher.state.sources[key].backlog)
-        batch = next(iter(dispatcher.state.batches.values()))
-        self.assertEqual(BatchStatus.SUCCEEDED, batch.status)
+
+        # Cap with [,10].
+        backend2 = FakeRayBackend()
+        dispatcher2 = RayDispatcher(
+            (HandlerSpec("cap", object(), (source,), batch_size=(None, 10)),),
+            ray_backend=backend2,
+            checkpoint_store=MemoryCheckpointStore({key: 100}),
+            config=DispatcherConfig(max_in_flight=10),
+        )
+        dispatcher2.source_observer = client
+        await dispatcher2.data_listener()
+        self.assertEqual(1, len(await dispatcher2.ray_trigger()))
+        capped = backend2.fetch_submissions[0][1]
+        self.assertEqual((100, 110), (capped.start_offset, capped.end_offset))
+
+        # Min gate [20,] with backlog 15.
+        backend3 = FakeRayBackend()
+        dispatcher3 = RayDispatcher(
+            (HandlerSpec("min", object(), (source,), batch_size=(20, None)),),
+            ray_backend=backend3,
+            checkpoint_store=MemoryCheckpointStore({key: 110}),
+            config=DispatcherConfig(max_in_flight=10),
+        )
+        dispatcher3.source_observer = client
+        await dispatcher3.data_listener()
+        self.assertEqual(15, dispatcher3.state.sources[key].backlog)
+        self.assertEqual([], await dispatcher3.ray_trigger())
 
     async def test_failed_ref_is_retried_with_same_dispatch_id(self) -> None:
         client = FakeSourceObserver()
         backend = FakeRayBackend()
         source = KafkaSource("events", ("broker",), "events", initial_offset="earliest")
         worker = HandlerSpec(
-            "worker", object(), (source,), batch_size=100, max_retries=1
+            "worker", object(), (source,), batch_size=(1, 100), max_retries=1
         )
         dispatcher = RayDispatcher((worker,), ray_backend=backend)
         dispatcher.source_observer = client
@@ -500,7 +504,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         backend.fail_submissions = 1
         source = KafkaSource("events", ("broker",), "events", initial_offset="earliest")
         worker = HandlerSpec(
-            "worker", object(), (source,), max_retries=1
+            "worker", object(), (source,), max_retries=1, batch_size=0
         )
         dispatcher = RayDispatcher((worker,), ray_backend=backend)
         dispatcher.source_observer = client
@@ -539,7 +543,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
             initial_cursor=start,
         )
         worker = HandlerSpec(
-            "order-worker", object(), (source,), batch_size=10
+            "order-worker", object(), (source,), batch_size=(1, 10)
         )
         checkpoints = MemoryCheckpointStore()
         dispatcher = RayDispatcher(
@@ -618,7 +622,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
             "events",
             retention_policy="reset_to_earliest",
         )
-        worker = HandlerSpec("worker", object(), (source,), batch_size=100)
+        worker = HandlerSpec("worker", object(), (source,), batch_size=(1, 100))
         key = "shared:events:0"
         checkpoints = MemoryCheckpointStore({key: 5})
         dispatcher = RayDispatcher(
@@ -643,7 +647,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
             initial_offset="earliest",
             retention_policy="reset_to_earliest",
         )
-        worker = HandlerSpec("worker", object(), (source,))
+        worker = HandlerSpec("worker", object(), (source,), batch_size=0)
         checkpoints = MemoryCheckpointStore()
         dispatcher = RayDispatcher(
             (worker,), ray_backend=backend, checkpoint_store=checkpoints
@@ -677,6 +681,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
             (source,),
             mode=ExecutionMode.ACTOR,
             remote_method="process",
+            batch_size=0,
         )
         dispatcher = RayDispatcher((worker,), ray_backend=backend)
         dispatcher.source_observer = client
@@ -812,7 +817,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
             "worker",
             object(),
             (source,),
-            batch_size=5,
+            batch_size=(1, 5),
             max_retries=0,
         )
         dispatcher = RayDispatcher(
@@ -872,7 +877,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         )
         common = {
             "sources": (source,),
-            "batch_size": 10,
+            "batch_size": (1, 10),
             "max_retries": 0,
         }
         workers = (
@@ -985,7 +990,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
             "join-handler",
             object(),
             (orders, payments),
-            batch_size=100,
+            batch_size=(1, 100),
         )
         checkpoints = MemoryCheckpointStore(
             {RayDispatcher._mswin_checkpoint_key(worker.group_key): t0}
@@ -1072,7 +1077,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
             "join-handler",
             object(),
             (orders, payments),
-            batch_size=100,
+            batch_size=(1, 100),
         )
         checkpoints = MemoryCheckpointStore(
             {RayDispatcher._mswin_checkpoint_key(worker.group_key): t0}
@@ -1165,7 +1170,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
             (source,),
             mode=ExecutionMode.ACTOR,
             remote_method="process",
-            batch_size=5,
+            batch_size=(1, 5),
             max_retries=0,
         )
         checkpoints = MemoryCheckpointStore()
@@ -1280,7 +1285,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
             "join-handler",
             object(),
             (orders, payments),
-            batch_size=100,
+            batch_size=(1, 100),
             max_retries=0,
         )
         checkpoints = MemoryCheckpointStore(
@@ -1346,7 +1351,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
             "join-handler",
             object(),
             (orders, payments),
-            batch_size=100,
+            batch_size=(1, 100),
             max_retries=0,
         )
         checkpoints = MemoryCheckpointStore(
@@ -1408,7 +1413,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         source = KafkaSource(
             "events", ("broker",), "events", initial_offset="earliest"
         )
-        worker = HandlerSpec("worker", object(), (source,), batch_size=5)
+        worker = HandlerSpec("worker", object(), (source,), batch_size=(1, 5))
         dispatcher = RayDispatcher(
             (worker,),
             ray_backend=backend,
@@ -1450,7 +1455,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         source = KafkaSource(
             "events", ("broker",), "events", initial_offset="earliest"
         )
-        worker = HandlerSpec("worker", object(), (source,), batch_size=5, max_retries=0)
+        worker = HandlerSpec("worker", object(), (source,), batch_size=(1, 5), max_retries=0)
         dispatcher = RayDispatcher(
             (worker,),
             ray_backend=backend,
@@ -1576,7 +1581,7 @@ class TriggerDispatcherIntegrationTests(unittest.IsolatedAsyncioTestCase):
         source = KafkaSource(
             "events", ("broker",), "events", initial_offset="earliest"
         )
-        worker = HandlerSpec("worker", object(), (source,), batch_size=5, max_retries=0)
+        worker = HandlerSpec("worker", object(), (source,), batch_size=(1, 5), max_retries=0)
         # One slice needs fetch+handler (2 slots). max_in_flight=3 leaves 1 slot
         # after the first batch — enough to evaluate the next partition, not enough
         # to schedule → BLOCK via HasCapacity.

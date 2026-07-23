@@ -43,7 +43,7 @@ HANDLERS = [
             "path": str(OUTPUT_ROOT / "jsonl"),
         },
         # Scheduling knobs (explicit for discoverability)
-        "batch_size": 10,
+        "batch_size": [1, 25],
         "cpus_per_task": 1,
         "max_retries": 2,
         "priority": 0,
@@ -57,7 +57,7 @@ HANDLERS = [
             "path": str(OUTPUT_ROOT / "csv"),
         },
         # Scheduling knobs
-        "batch_size": 5,
+        "batch_size": [1, 25],
         "cpus_per_task": 1,
         "max_retries": 2,
         "priority": 0,

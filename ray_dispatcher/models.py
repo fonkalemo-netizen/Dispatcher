@@ -7,7 +7,58 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from functools import total_ordering
-from typing import Any, Literal, Mapping, Union
+from typing import Any, Literal, Mapping, Optional, Sequence, Tuple, Union
+
+BatchSizeConfig = Union[int, Tuple[Optional[int], Optional[int]]]
+BatchWindow = Tuple[int, Optional[int]]  # (min_items, max_items); max None = unlimited
+
+
+def normalize_batch_size(value: BatchSizeConfig) -> BatchWindow:
+    """Normalize ``batch_size`` to ``(min_items, max_items)``.
+
+    - ``n`` → ``(n, None)``  (``[n,]``: trigger at n, take all)
+    - ``(None, n)`` → ``(1, n)``  (``[,n]``)
+    - ``(n, None)`` → ``(n, None)``
+    - ``(n, m)`` → ``(n, m)`` with ``n <= m``
+    """
+
+    if isinstance(value, bool):
+        raise TypeError("batch_size must be an int or a (min, max) tuple")
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError("batch_size int must be >= 0")
+        return (value, None)
+    if not isinstance(value, tuple) or len(value) != 2:
+        raise TypeError("batch_size must be an int or a (min, max) tuple")
+    raw_min, raw_max = value
+    if raw_min is not None and (not isinstance(raw_min, int) or isinstance(raw_min, bool)):
+        raise TypeError("batch_size min must be an int or None")
+    if raw_max is not None and (not isinstance(raw_max, int) or isinstance(raw_max, bool)):
+        raise TypeError("batch_size max must be an int or None")
+    if raw_min is not None and raw_min < 0:
+        raise ValueError("batch_size min must be >= 0")
+    if raw_max is not None and raw_max < 1:
+        raise ValueError("batch_size max must be >= 1")
+    min_items = 1 if raw_min is None else raw_min
+    max_items = raw_max
+    if max_items is not None and min_items > max_items:
+        raise ValueError("batch_size min must be <= max")
+    return (min_items, max_items)
+
+
+def merge_batch_windows(windows: Sequence[BatchWindow]) -> BatchWindow:
+    """Strictest shared window: max of mins, min of finite maxes."""
+
+    if not windows:
+        raise ValueError("windows cannot be empty")
+    min_items = max(window[0] for window in windows)
+    finite_maxes = [window[1] for window in windows if window[1] is not None]
+    max_items = min(finite_maxes) if finite_maxes else None
+    if max_items is not None and min_items > max_items:
+        # Conflicting member configs: still schedule only when both satisfied;
+        # take at most max_items once triggered (min gate may never pass).
+        pass
+    return (min_items, max_items)
 
 
 class SourceKind(str, Enum):
@@ -157,7 +208,7 @@ class HandlerSpec:
     sources: tuple[SourceSpec, ...]
     mode: ExecutionMode = ExecutionMode.TASK
     remote_method: str | None = None
-    batch_size: int = 10_000
+    batch_size: BatchSizeConfig = 10_000
     cpus_per_task: float = 1.0
     max_retries: int = 2
     priority: int = 0
@@ -167,8 +218,8 @@ class HandlerSpec:
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("worker name cannot be empty")
-        if self.batch_size < 1:
-            raise ValueError("batch_size must be positive")
+        # Validate batch_size eagerly so bad configs fail at construction.
+        normalize_batch_size(self.batch_size)
         if self.cpus_per_task <= 0:
             raise ValueError("cpus_per_task must be positive")
         if self.mode is ExecutionMode.ACTOR and not self.remote_method:
@@ -184,6 +235,12 @@ class HandlerSpec:
             raise ValueError("handler source_ids must be unique")
         if len(self.resource_ids) != len(set(self.resource_ids)):
             raise ValueError("resource_ids must be unique")
+
+    @property
+    def batch_window(self) -> BatchWindow:
+        """Normalized ``(min_items, max_items)`` scheduling window."""
+
+        return normalize_batch_size(self.batch_size)
 
     @property
     def handler_id(self) -> str:

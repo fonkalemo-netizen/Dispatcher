@@ -29,6 +29,7 @@ from ray_dispatcher.event_log import (
 from ray_dispatcher.failures import MemoryFailureStore, SQLiteFailureStore
 from ray_dispatcher.models import (
     BatchStatus,
+    BatchWindow,
     DispatchRequest,
     ExecutionMode,
     ExecutionResult,
@@ -44,6 +45,8 @@ from ray_dispatcher.models import (
     SourceKind,
     SourceSpec,
     SourceState,
+    merge_batch_windows,
+    normalize_batch_size,
 )
 from ray_dispatcher.policy import (
     BacklogPressure,
@@ -89,6 +92,7 @@ from ray_dispatcher.sources import (
 __all__ = [
     "BacklogPressure",
     "BatchStatus",
+    "BatchWindow",
     "CheckpointDocument",
     "CompositePayloadReader",
     "ConditionResult",
@@ -153,7 +157,9 @@ __all__ = [
     "discover_event_hooks",
     "discover_workers",
     "hook",
+    "merge_batch_windows",
     "merge_fetch_results",
+    "normalize_batch_size",
     "resolve_resource",
     "resolve_source",
     "resource_from_mapping",

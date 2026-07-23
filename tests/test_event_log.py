@@ -133,7 +133,7 @@ class EventLogDispatcherTests(unittest.IsolatedAsyncioTestCase):
         source = KafkaSource(
             "events", ("broker",), "events", initial_offset="earliest"
         )
-        worker = HandlerSpec("worker", object(), (source,), batch_size=5, max_retries=0)
+        worker = HandlerSpec("worker", object(), (source,), batch_size=(1, 5), max_retries=0)
         dispatcher = RayDispatcher(
             (worker,),
             ray_backend=backend,
@@ -171,7 +171,7 @@ class EventLogDispatcherTests(unittest.IsolatedAsyncioTestCase):
         source = KafkaSource(
             "events", ("broker",), "events", initial_offset="earliest"
         )
-        worker = HandlerSpec("worker", object(), (source,), batch_size=5, max_retries=0)
+        worker = HandlerSpec("worker", object(), (source,), batch_size=(1, 5), max_retries=0)
         dispatcher = RayDispatcher(
             (worker,),
             ray_backend=backend,
@@ -208,7 +208,7 @@ class EventLogDispatcherTests(unittest.IsolatedAsyncioTestCase):
         source = KafkaSource(
             "events", ("broker",), "events", initial_offset="earliest"
         )
-        worker = HandlerSpec("worker", object(), (source,), batch_size=5, max_retries=0)
+        worker = HandlerSpec("worker", object(), (source,), batch_size=(1, 5), max_retries=0)
         dispatcher = RayDispatcher(
             (worker,),
             ray_backend=backend,

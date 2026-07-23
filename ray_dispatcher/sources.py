@@ -258,8 +258,7 @@ class SourceObserver:
 
         Only boundary rows are returned to the Dispatcher. Every resulting
         range is ordered, disjoint and contains no more than ``batch_size``
-        rows, including when Ray capacity allows fewer tasks than the backlog
-        would otherwise request.
+        rows. Callers that want a single capped window pass ``max_ranges=1``.
         """
 
         if max_ranges < 1 or batch_size < 1:
