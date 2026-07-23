@@ -11,15 +11,17 @@ from unittest.mock import patch
 
 from ray_dispatcher import (
     ExecutionResult,
-    SourceObserver,
     KafkaSource,
     PostgresCursor,
     PostgresSource,
     RayDispatcher,
+    SourceObserver,
     WorkerDiscoveryError,
-    WorkerSpec,
+    HandlerSpec,
     discover_workers,
 )
+from ray_dispatcher.registries import build_resource_registry, build_source_registry
+from ray_dispatcher.resources import ResourceLoader
 
 
 class RecordingSourceObserver:
@@ -40,15 +42,18 @@ class RecordingSourceObserver:
 class FakeRayBackend:
     def __init__(self) -> None:
         self.submissions: list[Any] = []
+        self.fetch_submissions: list[tuple[Any, Any, Any]] = []
         self.ready: dict[str, ExecutionResult] = {}
         self.values: dict[str, Any] = {}
+        self.resource_loader = None
 
-    def submit(self, worker: WorkerSpec, request: Any, data_ref: Any = None) -> str:
+    def submit(self, worker: HandlerSpec, request: Any, data_ref: Any = None) -> str:
         self.submissions.append(request)
         return f"ref-{len(self.submissions)}"
 
-    def submit_fetch(self, worker: WorkerSpec, request: Any) -> str:
-        return f"fetch-ref-{len(self.submissions) + 1}"
+    def submit_fetch(self, worker: HandlerSpec, request: Any, source: Any, **_: Any) -> str:
+        self.fetch_submissions.append((worker, request, source))
+        return f"fetch-ref-{len(self.fetch_submissions)}"
 
     def poll(self, refs: Mapping[str, Any]):
         outcomes = {
@@ -74,71 +79,90 @@ class FakeRayBackend:
             self.values[ref] = value
 
 
+ORDERS_REGISTRY = build_source_registry(
+    {
+        "orders": {
+            "kind": "kafka",
+            "brokers": ["broker:9092"],
+            "topic": "orders",
+            "initial_offset": "earliest",
+        }
+    }
+)
+
+EVENTS_REGISTRY = build_source_registry(
+    {
+        "events-v1": {
+            "kind": "kafka",
+            "brokers": ["kafka-a:9092", "kafka-b:9092"],
+            "topic": "events",
+            "initial_offset": "earliest",
+        }
+    }
+)
+
+
 class WorkerDiscoveryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_multiple_handlers_share_observation_but_keep_independent_state(self) -> None:
+    async def test_multiple_handlers_auto_share_one_source_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             Path(directory, "orders.py").write_text(
                 '''
 HANDLERS = [
     {
-        "name": "to_jsonl",
         "entrypoint": "to_jsonl",
-        "sources": [{
-            "kind": "kafka",
-            "source_id": "orders",
-            "brokers": ["broker:9092"],
-            "topic": "orders",
-            "initial_offset": "earliest",
-        }],
+        "sources": ["orders"],
         "output": {
-            "connection_id": "files",
-            "target": "/tmp/jsonl",
-            "output_format": "jsonl",
-            "max_parallelism": 1,
+            "path": "/tmp/jsonl",
         },
         "batch_size": 2,
-        "max_parallelism": 4,
         "max_retries": 0,
     },
     {
-        "name": "to_csv",
         "entrypoint": "to_csv",
-        "sources": [{
-            "kind": "kafka",
-            "source_id": "orders",
-            "brokers": ["broker:9092"],
-            "topic": "orders",
-            "initial_offset": "earliest",
-        }],
+        "sources": ["orders"],
         "output": {
-            "connection_id": "files",
-            "target": "/tmp/csv",
-            "output_format": "csv",
-            "max_parallelism": 2,
+            "path": "/tmp/csv",
         },
         "batch_size": 2,
-        "max_parallelism": 4,
         "max_retries": 0,
     },
 ]
 
-def to_jsonl(request):
+def to_jsonl(request, records):
     return request.dispatch_id
 
-def to_csv(request):
+def to_csv(request, records):
     return request.dispatch_id
 ''',
                 encoding="utf-8",
             )
             source_observer = RecordingSourceObserver()
+
+            async def single_partition(source):
+                source_observer.kafka_calls.append((source.brokers, source.topic))
+                return {0: (0, 7)}
+
+            source_observer.kafka_watermarks = single_partition  # type: ignore[method-assign]
             backend = FakeRayBackend()
-            dispatcher = RayDispatcher(directory, ray_backend=backend)
+            dispatcher = RayDispatcher(
+                directory,
+                ray_backend=backend,
+                source_registry=ORDERS_REGISTRY,
+            )
             dispatcher.source_observer = source_observer
 
             backlog = await dispatcher.data_listener()
-            run_ids = await dispatcher.ray_trigger()
+            fetch_ids = await dispatcher.ray_trigger()
 
             for run in dispatcher.state.runs.values():
+                if run.kind != "fetch":
+                    continue
+                backend.finish(run.ref, value=[{"offset": 0}, {"offset": 1}])
+            await dispatcher.ray_status()
+
+            for run in dispatcher.state.runs.values():
+                if run.kind != "handler":
+                    continue
                 backend.finish(
                     run.ref,
                     error=(
@@ -153,60 +177,57 @@ def to_csv(request):
         self.assertEqual(
             {"orders:to_jsonl", "orders:to_csv"}, set(dispatcher.workers)
         )
-        self.assertEqual(7, backlog["orders:to_jsonl:orders:0"])
-        self.assertEqual(7, backlog["orders:to_csv:orders:0"])
-        requests = [run.request for run in dispatcher.state.runs.values()]
-        jsonl = [request for request in requests if request.handler_id.endswith("to_jsonl")]
-        csv = [request for request in requests if request.handler_id.endswith("to_csv")]
-        self.assertEqual(1, len(jsonl))
-        self.assertEqual(2, len(csv))
-        self.assertEqual(2, jsonl[0].end_offset - jsonl[0].start_offset)
-        self.assertEqual(
-            4,
-            sum(request.end_offset - request.start_offset for request in csv),
-        )
-        self.assertEqual("jsonl", jsonl[0].output_format)
-        self.assertEqual("/tmp/csv", csv[0].output_target)
-        self.assertEqual(3, len(run_ids))
-        self.assertEqual(
-            2,
-            dispatcher.state.sources["orders:to_jsonl:orders:0"].committed,
-        )
-        # Permanent csv failure skips its wave and unblocks the source.
-        self.assertEqual(
-            4,
-            dispatcher.state.sources["orders:to_csv:orders:0"].committed,
-        )
-        self.assertIsNone(
-            dispatcher.state.sources["orders:to_csv:orders:0"].active_batch_id
-        )
+        self.assertEqual({"shared:orders:0": 7}, backlog)
+        self.assertEqual(4, len(fetch_ids))
+        self.assertEqual(4, len(backend.fetch_submissions))
+        handler_requests = [
+            run.request
+            for run in dispatcher.state.runs.values()
+            if run.kind == "handler"
+        ]
+        jsonl = [
+            request
+            for request in handler_requests
+            if request.handler_id.endswith("to_jsonl")
+        ]
+        csv = [
+            request
+            for request in handler_requests
+            if request.handler_id.endswith("to_csv")
+        ]
+        self.assertEqual(4, len(jsonl))
+        self.assertEqual(4, len(csv))
+        self.assertEqual({"path": "/tmp/jsonl"}, dict(jsonl[0].output or {}))
+        self.assertEqual("/tmp/csv", (csv[0].output or {})["path"])
+        # Shared permanent failure advances the one source checkpoint.
+        self.assertEqual(7, dispatcher.state.sources["shared:orders:0"].committed)
+        self.assertIsNone(dispatcher.state.sources["shared:orders:0"].active_batch_id)
 
     async def test_directory_metadata_drives_active_topic_observation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             Path(directory, "events.py").write_text(
                 '''
-WORKER_CONFIG = {
-    "name": "events-worker",
-    "entrypoint": "process",
-    "max_parallelism": 2,
-    "batch_size": 10,
-    "sources": [{
-        "kind": "kafka",
-        "source_id": "events-v1",
-        "brokers": ["kafka-a:9092", "kafka-b:9092"],
-        "topic": "events",
-        "initial_offset": "earliest",
-    }],
-}
+HANDLERS = [
+    {
+        "handler_id": "events-worker",
+        "entrypoint": "process",
+        "batch_size": 10,
+        "sources": ["events-v1"],
+    },
+]
 
-def process(request):
+def process(request, records):
     return request.dispatch_id
 ''',
                 encoding="utf-8",
             )
             source_observer = RecordingSourceObserver()
             backend = FakeRayBackend()
-            dispatcher = RayDispatcher(directory, ray_backend=backend)
+            dispatcher = RayDispatcher(
+                directory,
+                ray_backend=backend,
+                source_registry=EVENTS_REGISTRY,
+            )
             dispatcher.source_observer = source_observer
 
             backlog = await dispatcher.data_listener()
@@ -215,9 +236,306 @@ def process(request):
             [(('kafka-a:9092', 'kafka-b:9092'), 'events')],
             source_observer.kafka_calls,
         )
-        self.assertEqual(7, backlog["events-worker:events-v1:0"])
-        self.assertEqual(6, backlog["events-worker:events-v1:1"])
-        self.assertEqual("events", dispatcher.workers["events-worker"].sources[0].topic)
+        self.assertEqual(7, backlog["shared:events-v1:0"])
+        self.assertEqual(6, backlog["shared:events-v1:1"])
+        self.assertEqual(
+            "events", dispatcher.workers["events-worker"].sources[0].topic
+        )
+
+    def test_legacy_worker_config_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "legacy.py").write_text(
+                '''
+WORKER_CONFIG = {
+    "entrypoint": "process",
+    "sources": ["orders"],
+}
+
+def process(request, records):
+    return request.dispatch_id
+''',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(WorkerDiscoveryError, "must export HANDLERS"):
+                discover_workers(directory, source_registry=ORDERS_REGISTRY)
+
+    def test_resource_registry_resolves_named_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "enriched.py").write_text(
+                '''
+HANDLERS = [
+    {
+        "entrypoint": "process",
+        "sources": ["orders"],
+        "resources": ["user-dim-v1"],
+    },
+]
+
+def process(request, records, resources):
+    return resources["user-dim-v1"]
+''',
+                encoding="utf-8",
+            )
+            resource_registry = build_resource_registry(
+                {
+                    "user-dim-v1": {
+                        "kind": "static",
+                        "data": {1: {"name": "alice"}},
+                    }
+                }
+            )
+            workers, _, resources = discover_workers(
+                directory,
+                source_registry=ORDERS_REGISTRY,
+                resource_registry=resource_registry,
+            )
+        self.assertEqual(("user-dim-v1",), workers[0].resource_ids)
+        self.assertEqual("static", resources["user-dim-v1"].kind)
+
+    def test_module_sources_and_resources_are_merged(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "orders.py").write_text(
+                '''
+SOURCES = {
+    "orders": {
+        "kind": "kafka",
+        "brokers": ["broker:9092"],
+        "topic": "orders",
+        "initial_offset": "earliest",
+    }
+}
+RESOURCES = {
+    "user-dim-v1": {
+        "kind": "static",
+        "data": {1: {"name": "alice"}},
+    }
+}
+HANDLERS = [
+    {
+        "entrypoint": "process",
+        "sources": ["orders"],
+        "resources": ["user-dim-v1"],
+    },
+]
+
+def process(request, records, resources):
+    return resources["user-dim-v1"]
+''',
+                encoding="utf-8",
+            )
+            workers, sources, resources = discover_workers(directory)
+        self.assertEqual(1, len(workers))
+        self.assertEqual("orders", sources["orders"].topic)
+        self.assertEqual({1: {"name": "alice"}}, resources["user-dim-v1"].data)
+        loader = ResourceLoader(resources)
+        self.assertEqual({1: {"name": "alice"}}, loader.get("user-dim-v1"))
+
+    def test_equal_module_source_declarations_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "a.py").write_text(
+                '''
+SOURCES = {
+    "orders": {
+        "kind": "kafka",
+        "brokers": ["broker:9092"],
+        "topic": "orders",
+    }
+}
+HANDLERS = [{"entrypoint": "process", "sources": ["orders"]}]
+
+def process(request, records):
+    return request.dispatch_id
+''',
+                encoding="utf-8",
+            )
+            Path(directory, "b.py").write_text(
+                '''
+SOURCES = {
+    "orders": {
+        "kind": "kafka",
+        "brokers": ["broker:9092"],
+        "topic": "orders",
+    }
+}
+HANDLERS = [{"entrypoint": "process", "sources": ["orders"]}]
+
+def process(request, records):
+    return request.dispatch_id
+''',
+                encoding="utf-8",
+            )
+            workers, sources, _ = discover_workers(directory)
+        self.assertEqual(2, len(workers))
+        self.assertEqual(["orders"], list(sources))
+
+    def test_conflicting_module_source_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "a.py").write_text(
+                '''
+SOURCES = {
+    "orders": {
+        "kind": "kafka",
+        "brokers": ["broker:9092"],
+        "topic": "orders",
+    }
+}
+HANDLERS = [{"entrypoint": "process", "sources": ["orders"]}]
+
+def process(request, records):
+    return request.dispatch_id
+''',
+                encoding="utf-8",
+            )
+            Path(directory, "b.py").write_text(
+                '''
+SOURCES = {
+    "orders": {
+        "kind": "kafka",
+        "brokers": ["other:9092"],
+        "topic": "orders",
+    }
+}
+HANDLERS = [{"entrypoint": "process", "sources": ["orders"]}]
+
+def process(request, records):
+    return request.dispatch_id
+''',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(WorkerDiscoveryError, "conflicting source"):
+                discover_workers(directory)
+
+    def test_file_resource_loads_json(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            dim_path = Path(directory, "users.json")
+            dim_path.write_text('{"1": {"name": "alice"}}', encoding="utf-8")
+            Path(directory, "enriched.py").write_text(
+                f'''
+SOURCES = {{
+    "orders": {{
+        "kind": "kafka",
+        "brokers": ["broker:9092"],
+        "topic": "orders",
+    }}
+}}
+RESOURCES = {{
+    "user-dim-v1": {{
+        "kind": "file",
+        "path": {str(dim_path)!r},
+    }}
+}}
+HANDLERS = [
+    {{
+        "entrypoint": "process",
+        "sources": ["orders"],
+        "resources": ["user-dim-v1"],
+    }},
+]
+
+def process(request, records, resources):
+    return resources["user-dim-v1"]
+''',
+                encoding="utf-8",
+            )
+            _, _, resources = discover_workers(directory)
+            loaded = ResourceLoader(resources).get("user-dim-v1")
+        self.assertEqual({"1": {"name": "alice"}}, loaded)
+
+    def test_unknown_resource_name_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "missing.py").write_text(
+                '''
+HANDLERS = [
+    {
+        "entrypoint": "process",
+        "sources": ["orders"],
+        "resources": ["missing-dim"],
+    },
+]
+
+def process(request, records, resources):
+    return request.dispatch_id
+''',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(WorkerDiscoveryError, "unknown resource"):
+                discover_workers(
+                    directory,
+                    source_registry=ORDERS_REGISTRY,
+                    resource_registry={},
+                )
+
+    def test_multisource_handlers_require_kafka_only(self) -> None:
+        registry = build_source_registry(
+            {
+                "orders": {
+                    "kind": "kafka",
+                    "brokers": ["broker:9092"],
+                    "topic": "orders",
+                },
+                "dim": {
+                    "kind": "postgres",
+                    "dsn": "postgresql://example",
+                    "table": "dim",
+                    "timestamp_column": "updated_at",
+                    "primary_key_column": "id",
+                },
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "join.py").write_text(
+                '''
+HANDLERS = [
+    {
+        "entrypoint": "join",
+        "sources": ["orders", "dim"],
+    },
+]
+
+def join(request, records):
+    return records
+''',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                WorkerDiscoveryError, "multi-source handlers must declare only Kafka"
+            ):
+                discover_workers(directory, source_registry=registry)
+
+    def test_multisource_kafka_handler_discovers_group_key(self) -> None:
+        registry = build_source_registry(
+            {
+                "orders": {
+                    "kind": "kafka",
+                    "brokers": ["broker:9092"],
+                    "topic": "orders",
+                },
+                "payments": {
+                    "kind": "kafka",
+                    "brokers": ["broker:9092"],
+                    "topic": "payments",
+                },
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "join.py").write_text(
+                '''
+HANDLERS = [
+    {
+        "entrypoint": "join",
+        "sources": ["orders", "payments"],
+    },
+]
+
+def join(request, records):
+    return records
+''',
+                encoding="utf-8",
+            )
+            workers, _, _ = discover_workers(directory, source_registry=registry)
+        self.assertEqual(1, len(workers))
+        self.assertTrue(workers[0].is_multisource)
+        self.assertEqual("ms:orders+payments", workers[0].group_key)
 
     def test_bad_worker_module_reports_its_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

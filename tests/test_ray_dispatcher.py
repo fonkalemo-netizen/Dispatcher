@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from ray_dispatcher import (
     BatchStatus,
+    CheckpointDocument,
+    Decision,
     DispatchRequest,
+    DispatcherConfig,
     ExecutionMode,
     ExecutionResult,
+    HandlerRequest,
+    HandlerSpec,
     KafkaRetentionGap,
     KafkaSource,
     MemoryCheckpointStore,
@@ -20,12 +26,20 @@ from ray_dispatcher import (
     PostgresSource,
     RayDispatcher,
     RunStatus,
-    SchedulingPolicy,
+    SoftAction,
     SourceKind,
     SourceState,
     SQLiteCheckpointStore,
-    WorkerSpec,
+    BacklogPressure,
+    HasBacklog,
+    HasCapacity,
+    SourceIdle,
+    TargetReached,
+    TriggerContext,
+    TriggerPolicy,
 )
+from ray_dispatcher.registries import ResourceSpec
+from ray_dispatcher.resources import ResourceLoader
 
 
 class FakeSourceObserver:
@@ -34,11 +48,36 @@ class FakeSourceObserver:
         self.pg_upper: dict[str, PostgresCursor] = {}
         self.pg_count: dict[str, int] = {}
         self.pg_count_calls = 0
+        self.event_time_highs: dict[str, dict[int, datetime]] = {}
+        # source_id -> partition -> sorted (timestamp, offset) pairs
+        self.offsets_for_times: dict[str, dict[int, list[tuple[datetime, int]]]] = {}
 
     async def kafka_watermarks(
         self, source: KafkaSource
     ) -> Mapping[int, tuple[int, int]]:
         return self.kafka[source.source_id]
+
+    async def kafka_event_time_highs(
+        self,
+        source: KafkaSource,
+        watermarks: Mapping[int, tuple[int, int]] | None = None,
+    ) -> Mapping[int, datetime]:
+        return self.event_time_highs.get(source.source_id, {})
+
+    async def kafka_offsets_for_times(
+        self,
+        source: KafkaSource,
+        timestamps: Mapping[int, datetime],
+    ) -> Mapping[int, int]:
+        table = self.offsets_for_times.get(source.source_id, {})
+        result: dict[int, int] = {}
+        for partition, moment in timestamps.items():
+            points = table.get(partition, [])
+            for ts, offset in points:
+                if ts >= moment:
+                    result[partition] = offset
+                    break
+        return result
 
     async def postgres_high_watermark(self, source: PostgresSource) -> PostgresCursor:
         return self.pg_upper[source.source_id]
@@ -54,18 +93,32 @@ class FakeSourceObserver:
 
 
 class FakeRayBackend:
-    def __init__(self, cpus: float = 100.0) -> None:
+    def __init__(self, cpus: float | None = 100.0) -> None:
         self.cpus = cpus
         self.sequence = 0
         self.submissions: list[tuple[Any, Any, str]] = []
         self.ready: dict[str, ExecutionResult] = {}
         self.values: dict[str, Any] = {}
         self.fail_submissions = 0
-        self.fetch_submissions: list[tuple[Any, Any, str]] = []
+        self.fetch_submissions: list[tuple[Any, Any, Any, str]] = []
+        self.merge_submissions: list[tuple[Any, tuple[str, ...], tuple[Any, ...], str]] = []
         self.data_refs: dict[str, Any] = {}
+        self.resource_loader = ResourceLoader()
+        self._actors_seen: set[str] = set()
+
+    def prepare_actor_restore(self, worker: HandlerSpec) -> bool:
+        if worker.mode is not ExecutionMode.ACTOR:
+            return False
+        if worker.name in self._actors_seen:
+            return False
+        self._actors_seen.add(worker.name)
+        return True
+
+    def drop_actor(self, handler_name: str) -> None:
+        self._actors_seen.discard(handler_name)
 
     def submit(
-        self, worker: WorkerSpec, request: Any, data_ref: Any = None
+        self, worker: HandlerSpec, request: Any, data_ref: Any = None
     ) -> str:
         if self.fail_submissions:
             self.fail_submissions -= 1
@@ -76,10 +129,27 @@ class FakeRayBackend:
         self.data_refs[ref] = data_ref
         return ref
 
-    def submit_fetch(self, worker: WorkerSpec, request: Any) -> str:
+    def submit_fetch(self, worker: HandlerSpec, request: Any, source: Any, **_: Any) -> str:
         self.sequence += 1
         ref = f"fetch-ref-{self.sequence}"
-        self.fetch_submissions.append((worker, request, ref))
+        self.fetch_submissions.append((worker, request, source, ref))
+        return ref
+
+    def submit_merge(
+        self,
+        worker: HandlerSpec,
+        source_ids: tuple[str, ...],
+        fetch_refs: Any,
+    ) -> str:
+        from ray_dispatcher.readers import merge_fetch_results
+
+        self.sequence += 1
+        ref = f"merge-ref-{self.sequence}"
+        refs = tuple(fetch_refs)
+        payloads = [self.values.get(item, []) for item in refs]
+        merged = merge_fetch_results(tuple(source_ids), *payloads)
+        self.merge_submissions.append((worker, tuple(source_ids), refs, ref))
+        self.values[ref] = merged
         return ref
 
     def poll(self, refs: Mapping[str, Any]) -> Mapping[str, ExecutionResult]:
@@ -98,6 +168,8 @@ class FakeRayBackend:
         return self.values[ref]
 
     def finish(self, ref: str, *, value: Any = None, error: str | None = None) -> None:
+        if error is None and value is None and ref in self.values:
+            value = self.values[ref]
         self.ready[ref] = ExecutionResult(error is None, value=value, error=error)
         if error is None:
             self.values[ref] = value
@@ -161,20 +233,40 @@ class RecordingActorInstance:
 
 class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
-    def _shared_workers(source: KafkaSource) -> tuple[WorkerSpec, WorkerSpec]:
-        fetcher = object()
+    def _shared_workers(source: KafkaSource) -> tuple[HandlerSpec, HandlerSpec]:
         common = {
             "sources": (source,),
-            "max_parallelism": 2,
             "batch_size": 10,
-            "shared_source_group": "events-fanout",
-            "data_fetcher": fetcher,
-            "fetcher_id": "events-reader-v1",
         }
         return (
-            WorkerSpec("json-handler", object(), **common),
-            WorkerSpec("csv-handler", object(), **common),
+            HandlerSpec("json-handler", object(), **common),
+            HandlerSpec("csv-handler", object(), **common),
         )
+
+    async def _complete_fetches(
+        self,
+        dispatcher: RayDispatcher,
+        backend: FakeRayBackend,
+        *,
+        value: Any | None = None,
+    ) -> None:
+        pending = [
+            (request, ref)
+            for _, request, _, ref in backend.fetch_submissions
+            if ref not in backend.values and ref not in backend.ready
+        ]
+        for request, ref in pending:
+            if value is not None:
+                payload = value
+            elif request.start_offset is not None and request.end_offset is not None:
+                payload = [
+                    {"offset": offset}
+                    for offset in range(request.start_offset, request.end_offset)
+                ]
+            else:
+                payload = [{"row": True}]
+            backend.finish(ref, value=payload)
+        await dispatcher.ray_status()
 
     async def test_shared_source_fetches_once_and_commits_after_all_handlers(self) -> None:
         client = FakeSourceObserver()
@@ -188,7 +280,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
             workers,
             ray_backend=backend,
             checkpoint_store=checkpoints,
-            policy=SchedulingPolicy(max_in_flight=3),
+            config=DispatcherConfig(max_in_flight=3),
         )
         dispatcher.source_observer = client
         client.kafka["events"] = {0: (0, 10)}
@@ -196,32 +288,32 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         backlog = await dispatcher.data_listener()
         fetch_ids = await dispatcher.ray_trigger()
 
-        key = "shared:events-fanout:events:0"
+        key = "shared:events:0"
         self.assertEqual({key: 10}, backlog)
         self.assertEqual(1, len(fetch_ids))
         self.assertEqual(1, len(backend.fetch_submissions))
         self.assertEqual([], backend.submissions)
+        self.assertIs(source, backend.fetch_submissions[0][2])
 
-        fetch_ref = backend.fetch_submissions[0][2]
-        backend.finish(fetch_ref, value=[{"offset": value} for value in range(10)])
-        await dispatcher.ray_status()
+        await self._complete_fetches(dispatcher, backend)
 
         self.assertEqual(2, len(backend.submissions))
+        fetch_ref = backend.fetch_submissions[0][3]
         self.assertTrue(
             all(
                 backend.data_refs[handler_ref] == fetch_ref
                 for _, _, handler_ref in backend.submissions
             )
         )
-        self.assertEqual(0, checkpoints.values[key])
+        self.assertEqual(0, checkpoints.values[key].progress)
 
         backend.finish(backend.submissions[0][2], value="json-ok")
         await dispatcher.ray_status()
-        self.assertEqual(0, checkpoints.values[key])
+        self.assertEqual(0, checkpoints.values[key].progress)
 
         backend.finish(backend.submissions[1][2], value="csv-ok")
         await dispatcher.ray_status()
-        self.assertEqual(10, checkpoints.values[key])
+        self.assertEqual(10, checkpoints.values[key].progress)
         self.assertEqual(0, dispatcher.state.sources[key].backlog)
         batch = next(iter(dispatcher.state.batches.values()))
         self.assertEqual(BatchStatus.SUCCEEDED, batch.status)
@@ -231,6 +323,43 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
                 for run_id in [*batch.fetch_run_ids, *batch.run_ids]
             )
         )
+
+    async def test_single_handler_also_uses_fetch_path(self) -> None:
+        client = FakeSourceObserver()
+        backend = FakeRayBackend()
+        checkpoints = MemoryCheckpointStore()
+        source = KafkaSource(
+            "events", ("broker",), "events", initial_offset="earliest"
+        )
+        worker = HandlerSpec(
+            "worker", object(), (source,), batch_size=10
+        )
+        dispatcher = RayDispatcher(
+            (worker,),
+            ray_backend=backend,
+            checkpoint_store=checkpoints,
+        )
+        dispatcher.source_observer = client
+        client.kafka["events"] = {0: (0, 5)}
+
+        backlog = await dispatcher.data_listener()
+        key = "shared:events:0"
+        self.assertEqual({key: 5}, backlog)
+        fetch_ids = await dispatcher.ray_trigger()
+        self.assertEqual(1, len(fetch_ids))
+        self.assertEqual(1, len(backend.fetch_submissions))
+        self.assertEqual([], backend.submissions)
+
+        await self._complete_fetches(dispatcher, backend)
+        self.assertEqual(1, len(backend.submissions))
+        self.assertEqual(
+            backend.fetch_submissions[0][3],
+            backend.data_refs[backend.submissions[0][2]],
+        )
+
+        backend.finish(backend.submissions[0][2], value="ok")
+        await dispatcher.ray_status()
+        self.assertEqual(5, checkpoints.values[key].progress)
 
     async def test_shared_handler_retry_reuses_fetch_ref(self) -> None:
         client = FakeSourceObserver()
@@ -242,15 +371,14 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         dispatcher = RayDispatcher(
             workers,
             ray_backend=backend,
-            policy=SchedulingPolicy(max_in_flight=3),
+            config=DispatcherConfig(max_in_flight=3),
         )
         dispatcher.source_observer = client
         client.kafka["events"] = {0: (0, 4)}
         await dispatcher.data_listener()
         await dispatcher.ray_trigger()
-        fetch_ref = backend.fetch_submissions[0][2]
-        backend.finish(fetch_ref, value=[1, 2, 3, 4])
-        await dispatcher.ray_status()
+        await self._complete_fetches(dispatcher, backend, value=[1, 2, 3, 4])
+        fetch_ref = backend.fetch_submissions[0][3]
 
         first_handler_ref = backend.submissions[0][2]
         failed_handler_ref = backend.submissions[1][2]
@@ -265,12 +393,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
         backend.finish(retry_ref, value="retry-ok")
         await dispatcher.ray_status()
-        self.assertEqual(
-            4,
-            dispatcher.state.sources[
-                "shared:events-fanout:events:0"
-            ].committed,
-        )
+        self.assertEqual(4, dispatcher.state.sources["shared:events:0"].committed)
 
     async def test_kafka_increment_is_split_and_committed_after_all_refs_finish(self) -> None:
         client = FakeSourceObserver()
@@ -279,52 +402,65 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         source = KafkaSource(
             "events", ("broker:9092",), "events", connection_id="primary-kafka"
         )
-        worker = WorkerSpec(
+        worker = HandlerSpec(
             "event-worker",
             object(),
             (source,),
-            max_parallelism=4,
             batch_size=10,
         )
         dispatcher = RayDispatcher(
             (worker,),
             ray_backend=backend,
             checkpoint_store=checkpoints,
-            policy=SchedulingPolicy(max_in_flight=10),
+            config=DispatcherConfig(max_in_flight=10),
         )
         dispatcher.source_observer = client
 
         client.kafka["events"] = {0: (0, 100)}
-        self.assertEqual({"event-worker:events:0": 0}, await dispatcher.data_listener())
-        self.assertEqual(100, checkpoints.values["event-worker:events:0"])
+        key = "shared:events:0"
+        self.assertEqual({key: 0}, await dispatcher.data_listener())
+        self.assertEqual(100, checkpoints.values[key].progress)
 
         client.kafka["events"] = {0: (0, 125)}
         backlog = await dispatcher.data_listener()
-        self.assertEqual(25, backlog["event-worker:events:0"])
+        self.assertEqual(25, backlog[key])
 
-        run_ids = await dispatcher.ray_trigger()
-        self.assertEqual(3, len(run_ids))
-        requests = [submission[1] for submission in backend.submissions]
-        self.assertEqual([(100, 109), (109, 117), (117, 125)], [
-            (request.start_offset, request.end_offset) for request in requests
-        ])
-        self.assertEqual({0, 1, 2}, {request.task_index for request in requests})
-        self.assertTrue(all(request.n == 3 for request in requests))
-        self.assertTrue(all(request.topic == "events" for request in requests))
-        self.assertTrue(
-            all(request.source_connection_id == "primary-kafka" for request in requests)
+        fetch_ids = await dispatcher.ray_trigger()
+        self.assertEqual(3, len(fetch_ids))
+        fetch_requests = [item[1] for item in backend.fetch_submissions]
+        self.assertEqual(
+            [(100, 109), (109, 117), (117, 125)],
+            [(request.start_offset, request.end_offset) for request in fetch_requests],
         )
-        self.assertEqual(3, len(dispatcher.state.refs))
+        self.assertEqual({0, 1, 2}, {request.task_index for request in fetch_requests})
+        self.assertTrue(all(request.n == 3 for request in fetch_requests))
+        self.assertTrue(all(request.topic == "events" for request in fetch_requests))
+        self.assertTrue(
+            all(
+                request.source_connection_id == "primary-kafka"
+                for request in fetch_requests
+            )
+        )
+
+        await self._complete_fetches(dispatcher, backend)
+        self.assertEqual(3, len(backend.submissions))
+        requests = [submission[1] for submission in backend.submissions]
+        self.assertTrue(all(isinstance(request, HandlerRequest) for request in requests))
+        self.assertEqual(
+            {"event-worker"},
+            {request.handler_id for request in requests},
+        )
+        self.assertEqual(3, len({request.dispatch_id for request in requests}))
 
         backend.finish(backend.submissions[1][2], value="middle")
         await dispatcher.ray_status()
-        self.assertEqual(100, checkpoints.values["event-worker:events:0"])
+        self.assertEqual(100, checkpoints.values[key].progress)
 
         backend.finish(backend.submissions[0][2], value="first")
         backend.finish(backend.submissions[2][2], value="last")
         await dispatcher.ray_status()
-        self.assertEqual(125, checkpoints.values["event-worker:events:0"])
-        self.assertEqual(0, dispatcher.state.sources["event-worker:events:0"].backlog)
+        self.assertEqual(125, checkpoints.values[key].progress)
+        self.assertEqual(0, dispatcher.state.sources[key].backlog)
         batch = next(iter(dispatcher.state.batches.values()))
         self.assertEqual(BatchStatus.SUCCEEDED, batch.status)
 
@@ -332,14 +468,20 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         client = FakeSourceObserver()
         backend = FakeRayBackend()
         source = KafkaSource("events", ("broker",), "events", initial_offset="earliest")
-        worker = WorkerSpec(
-            "worker", object(), (source,), max_parallelism=1, batch_size=100, max_retries=1
+        worker = HandlerSpec(
+            "worker", object(), (source,), batch_size=100, max_retries=1
         )
         dispatcher = RayDispatcher((worker,), ray_backend=backend)
         dispatcher.source_observer = client
         client.kafka["events"] = {0: (0, 5)}
         await dispatcher.data_listener()
-        [run_id] = await dispatcher.ray_trigger()
+        await dispatcher.ray_trigger()
+        await self._complete_fetches(dispatcher, backend)
+        [run_id] = [
+            run_id
+            for run_id, run in dispatcher.state.runs.items()
+            if run.kind == "handler"
+        ]
         original_dispatch_id = backend.submissions[0][1].dispatch_id
 
         backend.finish(backend.submissions[0][2], error="transient")
@@ -350,21 +492,28 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
         backend.finish(backend.submissions[1][2], value="ok")
         await dispatcher.ray_status()
-        self.assertEqual(5, dispatcher.state.sources["worker:events:0"].committed)
+        self.assertEqual(5, dispatcher.state.sources["shared:events:0"].committed)
 
     async def test_initial_submission_failure_is_automatically_retried(self) -> None:
         client = FakeSourceObserver()
         backend = FakeRayBackend()
         backend.fail_submissions = 1
         source = KafkaSource("events", ("broker",), "events", initial_offset="earliest")
-        worker = WorkerSpec(
-            "worker", object(), (source,), max_parallelism=1, max_retries=1
+        worker = HandlerSpec(
+            "worker", object(), (source,), max_retries=1
         )
         dispatcher = RayDispatcher((worker,), ray_backend=backend)
         dispatcher.source_observer = client
         client.kafka["events"] = {0: (0, 5)}
         await dispatcher.data_listener()
-        [run_id] = await dispatcher.ray_trigger()
+        await dispatcher.ray_trigger()
+        await self._complete_fetches(dispatcher, backend)
+
+        [run_id] = [
+            run_id
+            for run_id, run in dispatcher.state.runs.items()
+            if run.kind == "handler"
+        ]
         self.assertIsNone(dispatcher.state.runs[run_id].ref)
 
         statuses = await dispatcher.ray_status()
@@ -374,7 +523,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
         backend.finish(backend.submissions[-1][2], value="ok")
         await dispatcher.ray_status()
-        self.assertEqual(5, dispatcher.state.sources["worker:events:0"].committed)
+        self.assertEqual(5, dispatcher.state.sources["shared:events:0"].committed)
 
     async def test_postgres_composite_cursor_window_uses_task_slices(self) -> None:
         client = FakeSourceObserver()
@@ -389,8 +538,8 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
             "id",
             initial_cursor=start,
         )
-        worker = WorkerSpec(
-            "order-worker", object(), (source,), max_parallelism=4, batch_size=10
+        worker = HandlerSpec(
+            "order-worker", object(), (source,), batch_size=10
         )
         checkpoints = MemoryCheckpointStore()
         dispatcher = RayDispatcher(
@@ -400,21 +549,29 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         client.pg_upper["orders"] = end
         client.pg_count["orders"] = 25
 
+        key = "shared:orders:orders"
         backlog = await dispatcher.data_listener()
-        self.assertEqual(25, backlog["order-worker:orders:orders"])
-        run_ids = await dispatcher.ray_trigger()
+        self.assertEqual(25, backlog[key])
+        fetch_ids = await dispatcher.ray_trigger()
         # Custom clients without postgres_ranges safely use one task instead of
         # process-dependent Python hash partitioning.
-        self.assertEqual(1, len(run_ids))
+        self.assertEqual(1, len(fetch_ids))
+        await self._complete_fetches(dispatcher, backend)
+        fetch_requests = [item[1] for item in backend.fetch_submissions]
+        self.assertTrue(all(request.start_cursor == start for request in fetch_requests))
+        self.assertTrue(all(request.end_cursor == end for request in fetch_requests))
+        self.assertEqual([0], [request.task_index for request in fetch_requests])
         requests = [item[1] for item in backend.submissions]
-        self.assertTrue(all(request.start_cursor == start for request in requests))
-        self.assertTrue(all(request.end_cursor == end for request in requests))
-        self.assertEqual([0], [request.task_index for request in requests])
+        self.assertTrue(all(isinstance(request, HandlerRequest) for request in requests))
+        self.assertEqual(
+            {"order-worker"},
+            {request.handler_id for request in requests},
+        )
 
         for _, _, ref in backend.submissions:
             backend.finish(ref, value={"processed": True})
         await dispatcher.ray_status()
-        self.assertEqual(end, checkpoints.values["order-worker:orders:orders"])
+        self.assertEqual(end, checkpoints.values[key].progress)
 
     async def test_postgres_numeric_primary_keys_keep_database_order(self) -> None:
         client = FakeSourceObserver()
@@ -425,22 +582,23 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         source = PostgresSource(
             "orders", "dsn", "orders", "updated_at", "id", initial_cursor=start
         )
-        worker = WorkerSpec("worker", object(), (source,))
+        worker = HandlerSpec("worker", object(), (source,))
         dispatcher = RayDispatcher((worker,), ray_backend=backend)
         dispatcher.source_observer = client
         client.pg_upper["orders"] = end
         client.pg_count["orders"] = 1
 
         backlog = await dispatcher.data_listener()
-        self.assertEqual(1, backlog["worker:orders:orders"])
+        self.assertEqual(1, backlog["shared:orders:orders"])
         self.assertEqual(1, client.pg_count_calls)
 
     async def test_retention_gap_fails_without_silently_skipping_data(self) -> None:
         client = FakeSourceObserver()
         backend = FakeRayBackend()
         source = KafkaSource("events", ("broker",), "events")
-        worker = WorkerSpec("worker", object(), (source,))
-        checkpoints = MemoryCheckpointStore({"worker:events:0": 5})
+        worker = HandlerSpec("worker", object(), (source,))
+        key = "shared:events:0"
+        checkpoints = MemoryCheckpointStore({key: 5})
         dispatcher = RayDispatcher(
             (worker,), ray_backend=backend, checkpoint_store=checkpoints
         )
@@ -449,7 +607,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(KafkaRetentionGap):
             await dispatcher.data_listener()
-        self.assertIn("below retained", dispatcher.state.sources["worker:events:0"].retention_gap)
+        self.assertIn("below retained", dispatcher.state.sources[key].retention_gap)
 
     async def test_explicit_retention_reset_resumes_from_new_low_watermark(self) -> None:
         client = FakeSourceObserver()
@@ -460,8 +618,9 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
             "events",
             retention_policy="reset_to_earliest",
         )
-        worker = WorkerSpec("worker", object(), (source,), batch_size=100)
-        checkpoints = MemoryCheckpointStore({"worker:events:0": 5})
+        worker = HandlerSpec("worker", object(), (source,), batch_size=100)
+        key = "shared:events:0"
+        checkpoints = MemoryCheckpointStore({key: 5})
         dispatcher = RayDispatcher(
             (worker,), ray_backend=backend, checkpoint_store=checkpoints
         )
@@ -469,9 +628,9 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         client.kafka["events"] = {0: (10, 20)}
 
         backlog = await dispatcher.data_listener()
-        self.assertEqual(10, backlog["worker:events:0"])
-        self.assertIsNone(dispatcher.state.sources["worker:events:0"].retention_gap)
-        self.assertEqual(10, checkpoints.values["worker:events:0"])
+        self.assertEqual(10, backlog[key])
+        self.assertIsNone(dispatcher.state.sources[key].retention_gap)
+        self.assertEqual(10, checkpoints.values[key].progress)
         self.assertEqual(1, len(await dispatcher.ray_trigger()))
 
     async def test_retention_reset_does_not_overwrite_an_active_batch(self) -> None:
@@ -484,52 +643,55 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
             initial_offset="earliest",
             retention_policy="reset_to_earliest",
         )
-        worker = WorkerSpec("worker", object(), (source,), max_parallelism=1)
+        worker = HandlerSpec("worker", object(), (source,))
         checkpoints = MemoryCheckpointStore()
         dispatcher = RayDispatcher(
             (worker,), ray_backend=backend, checkpoint_store=checkpoints
         )
         dispatcher.source_observer = client
         client.kafka["events"] = {0: (0, 20)}
+        key = "shared:events:0"
         await dispatcher.data_listener()
         await dispatcher.ray_trigger()
+        await self._complete_fetches(dispatcher, backend)
 
         client.kafka["events"] = {0: (30, 40)}
         with self.assertRaises(KafkaRetentionGap):
             await dispatcher.data_listener()
-        self.assertEqual(0, checkpoints.values["worker:events:0"])
+        self.assertEqual(0, checkpoints.values[key].progress)
 
         backend.finish(backend.submissions[0][2], value="old range completed")
         await dispatcher.ray_status()
-        self.assertEqual(20, checkpoints.values["worker:events:0"])
+        self.assertEqual(20, checkpoints.values[key].progress)
         backlog = await dispatcher.data_listener()
-        self.assertEqual(10, backlog["worker:events:0"])
-        self.assertEqual(30, checkpoints.values["worker:events:0"])
+        self.assertEqual(10, backlog[key])
+        self.assertEqual(30, checkpoints.values[key].progress)
 
     async def test_actor_pool_can_accept_a_second_wave_when_free_cpu_is_zero(self) -> None:
         client = FakeSourceObserver()
         backend = FakeRayBackend(cpus=1)
         source = KafkaSource("events", ("broker",), "events", initial_offset="earliest")
-        worker = WorkerSpec(
+        worker = HandlerSpec(
             "worker",
             object(),
             (source,),
             mode=ExecutionMode.ACTOR,
             remote_method="process",
-            max_parallelism=1,
-            cache_history=True,
         )
         dispatcher = RayDispatcher((worker,), ray_backend=backend)
         dispatcher.source_observer = client
         client.kafka["events"] = {0: (0, 1)}
         await dispatcher.data_listener()
         await dispatcher.ray_trigger()
+        await self._complete_fetches(dispatcher, backend)
         backend.finish(backend.submissions[0][2], value="first")
         await dispatcher.ray_status()
 
         client.kafka["events"] = {0: (0, 2)}
         await dispatcher.data_listener()
-        backend.cpus = 0
+        # Actor CPUs are already reserved; disable free-CPU gating so the next
+        # fetch/handler wave can still schedule.
+        backend.cpus = None
         second_wave = await dispatcher.ray_trigger()
         self.assertEqual(1, len(second_wave))
 
@@ -537,30 +699,68 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         backend = NativeRayBackend(FakeNativeRayModule())
         actor_cls = RecordingActorClass()
         source = KafkaSource("events", ("broker",), "events")
-        worker = WorkerSpec(
+        worker = HandlerSpec(
             "worker",
             actor_cls,
             (source,),
             mode=ExecutionMode.ACTOR,
             remote_method="process",
-            max_parallelism=4,
         )
-        request = DispatchRequest(
-            "dispatch", "worker", "events", SourceKind.KAFKA, 0, 1
-        )
+        request = HandlerRequest(dispatch_id="dispatch", handler_id="worker")
+        data_ref = object()
 
-        backend.submit(worker, request)
-        backend.submit(worker, request)
-        backend.submit(worker, request)
+        backend.submit(worker, request, data_ref)
+        backend.submit(worker, request, data_ref)
+        backend.submit(worker, request, data_ref)
 
         self.assertEqual(1, len(actor_cls.remote_instances))
         self.assertEqual(3, len(actor_cls.remote_instances[0].process.remote_calls))
+        self.assertEqual(
+            (request, data_ref),
+            actor_cls.remote_instances[0].process.remote_calls[0][0],
+        )
 
-    def test_scheduling_priority_is_progressive(self) -> None:
-        policy = SchedulingPolicy()
+    def test_native_backend_loads_resource_snapshot_once(self) -> None:
+        data = {1: {"name": "alice"}}
+        loader = ResourceLoader(
+            {
+                "user-dim-v1": ResourceSpec(
+                    "user-dim-v1", kind="static", data=data
+                )
+            }
+        )
+        backend = NativeRayBackend(FakeNativeRayModule(), resource_loader=loader)
+        remote = RecordingRemoteFunction()
         source = KafkaSource("events", ("broker",), "events")
-        high = WorkerSpec("high", object(), (source,), priority=1)
-        low = WorkerSpec("low", object(), (source,), priority=0)
+        worker = HandlerSpec(
+            "worker",
+            remote,
+            (source,),
+            resource_ids=("user-dim-v1",),
+        )
+        request = HandlerRequest(dispatch_id="dispatch", handler_id="worker")
+        data_ref = object()
+
+        backend.submit(worker, request, data_ref)
+        backend.submit(worker, request, data_ref)
+
+        self.assertIs(loader.get("user-dim-v1"), data)
+        resources = {"user-dim-v1": data}
+        self.assertEqual(
+            ((request, data_ref, resources), {}),
+            remote.remote_calls[0],
+        )
+        self.assertEqual(remote.remote_calls[0][0][2], remote.remote_calls[1][0][2])
+        self.assertIs(
+            remote.remote_calls[0][0][2]["user-dim-v1"],
+            remote.remote_calls[1][0][2]["user-dim-v1"],
+        )
+
+    def test_trigger_rank_key_is_progressive(self) -> None:
+        trigger = TriggerPolicy.default()
+        source = KafkaSource("events", ("broker",), "events")
+        high = HandlerSpec("high", object(), (source,), priority=1)
+        low = HandlerSpec("low", object(), (source,), priority=0)
         now = 100.0
         most = SourceState(
             "a", "low", "events", SourceKind.KAFKA, "0", 0, 100, backlog=100
@@ -595,7 +795,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
 
         ordered = sorted(
             [most, slow, fast, ranked],
-            key=lambda state: policy.priority(
+            key=lambda state: trigger.rank_key(
                 high if state.worker_name == "high" else low, state, now
             ),
             reverse=True,
@@ -608,11 +808,10 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         checkpoints = MemoryCheckpointStore()
         failures = MemoryFailureStore()
         source = KafkaSource("events", ("broker",), "events", initial_offset="earliest")
-        worker = WorkerSpec(
+        worker = HandlerSpec(
             "worker",
             object(),
             (source,),
-            max_parallelism=1,
             batch_size=5,
             max_retries=0,
         )
@@ -621,12 +820,21 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
             ray_backend=backend,
             checkpoint_store=checkpoints,
             failure_store=failures,
+            # One slice needs fetch + handler; keep a single batch in flight.
+            config=DispatcherConfig(max_in_flight=2),
         )
         dispatcher.source_observer = client
         client.kafka["events"] = {0: (0, 12)}
         await dispatcher.data_listener()
-        [run_id] = await dispatcher.ray_trigger()
-        key = "worker:events:0"
+        await dispatcher.ray_trigger()
+        key = "shared:events:0"
+        payload = [{"offset": offset} for offset in range(5)]
+        await self._complete_fetches(dispatcher, backend, value=payload)
+        [run_id] = [
+            run_id
+            for run_id, run in dispatcher.state.runs.items()
+            if run.kind == "handler"
+        ]
         self.assertEqual(0, dispatcher.state.sources[key].committed)
         self.assertIsNotNone(dispatcher.state.sources[key].active_batch_id)
 
@@ -638,7 +846,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(RunStatus.FAILED, dispatcher.state.runs[run_id].status)
         self.assertEqual(BatchStatus.FAILED, batch.status)
         self.assertEqual(5, state.committed)
-        self.assertEqual(5, checkpoints.values[key])
+        self.assertEqual(5, checkpoints.values[key].progress)
         self.assertIsNone(state.active_batch_id)
         self.assertEqual(7, state.backlog)
         recorded = await failures.list_failures()
@@ -646,14 +854,14 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(batch.batch_id, recorded[0].batch_id)
         self.assertEqual(0, recorded[0].start)
         self.assertEqual(5, recorded[0].end)
-        self.assertIsNone(recorded[0].payload)
-        self.assertIn("poison", recorded[0].runs[0].error or "")
-        self.assertEqual([], await dispatcher.retry_failed_batch(batch.batch_id))
+        self.assertEqual(payload, recorded[0].payload)
+        self.assertIn("poison", recorded[0].runs[-1].error or "")
+        self.assertFalse(hasattr(dispatcher, "retry_failed_batch"))
 
         next_ids = await dispatcher.ray_trigger()
         self.assertEqual(1, len(next_ids))
-        self.assertEqual(5, backend.submissions[-1][1].start_offset)
-        self.assertEqual(10, backend.submissions[-1][1].end_offset)
+        self.assertEqual(5, backend.fetch_submissions[-1][1].start_offset)
+        self.assertEqual(10, backend.fetch_submissions[-1][1].end_offset)
 
     async def test_shared_permanent_failure_records_fetch_payload(self) -> None:
         client = FakeSourceObserver()
@@ -662,34 +870,27 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         source = KafkaSource(
             "events", ("broker",), "events", initial_offset="earliest"
         )
-        fetcher = object()
         common = {
             "sources": (source,),
-            "max_parallelism": 2,
             "batch_size": 10,
             "max_retries": 0,
-            "shared_source_group": "events-fanout",
-            "data_fetcher": fetcher,
-            "fetcher_id": "events-reader-v1",
         }
         workers = (
-            WorkerSpec("json-handler", object(), **common),
-            WorkerSpec("csv-handler", object(), **common),
+            HandlerSpec("json-handler", object(), **common),
+            HandlerSpec("csv-handler", object(), **common),
         )
         dispatcher = RayDispatcher(
             workers,
             ray_backend=backend,
             failure_store=failures,
-            policy=SchedulingPolicy(max_in_flight=8),
+            config=DispatcherConfig(max_in_flight=8),
         )
         dispatcher.source_observer = client
         client.kafka["events"] = {0: (0, 4)}
         await dispatcher.data_listener()
         await dispatcher.ray_trigger()
-        fetch_ref = backend.fetch_submissions[0][2]
         payload = [{"offset": 0}, {"offset": 1}, {"offset": 2}, {"offset": 3}]
-        backend.finish(fetch_ref, value=payload)
-        await dispatcher.ray_status()
+        await self._complete_fetches(dispatcher, backend, value=payload)
         backend.finish(backend.submissions[0][2], value="ok")
         backend.finish(backend.submissions[1][2], error="poison sink")
         await dispatcher.ray_status()
@@ -700,7 +901,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any("poison sink" in (run.error or "") for run in recorded[0].runs)
         )
-        key = "shared:events-fanout:events:0"
+        key = "shared:events:0"
         self.assertEqual(4, dispatcher.state.sources[key].committed)
         self.assertIsNone(dispatcher.state.sources[key].active_batch_id)
 
@@ -708,7 +909,7 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         client = FakeSourceObserver()
         backend = FakeRayBackend()
         source = KafkaSource("events", ("broker",), "events")
-        worker = WorkerSpec("worker", object(), (source,))
+        worker = HandlerSpec("worker", object(), (source,))
         dispatcher = RayDispatcher(
             (worker,),
             ray_backend=backend,
@@ -738,10 +939,8 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         backend = NativeRayBackend(FakeNativeRayModule())
         remote = RecordingRemoteFunction()
         source = KafkaSource("events", ("broker",), "events")
-        worker = WorkerSpec("worker", remote, (source,))
-        request = DispatchRequest(
-            "dispatch", "worker", "events", SourceKind.KAFKA, 0, 1
-        )
+        worker = HandlerSpec("worker", remote, (source,))
+        request = HandlerRequest(dispatch_id="dispatch", handler_id="worker")
         data_ref = object()
 
         result = backend.submit(worker, request, data_ref)
@@ -756,14 +955,651 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = f"{directory}/dispatcher.sqlite3"
             first_store = SQLiteCheckpointStore(path)
-            await first_store.save("handler:events:0", 42)
-            await first_store.save("handler:orders:orders", cursor)
+            await first_store.save("shared:events:0", 42)
+            await first_store.save("shared:orders:orders", cursor)
 
             restarted_store = SQLiteCheckpointStore(path)
-            self.assertEqual(42, await restarted_store.load("handler:events:0"))
-            self.assertEqual(
-                cursor, await restarted_store.load("handler:orders:orders")
+            loaded_events = await restarted_store.load("shared:events:0")
+            loaded_orders = await restarted_store.load("shared:orders:orders")
+            self.assertIsNotNone(loaded_events)
+            self.assertIsNotNone(loaded_orders)
+            assert loaded_events is not None
+            assert loaded_orders is not None
+            self.assertEqual(42, loaded_events.progress)
+            self.assertIsNone(loaded_events.state)
+            self.assertEqual(cursor, loaded_orders.progress)
+            self.assertIsNone(loaded_orders.state)
+
+    async def test_multisource_window_merges_records_dict(self) -> None:
+        client = FakeSourceObserver()
+        backend = FakeRayBackend()
+        t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        t_right = t0 + timedelta(seconds=100)
+        orders = KafkaSource(
+            "orders", ("broker",), "orders", initial_offset="earliest"
+        )
+        payments = KafkaSource(
+            "payments", ("broker",), "payments", initial_offset="earliest"
+        )
+        worker = HandlerSpec(
+            "join-handler",
+            object(),
+            (orders, payments),
+            batch_size=100,
+        )
+        checkpoints = MemoryCheckpointStore(
+            {RayDispatcher._mswin_checkpoint_key(worker.group_key): t0}
+        )
+        dispatcher = RayDispatcher(
+            (worker,),
+            ray_backend=backend,
+            checkpoint_store=checkpoints,
+            config=DispatcherConfig(max_in_flight=16, max_window_seconds=60.0),
+        )
+        dispatcher.source_observer = client
+        client.kafka["orders"] = {0: (0, 5)}
+        client.kafka["payments"] = {0: (0, 3)}
+        client.event_time_highs["orders"] = {0: t_right}
+        client.event_time_highs["payments"] = {0: t_right}
+        client.offsets_for_times["orders"] = {
+            0: [(t0, 0), (t0 + timedelta(seconds=60), 4), (t_right, 5)]
+        }
+        client.offsets_for_times["payments"] = {
+            0: [(t0, 0), (t0 + timedelta(seconds=60), 2), (t_right, 3)]
+        }
+
+        await dispatcher.data_listener()
+        window = dispatcher.state.multisource_windows[worker.group_key]
+        self.assertEqual(t0, window.committed_time)
+        self.assertEqual(t_right, window.observed_time)
+
+        fetch_ids = await dispatcher.ray_trigger()
+        self.assertEqual(2, len(fetch_ids))
+        self.assertEqual(2, len(backend.fetch_submissions))
+        fetched_sources = {source.source_id for _, _, source, _ in backend.fetch_submissions}
+        self.assertEqual({"orders", "payments"}, fetched_sources)
+
+        await self._complete_fetches(dispatcher, backend)
+        self.assertEqual(1, len(backend.merge_submissions))
+        merge_ref = backend.merge_submissions[0][3]
+        backend.finish(merge_ref)
+        await dispatcher.ray_status()
+
+        self.assertEqual(1, len(backend.submissions))
+        handler_ref = backend.submissions[0][2]
+        data_ref = backend.data_refs[handler_ref]
+        self.assertEqual(merge_ref, data_ref)
+        merged = backend.values[merge_ref]
+        self.assertIsInstance(merged, dict)
+        self.assertEqual({"orders", "payments"}, set(merged))
+        self.assertEqual(
+            [{"offset": 0}, {"offset": 1}, {"offset": 2}, {"offset": 3}],
+            merged["orders"],
+        )
+        self.assertEqual(
+            [{"offset": 0}, {"offset": 1}],
+            merged["payments"],
+        )
+
+        backend.finish(handler_ref, value="joined")
+        await dispatcher.ray_status()
+        self.assertEqual(
+            t0 + timedelta(seconds=60),
+            checkpoints.values[
+                RayDispatcher._mswin_checkpoint_key(worker.group_key)
+            ].progress,
+        )
+        self.assertEqual(4, checkpoints.values["shared:orders:0"].progress)
+        self.assertEqual(2, checkpoints.values["shared:payments:0"].progress)
+        self.assertIsNone(window.active_batch_id)
+        batch = next(iter(dispatcher.state.batches.values()))
+        self.assertEqual(BatchStatus.SUCCEEDED, batch.status)
+
+    async def test_multisource_missing_offset_for_times_uses_high(self) -> None:
+        """Missing offsets_for_times must not fall back to low (silent catch-up)."""
+
+        client = FakeSourceObserver()
+        backend = FakeRayBackend()
+        t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        t_right = t0 + timedelta(seconds=100)
+        orders = KafkaSource(
+            "orders", ("broker",), "orders", initial_offset="earliest"
+        )
+        payments = KafkaSource(
+            "payments", ("broker",), "payments", initial_offset="earliest"
+        )
+        worker = HandlerSpec(
+            "join-handler",
+            object(),
+            (orders, payments),
+            batch_size=100,
+        )
+        checkpoints = MemoryCheckpointStore(
+            {RayDispatcher._mswin_checkpoint_key(worker.group_key): t0}
+        )
+        dispatcher = RayDispatcher(
+            (worker,),
+            ray_backend=backend,
+            checkpoint_store=checkpoints,
+            config=DispatcherConfig(max_in_flight=16, max_window_seconds=60.0),
+        )
+        dispatcher.source_observer = client
+        client.kafka["orders"] = {0: (0, 10)}
+        client.kafka["payments"] = {0: (0, 10)}
+        client.event_time_highs["orders"] = {0: t_right}
+        client.event_time_highs["payments"] = {0: t_right}
+        # Only right-bound answers for payments: left bound missing → high.
+        client.offsets_for_times["orders"] = {
+            0: [(t0, 0), (t0 + timedelta(seconds=60), 4), (t_right, 5)]
+        }
+        client.offsets_for_times["payments"] = {
+            0: [(t0 + timedelta(seconds=60), 10), (t_right, 10)]
+        }
+
+        await dispatcher.data_listener()
+        fetch_ids = await dispatcher.ray_trigger()
+        self.assertEqual(1, len(fetch_ids))
+        self.assertEqual(1, len(backend.fetch_submissions))
+        _worker, request, source, _ref = backend.fetch_submissions[0]
+        self.assertEqual("orders", source.source_id)
+        self.assertEqual(0, request.start_offset)
+        self.assertEqual(4, request.end_offset)
+
+    async def test_sqlite_legacy_and_document_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = f"{directory}/checkpoints.sqlite3"
+            store = SQLiteCheckpointStore(path)
+            # Simulate a legacy flat row.
+            import sqlite3
+
+            connection = sqlite3.connect(path)
+            connection.execute(
+                """
+                INSERT INTO ray_dispatcher_checkpoints (
+                    checkpoint_key, value_type, value_json, updated_at
+                ) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                ("shared:legacy:0", "kafka_offset", "7"),
             )
+            connection.commit()
+            connection.close()
+
+            legacy = await store.load("shared:legacy:0")
+            self.assertEqual(
+                CheckpointDocument(progress=7, state=None), legacy
+            )
+
+            await store.save(
+                "actor:worker:shared:events:0",
+                CheckpointDocument(progress=10, state={"cache": [1, 2]}),
+            )
+            await store.save_many(
+                {
+                    "shared:events:0": 10,
+                    "actor:other:shared:events:0": CheckpointDocument(
+                        progress=10, state={"n": 1}
+                    ),
+                }
+            )
+            restarted = SQLiteCheckpointStore(path)
+            doc = await restarted.load("actor:worker:shared:events:0")
+            self.assertEqual(
+                CheckpointDocument(progress=10, state={"cache": [1, 2]}), doc
+            )
+            shared = await restarted.load("shared:events:0")
+            self.assertEqual(CheckpointDocument(progress=10, state=None), shared)
+            other = await restarted.load("actor:other:shared:events:0")
+            self.assertEqual(
+                CheckpointDocument(progress=10, state={"n": 1}), other
+            )
+
+    async def test_handler_checkpoint_state_commits_and_restores_on_actor(self) -> None:
+        client = FakeSourceObserver()
+        backend = FakeRayBackend()
+        source = KafkaSource(
+            "events", ("broker",), "events", initial_offset="earliest"
+        )
+        worker = HandlerSpec(
+            "stateful",
+            object(),
+            (source,),
+            mode=ExecutionMode.ACTOR,
+            remote_method="process",
+            batch_size=5,
+            max_retries=0,
+        )
+        checkpoints = MemoryCheckpointStore()
+        dispatcher = RayDispatcher(
+            (worker,),
+            ray_backend=backend,
+            checkpoint_store=checkpoints,
+            config=DispatcherConfig(max_in_flight=8),
+        )
+        dispatcher.source_observer = client
+        key = "shared:events:0"
+        client.kafka["events"] = {0: (0, 5)}
+
+        await dispatcher.data_listener()
+        await dispatcher.ray_trigger()
+        await self._complete_fetches(dispatcher, backend)
+        self.assertEqual(1, len(backend.submissions))
+        first_request = backend.submissions[0][1]
+        self.assertIsNone(first_request.checkpoint_state)
+        handler_ref = backend.submissions[0][2]
+        backend.finish(
+            handler_ref,
+            value={"ok": True, "checkpoint_state": {"seen": 5}},
+        )
+        await dispatcher.ray_status()
+
+        self.assertEqual(5, checkpoints.values[key].progress)
+        actor_key = RayDispatcher._actor_checkpoint_key("stateful", key)
+        self.assertEqual(
+            CheckpointDocument(progress=5, state={"seen": 5}),
+            checkpoints.values[actor_key],
+        )
+        run = next(
+            run
+            for run in dispatcher.state.runs.values()
+            if run.kind == "handler"
+        )
+        self.assertEqual({"ok": True}, run.result)
+        self.assertEqual({"seen": 5}, run.checkpoint_state)
+
+        backend.drop_actor("stateful")
+        client.kafka["events"] = {0: (0, 10)}
+        await dispatcher.data_listener()
+        backend.cpus = None
+        await dispatcher.ray_trigger()
+        await self._complete_fetches(dispatcher, backend)
+        self.assertEqual(2, len(backend.submissions))
+        restored_request = backend.submissions[1][1]
+        self.assertEqual({"seen": 5}, restored_request.checkpoint_state)
+
+    async def test_actor_retry_clears_checkpoint_state(self) -> None:
+        client = FakeSourceObserver()
+        backend = FakeRayBackend()
+        source = KafkaSource(
+            "events", ("broker",), "events", initial_offset="earliest"
+        )
+        worker = HandlerSpec(
+            "stateful",
+            object(),
+            (source,),
+            mode=ExecutionMode.ACTOR,
+            remote_method="process",
+            batch_size=5,
+            max_retries=1,
+        )
+        checkpoints = MemoryCheckpointStore(
+            {
+                RayDispatcher._actor_checkpoint_key("stateful", "shared:events:0"): (
+                    CheckpointDocument(progress=0, state={"seen": 1})
+                )
+            }
+        )
+        dispatcher = RayDispatcher(
+            (worker,),
+            ray_backend=backend,
+            checkpoint_store=checkpoints,
+            config=DispatcherConfig(max_in_flight=8),
+        )
+        dispatcher.source_observer = client
+        client.kafka["events"] = {0: (0, 5)}
+
+        await dispatcher.data_listener()
+        await dispatcher.ray_trigger()
+        await self._complete_fetches(dispatcher, backend)
+        first_request = backend.submissions[0][1]
+        self.assertEqual({"seen": 1}, first_request.checkpoint_state)
+
+        backend.finish(backend.submissions[0][2], error="transient")
+        await dispatcher.ray_status()
+        self.assertEqual(2, len(backend.submissions))
+        retry_request = backend.submissions[1][1]
+        self.assertIsNone(retry_request.checkpoint_state)
+        self.assertEqual(first_request.dispatch_id, retry_request.dispatch_id)
+
+        backend.finish(backend.submissions[1][2], value={"ok": True})
+        await dispatcher.ray_status()
+        self.assertEqual(5, checkpoints.values["shared:events:0"].progress)
+
+    async def test_multisource_fetch_failure_skips_window(self) -> None:
+        client = FakeSourceObserver()
+        backend = FakeRayBackend()
+        failures = MemoryFailureStore()
+        t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        t_right = t0 + timedelta(seconds=100)
+        orders = KafkaSource(
+            "orders", ("broker",), "orders", initial_offset="earliest"
+        )
+        payments = KafkaSource(
+            "payments", ("broker",), "payments", initial_offset="earliest"
+        )
+        worker = HandlerSpec(
+            "join-handler",
+            object(),
+            (orders, payments),
+            batch_size=100,
+            max_retries=0,
+        )
+        checkpoints = MemoryCheckpointStore(
+            {RayDispatcher._mswin_checkpoint_key(worker.group_key): t0}
+        )
+        dispatcher = RayDispatcher(
+            (worker,),
+            ray_backend=backend,
+            checkpoint_store=checkpoints,
+            failure_store=failures,
+            config=DispatcherConfig(
+                max_in_flight=16, max_window_seconds=60.0, fetch_max_retries=0
+            ),
+        )
+        dispatcher.source_observer = client
+        client.kafka["orders"] = {0: (0, 5)}
+        client.kafka["payments"] = {0: (0, 3)}
+        client.event_time_highs["orders"] = {0: t_right}
+        client.event_time_highs["payments"] = {0: t_right}
+        client.offsets_for_times["orders"] = {
+            0: [(t0, 0), (t0 + timedelta(seconds=60), 4), (t_right, 5)]
+        }
+        client.offsets_for_times["payments"] = {
+            0: [(t0, 0), (t0 + timedelta(seconds=60), 2), (t_right, 3)]
+        }
+
+        await dispatcher.data_listener()
+        await dispatcher.ray_trigger()
+        self.assertEqual(2, len(backend.fetch_submissions))
+        backend.finish(backend.fetch_submissions[0][3], error="orders fetch down")
+        backend.finish(
+            backend.fetch_submissions[1][3],
+            value=[{"offset": 0}, {"offset": 1}],
+        )
+        await dispatcher.ray_status()
+
+        window = dispatcher.state.multisource_windows[worker.group_key]
+        self.assertEqual(t0 + timedelta(seconds=60), window.committed_time)
+        self.assertIsNone(window.active_batch_id)
+        self.assertEqual(
+            t0 + timedelta(seconds=60),
+            checkpoints.values[
+                RayDispatcher._mswin_checkpoint_key(worker.group_key)
+            ].progress,
+        )
+        recorded = await failures.list_failures()
+        self.assertEqual(1, len(recorded))
+        self.assertIn("orders fetch down", recorded[0].runs[0].error or "")
+
+    async def test_multisource_handler_failure_skips_window(self) -> None:
+        client = FakeSourceObserver()
+        backend = FakeRayBackend()
+        failures = MemoryFailureStore()
+        t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        t_right = t0 + timedelta(seconds=100)
+        orders = KafkaSource(
+            "orders", ("broker",), "orders", initial_offset="earliest"
+        )
+        payments = KafkaSource(
+            "payments", ("broker",), "payments", initial_offset="earliest"
+        )
+        worker = HandlerSpec(
+            "join-handler",
+            object(),
+            (orders, payments),
+            batch_size=100,
+            max_retries=0,
+        )
+        checkpoints = MemoryCheckpointStore(
+            {RayDispatcher._mswin_checkpoint_key(worker.group_key): t0}
+        )
+        dispatcher = RayDispatcher(
+            (worker,),
+            ray_backend=backend,
+            checkpoint_store=checkpoints,
+            failure_store=failures,
+            config=DispatcherConfig(max_in_flight=16, max_window_seconds=60.0),
+        )
+        dispatcher.source_observer = client
+        client.kafka["orders"] = {0: (0, 5)}
+        client.kafka["payments"] = {0: (0, 3)}
+        client.event_time_highs["orders"] = {0: t_right}
+        client.event_time_highs["payments"] = {0: t_right}
+        client.offsets_for_times["orders"] = {
+            0: [(t0, 0), (t0 + timedelta(seconds=60), 4), (t_right, 5)]
+        }
+        client.offsets_for_times["payments"] = {
+            0: [(t0, 0), (t0 + timedelta(seconds=60), 2), (t_right, 3)]
+        }
+
+        await dispatcher.data_listener()
+        await dispatcher.ray_trigger()
+        await self._complete_fetches(dispatcher, backend)
+        merge_ref = backend.merge_submissions[0][3]
+        backend.finish(merge_ref)
+        await dispatcher.ray_status()
+        self.assertEqual(1, len(backend.submissions))
+        backend.finish(backend.submissions[0][2], error="join sink down")
+        await dispatcher.ray_status()
+
+        window = dispatcher.state.multisource_windows[worker.group_key]
+        self.assertEqual(t0 + timedelta(seconds=60), window.committed_time)
+        self.assertIsNone(window.active_batch_id)
+        recorded = await failures.list_failures()
+        self.assertEqual(1, len(recorded))
+        errors = [detail.error or "" for detail in recorded[0].runs]
+        self.assertTrue(any("join sink down" in error for error in errors), errors)
+
+    async def test_slow_data_listener_does_not_block_ray_status(self) -> None:
+        """Remote observe IO must not hold _lock across awaits."""
+
+        entered = asyncio.Event()
+        status_finished = asyncio.Event()
+
+        class SlowObserver(FakeSourceObserver):
+            async def kafka_watermarks(
+                self, source: KafkaSource
+            ) -> Mapping[int, tuple[int, int]]:
+                entered.set()
+                await asyncio.sleep(0.2)
+                return {0: (0, 5)}
+
+        client = SlowObserver()
+        backend = FakeRayBackend()
+        source = KafkaSource(
+            "events", ("broker",), "events", initial_offset="earliest"
+        )
+        worker = HandlerSpec("worker", object(), (source,), batch_size=5)
+        dispatcher = RayDispatcher(
+            (worker,),
+            ray_backend=backend,
+            checkpoint_store=MemoryCheckpointStore(),
+        )
+        dispatcher.source_observer = client
+
+        listener_task = asyncio.create_task(dispatcher.data_listener())
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+        status_started = time.monotonic()
+        await dispatcher.ray_status()
+        status_elapsed = time.monotonic() - status_started
+        status_finished.set()
+
+        backlog = await listener_task
+        self.assertLess(
+            status_elapsed,
+            0.15,
+            f"ray_status blocked for {status_elapsed:.3f}s during slow observe",
+        )
+        self.assertTrue(status_finished.is_set())
+        self.assertEqual({"shared:events:0": 5}, backlog)
+
+    async def test_slow_checkpoint_commit_does_not_block_data_listener(self) -> None:
+        """Commit durability must not hold _lock across checkpoint IO."""
+
+        entered = asyncio.Event()
+
+        class SlowCheckpointStore(MemoryCheckpointStore):
+            async def save_many(self, items: Mapping[str, Any]) -> None:
+                entered.set()
+                await asyncio.sleep(0.2)
+                await super().save_many(items)
+
+        client = FakeSourceObserver()
+        backend = FakeRayBackend()
+        checkpoints = SlowCheckpointStore()
+        source = KafkaSource(
+            "events", ("broker",), "events", initial_offset="earliest"
+        )
+        worker = HandlerSpec("worker", object(), (source,), batch_size=5, max_retries=0)
+        dispatcher = RayDispatcher(
+            (worker,),
+            ray_backend=backend,
+            checkpoint_store=checkpoints,
+        )
+        dispatcher.source_observer = client
+        client.kafka["events"] = {0: (0, 5)}
+
+        await dispatcher.data_listener()
+        await dispatcher.ray_trigger()
+        await self._complete_fetches(dispatcher, backend)
+        handler_ref = backend.submissions[0][2]
+        backend.finish(handler_ref, value="ok")
+
+        status_task = asyncio.create_task(dispatcher.ray_status())
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+        listener_started = time.monotonic()
+        backlog = await dispatcher.data_listener()
+        listener_elapsed = time.monotonic() - listener_started
+
+        self.assertLess(
+            listener_elapsed,
+            0.15,
+            f"data_listener blocked for {listener_elapsed:.3f}s during slow commit",
+        )
+        # Durability still in flight: committed not advanced in memory yet.
+        self.assertEqual({"shared:events:0": 5}, backlog)
+        await status_task
+        self.assertEqual(0, dispatcher.state.sources["shared:events:0"].backlog)
+        self.assertEqual(5, checkpoints.values["shared:events:0"].progress)
+        self.assertEqual(
+            BatchStatus.SUCCEEDED,
+            next(iter(dispatcher.state.batches.values())).status,
+        )
+
+
+class TriggerPolicyTests(unittest.TestCase):
+    def _ctx(
+        self,
+        *,
+        backlog: int = 10,
+        free_slots: int = 8,
+        available_cpus: float | None = 4.0,
+        active_batch_id: str | None = None,
+        retention_gap: str | None = None,
+        slots_per_slice: int = 2,
+        phase_cpus: float = 1.0,
+    ) -> TriggerContext:
+        source = KafkaSource("events", ("broker",), "events")
+        handler = HandlerSpec("worker", object(), (source,))
+        state = SourceState(
+            "events:0",
+            "worker",
+            "events",
+            SourceKind.KAFKA,
+            "0",
+            0,
+            backlog,
+            backlog=backlog,
+            active_batch_id=active_batch_id,
+            retention_gap=retention_gap,
+        )
+        return TriggerContext(
+            handler=handler,
+            source_state=state,
+            free_slots=free_slots,
+            available_cpus=available_cpus,
+            now=0.0,
+            config=DispatcherConfig(),
+            slots_per_slice=slots_per_slice,
+            phase_cpus=phase_cpus,
+        )
+
+    def test_default_chain_triggers(self) -> None:
+        decision = TriggerPolicy.default().evaluate(self._ctx())
+        self.assertEqual(Decision.TRIGGER, decision.decision)
+
+    def test_default_chain_skips_empty_backlog(self) -> None:
+        decision = TriggerPolicy.default().evaluate(self._ctx(backlog=0))
+        self.assertEqual(Decision.SKIP, decision.decision)
+        self.assertEqual("has_backlog", decision.results[-1].name)
+
+    def test_default_chain_blocks_without_capacity(self) -> None:
+        decision = TriggerPolicy.default().evaluate(
+            self._ctx(free_slots=1, slots_per_slice=2)
+        )
+        self.assertEqual(Decision.BLOCK, decision.decision)
+        self.assertEqual("has_capacity", decision.results[-1].name)
+
+    def test_target_reached_skips_until_min_items(self) -> None:
+        policy = TriggerPolicy(
+            conditions=(HasBacklog(), SourceIdle(), TargetReached(min_items=100), HasCapacity())
+        )
+        decision = policy.evaluate(self._ctx(backlog=50))
+        self.assertEqual(Decision.SKIP, decision.decision)
+        self.assertEqual("target_reached", decision.results[-1].name)
+
+    def test_backlog_pressure_degrades_urgent(self) -> None:
+        policy = TriggerPolicy(
+            conditions=(
+                HasBacklog(),
+                SourceIdle(),
+                BacklogPressure(max_backlog=5, on_fail=SoftAction.URGENT),
+                HasCapacity(),
+            )
+        )
+        decision = policy.evaluate(self._ctx(backlog=20))
+        self.assertEqual(Decision.DEGRADE, decision.decision)
+        self.assertEqual(SoftAction.URGENT, decision.soft_action)
+
+
+class TriggerDispatcherIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_trigger_evaluated_event_and_block(self) -> None:
+        from ray_dispatcher import EVENT_TRIGGER_EVALUATED, create_event_log
+
+        client = FakeSourceObserver()
+        backend = FakeRayBackend()
+        events = create_event_log(default_logging=False)
+        evaluated: list[Mapping[str, Any]] = []
+        events.register(EVENT_TRIGGER_EVALUATED, evaluated.append)
+
+        source = KafkaSource(
+            "events", ("broker",), "events", initial_offset="earliest"
+        )
+        worker = HandlerSpec("worker", object(), (source,), batch_size=5, max_retries=0)
+        # One slice needs fetch+handler (2 slots). max_in_flight=3 leaves 1 slot
+        # after the first batch — enough to evaluate the next partition, not enough
+        # to schedule → BLOCK via HasCapacity.
+        dispatcher = RayDispatcher(
+            (worker,),
+            ray_backend=backend,
+            checkpoint_store=MemoryCheckpointStore(),
+            config=DispatcherConfig(max_in_flight=3),
+            event_log=events,
+        )
+        dispatcher.source_observer = client
+        client.kafka["events"] = {0: (0, 5), 1: (0, 5)}
+        await dispatcher.data_listener()
+        submitted = await dispatcher.ray_trigger()
+        self.assertTrue(submitted)
+        self.assertTrue(evaluated)
+        self.assertEqual("trigger", evaluated[0]["decision"])
+
+        evaluated.clear()
+        more = await dispatcher.ray_trigger()
+        self.assertEqual([], more)
+        self.assertTrue(evaluated)
+        self.assertEqual("block", evaluated[0]["decision"])
 
 
 if __name__ == "__main__":

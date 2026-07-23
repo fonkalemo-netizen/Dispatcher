@@ -7,7 +7,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from functools import total_ordering
-from typing import Any, Callable, Literal, Mapping, Union
+from typing import Any, Literal, Mapping, Union
+
 
 class SourceKind(str, Enum):
     KAFKA = "kafka"
@@ -28,6 +29,8 @@ class RunStatus(str, Enum):
 
 class BatchStatus(str, Enum):
     RUNNING = "running"
+    COMMITTING = "committing"
+    SKIPPING = "skipping"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
 
@@ -84,32 +87,14 @@ SourceSpec = Union[KafkaSource, PostgresSource]
 
 
 @dataclass(frozen=True)
-class OutputSpec:
-    """Serializable output metadata used for routing and sink backpressure.
-
-    ``connection_id`` references external connection configuration; credentials
-    and live client objects must not be placed in this object or DispatchRequest.
-    """
-
-    connection_id: str
-    target: str
-    output_format: str
-    max_parallelism: int = 8
-
-    def __post_init__(self) -> None:
-        if not self.connection_id or not self.target or not self.output_format:
-            raise ValueError("output connection_id, target and output_format are required")
-        if self.max_parallelism < 1:
-            raise ValueError("output max_parallelism must be positive")
-
-
-@dataclass(frozen=True)
 class DispatchRequest:
-    """The single argument passed to a worker by default.
+    """Scheduling request used for fetch/merge and internal batch state.
 
     Production Postgres observers return disjoint ordered composite-cursor
     ranges. Custom observers without that capability safely use one task for
     the full window rather than process-dependent Python hash partitioning.
+
+    Business handlers receive :class:`HandlerRequest` instead of this type.
     """
 
     dispatch_id: str
@@ -123,12 +108,12 @@ class DispatchRequest:
     end_offset: int | None = None
     start_cursor: PostgresCursor | None = None
     end_cursor: PostgresCursor | None = None
-    output_connection_id: str | None = None
-    output_target: str | None = None
-    output_format: str | None = None
     source_connection_id: str | None = None
     topic: str | None = None
     table: str | None = None
+    window_start: datetime | None = None
+    window_end: datetime | None = None
+    source_ids: tuple[str, ...] = ()
 
     @property
     def n(self) -> int:
@@ -139,31 +124,32 @@ class DispatchRequest:
         return self.worker_name
 
 
+@dataclass(frozen=True)
+class HandlerRequest:
+    """Slim argument passed to business handlers.
 
-ArgsBuilder = Callable[[DispatchRequest], tuple[tuple[Any, ...], dict[str, Any]]]
+    Contains only identity and write-side passthrough. Scheduling bounds stay on
+    :class:`DispatchRequest` for fetch/internal use; payload arrives as
+    ``records``.
 
+    ``checkpoint_state`` is set only for Actor handlers on the first submit after
+    the Actor is (re)created, so they can restore the last successful cache.
+    Automatic retries clear this field so restore is not applied twice.
+    """
 
-def offset_kwargs_builder(request: DispatchRequest) -> tuple[tuple[Any, ...], dict[str, Any]]:
-    """Compatibility builder for workers accepting startoffset/endoffset/n."""
-
-    return (), {
-        "startoffset": request.start_offset,
-        "endoffset": request.end_offset,
-        "n": request.task_count,
-        "task_index": request.task_index,
-        "partition": request.partition,
-        "topic": request.topic,
-        "dispatch_id": request.dispatch_id,
-    }
+    dispatch_id: str
+    handler_id: str
+    output: Mapping[str, Any] | None = None
+    checkpoint_state: Any | None = None
 
 
 @dataclass(frozen=True)
 class HandlerSpec:
     """One independently scheduled processing function.
 
-    A Python module may export many handlers. By default each owns independent
-    source state. Handlers opting into one shared_source_group share source
-    fetches/checkpoints while retaining independent retries and output limits.
+    Single-source handlers share fetches by ``source_id``. Multi-source Kafka
+    handlers (``len(sources) >= 2``) share event-time windows for the same
+    ordered source tuple.
     """
 
     name: str
@@ -171,52 +157,55 @@ class HandlerSpec:
     sources: tuple[SourceSpec, ...]
     mode: ExecutionMode = ExecutionMode.TASK
     remote_method: str | None = None
-    max_parallelism: int = 4
     batch_size: int = 10_000
     cpus_per_task: float = 1.0
     max_retries: int = 2
-    cache_history: bool = False
     priority: int = 0
-    args_builder: ArgsBuilder | None = None
-    output: OutputSpec | None = None
-    shared_source_group: str | None = None
-    data_fetcher: Any | None = None
-    fetcher_id: str | None = None
-    fetch_cpus: float = 0.25
-    fetch_max_retries: int = 2
+    output: Mapping[str, Any] | None = None
+    resource_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("worker name cannot be empty")
-        if self.max_parallelism < 1 or self.batch_size < 1:
-            raise ValueError("max_parallelism and batch_size must be positive")
+        if self.batch_size < 1:
+            raise ValueError("batch_size must be positive")
         if self.cpus_per_task <= 0:
             raise ValueError("cpus_per_task must be positive")
         if self.mode is ExecutionMode.ACTOR and not self.remote_method:
             raise ValueError("actor workers require remote_method")
-        if self.cache_history and self.mode is not ExecutionMode.ACTOR:
-            raise ValueError("cache_history requires actor mode")
-        if (self.shared_source_group is None) != (self.data_fetcher is None):
-            raise ValueError(
-                "shared_source_group and data_fetcher must be configured together"
-            )
-        if self.shared_source_group is not None:
-            if len(self.sources) != 1:
-                raise ValueError("shared-source handlers must declare exactly one source")
-            if self.args_builder is not None:
-                raise ValueError("shared-source handlers do not support args_builder")
-            if not self.fetcher_id:
-                raise ValueError("shared-source handlers require fetcher_id")
-        if self.fetch_cpus <= 0 or self.fetch_max_retries < 0:
-            raise ValueError("fetch_cpus must be positive and fetch_max_retries non-negative")
+        if len(self.sources) < 1:
+            raise ValueError("handlers must declare at least one source")
+        if len(self.sources) > 1 and any(
+            not isinstance(source, KafkaSource) for source in self.sources
+        ):
+            raise ValueError("multi-source handlers must declare only Kafka sources")
+        source_ids = [source.source_id for source in self.sources]
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("handler source_ids must be unique")
+        if len(self.resource_ids) != len(set(self.resource_ids)):
+            raise ValueError("resource_ids must be unique")
 
     @property
     def handler_id(self) -> str:
         return self.name
 
+    @property
+    def source(self) -> SourceSpec:
+        return self.sources[0]
 
-# Backwards-compatible public name for applications using the original API.
-WorkerSpec = HandlerSpec
+    @property
+    def source_id(self) -> str:
+        return self.source.source_id
+
+    @property
+    def is_multisource(self) -> bool:
+        return len(self.sources) > 1
+
+    @property
+    def group_key(self) -> str:
+        if not self.is_multisource:
+            return self.source_id
+        return "ms:" + "+".join(source.source_id for source in self.sources)
 
 
 @dataclass(frozen=True)
@@ -231,7 +220,7 @@ class FailureRunDetail:
     """One task's contribution to a permanently failed batch."""
 
     run_id: str
-    kind: Literal["fetch", "handler"]
+    kind: Literal["fetch", "handler", "merge"]
     worker_name: str
     status: str
     attempt: int
@@ -246,7 +235,6 @@ class FailureRecord:
     failure_id: str
     batch_id: str
     source_state_key: str
-    shared_source_group: str | None
     start: Any
     end: Any
     item_count: int
@@ -273,7 +261,6 @@ class SourceState:
     last_scheduled_at: float = field(default_factory=time.monotonic)
     active_batch_id: str | None = None
     retention_gap: str | None = None
-    shared_source_group: str | None = None
 
 
 @dataclass
@@ -281,7 +268,7 @@ class TaskRun:
     run_id: str
     batch_id: str
     worker_name: str
-    request: DispatchRequest
+    request: DispatchRequest | HandlerRequest
     ref: Any
     status: RunStatus = RunStatus.SUBMITTED
     attempt: int = 1
@@ -289,8 +276,9 @@ class TaskRun:
     finished_at: float | None = None
     result: Any = None
     error: str | None = None
-    kind: Literal["fetch", "handler"] = "handler"
+    kind: Literal["fetch", "handler", "merge"] = "handler"
     data_ref: Any = None
+    checkpoint_state: Any | None = None
 
 
 @dataclass
@@ -298,17 +286,36 @@ class BatchRun:
     batch_id: str
     source_state_key: str
     worker_name: str
-    start: int | PostgresCursor
-    end: int | PostgresCursor
+    start: int | PostgresCursor | datetime
+    end: int | PostgresCursor | datetime
     item_count: int
     run_ids: list[str]
     status: BatchStatus = BatchStatus.RUNNING
     started_at: float = field(default_factory=time.monotonic)
     finished_at: float | None = None
-    shared_source_group: str | None = None
     worker_names: tuple[str, ...] = ()
     fetch_run_ids: list[str] = field(default_factory=list)
     reserved_handler_count: int = 0
+    window_start: datetime | None = None
+    window_end: datetime | None = None
+    source_state_keys: tuple[str, ...] = ()
+    partition_commits: dict[str, int] = field(default_factory=dict)
+    merge_run_id: str | None = None
+    group_key: str | None = None
+    fetch_source_ids: tuple[str, ...] = ()
+    failure_id: str | None = None
+
+
+@dataclass
+class MultiSourceWindowState:
+    """Aligned event-time window progress for a multi-Kafka handler group."""
+
+    group_key: str
+    source_ids: tuple[str, ...]
+    committed_time: datetime | None = None
+    observed_time: datetime | None = None
+    active_batch_id: str | None = None
+    last_scheduled_at: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -317,7 +324,4 @@ class DispatcherState:
     batches: dict[str, BatchRun] = field(default_factory=dict)
     runs: dict[str, TaskRun] = field(default_factory=dict)
     loop_errors: list[str] = field(default_factory=list)
-
-    @property
-    def refs(self) -> dict[str, Any]:
-        return {run_id: run.ref for run_id, run in self.runs.items() if run.ref is not None}
+    multisource_windows: dict[str, MultiSourceWindowState] = field(default_factory=dict)

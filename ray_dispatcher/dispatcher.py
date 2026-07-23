@@ -7,11 +7,27 @@ import hashlib
 import inspect
 import math
 import time
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence, Union
 
-from ray_dispatcher.checkpoint import MemoryCheckpointStore
-from ray_dispatcher.failures import MemoryFailureStore
+from ray_dispatcher.backend import RayBackend
+from ray_dispatcher.checkpoint import (
+    CheckpointDocument,
+    CheckpointStore,
+    MemoryCheckpointStore,
+)
+from ray_dispatcher.event_log import (
+    EVENT_BATCH_COMMITTED,
+    EVENT_BATCH_SKIPPED,
+    EVENT_RUN_FAILED,
+    EVENT_SNAPSHOT,
+    EVENT_TRIGGER_EVALUATED,
+    EventLog,
+    create_event_log,
+)
+from ray_dispatcher.failures import FailureStore, MemoryFailureStore
 from ray_dispatcher.models import (
     BatchRun,
     BatchStatus,
@@ -20,8 +36,10 @@ from ray_dispatcher.models import (
     ExecutionMode,
     FailureRecord,
     FailureRunDetail,
+    HandlerRequest,
     HandlerSpec,
     KafkaSource,
+    MultiSourceWindowState,
     PostgresCursor,
     PostgresSource,
     RunStatus,
@@ -29,10 +47,23 @@ from ray_dispatcher.models import (
     SourceSpec,
     SourceState,
     TaskRun,
-    WorkerSpec,
 )
-from ray_dispatcher.policy import SchedulingPolicy
-from ray_dispatcher.protocols import CheckpointStore, FailureStore, RayBackend
+from ray_dispatcher.policy import (
+    Decision,
+    DispatcherConfig,
+    SoftAction,
+    TriggerContext,
+    TriggerPolicy,
+    window_bounds,
+)
+from ray_dispatcher.readers import CompositePayloadReader, PayloadReader
+from ray_dispatcher.registries import (
+    ResourceRegistry,
+    SourceRegistry,
+    canonical_json,
+    source_canonical_dict,
+)
+from ray_dispatcher.resources import ResourceLoader
 from ray_dispatcher.sources import SourceObserver
 
 
@@ -45,87 +76,257 @@ class StaleBatchError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class _KafkaPartitionPrep:
+    key: str
+    worker_name: str
+    source_id: str
+    shard: str
+    low: int
+    high: int
+    create: bool
+    committed: int
+    reset_committed: int | None
+    snapshot_committed: int | None
+    snapshot_observed: int | None
+    snapshot_last_observed_at: float | None
+    snapshot_arrival_rate: float | None
+    retention_message: str | None
+    retention_error: bool
+
+
+@dataclass(frozen=True)
+class _KafkaObservePrep:
+    partitions: tuple[_KafkaPartitionPrep, ...]
+    now: float
+
+
+@dataclass(frozen=True)
+class _PostgresObservePrep:
+    key: str
+    worker_name: str
+    source_id: str
+    table: str
+    create: bool
+    committed: PostgresCursor
+    upper: PostgresCursor
+    count: int
+    snapshot_committed: PostgresCursor | None
+    snapshot_backlog: int | None
+    snapshot_last_observed_at: float | None
+    snapshot_arrival_rate: float | None
+    now: float
+
+
+@dataclass
+class _MultisourceSourcePlan:
+    source: KafkaSource
+    watermarks: dict[int, tuple[int, int]]
+    need_watermarks: bool
+
+
+@dataclass
+class _MultisourceObservePlan:
+    group_key: str
+    sources: list[_MultisourceSourcePlan]
+    need_checkpoint: bool
+
+
+@dataclass(frozen=True)
+class _MultisourceObserveResult:
+    group_key: str
+    observed_time: datetime | None
+    checkpoint_progress: datetime | None
+    error: Exception | None = None
+
+
+@dataclass
+class _PendingBatchDurability:
+    """Checkpoint / failure IO prepared under lock, executed outside it."""
+
+    batch_id: str
+    action: str  # "commit" | "skip"
+    writes: dict[str, Any]
+    failure_id: str | None = None
+    source_state_key: str = ""
+    start: Any = None
+    end: Any = None
+    item_count: int = 0
+    worker_names: tuple[str, ...] = ()
+    run_details: tuple[FailureRunDetail, ...] = ()
+    fetch_refs: tuple[Any, ...] = ()
+    persist_error: Exception | None = None
+    failure_store_error: Exception | None = None
+    materialized_payload: Any = None
+    payload_error: str | None = None
+
+
 class RayDispatcher:
     """Observe source increments, schedule work and monitor Ray references.
 
     The public methods perform one non-blocking cycle each. ``start`` runs the
-    three cycles periodically until ``stop`` is called.
+    listener, trigger, status, event-log, and (when enabled) workers-reload
+    cycles periodically until ``stop`` is called.
 
-    ``workers`` may be a sequence of ``WorkerSpec`` or a directory path; a path
-    is scanned with :func:`ray_dispatcher.discovery.discover_workers`.
+    ``workers`` may be a sequence of ``HandlerSpec`` or a directory path; a path
+    is scanned with :func:`ray_dispatcher.discovery.discover_workers`. Directory
+    mode may also enable hot reload via ``reload_interval``.
+
+    Handlers that share the same ``group_key`` automatically share fetches and
+    checkpoints. Single-source groups key by ``source_id``; multi-source Kafka
+    groups key by ``ms:...`` and schedule aligned event-time windows.
     """
 
     def __init__(
         self,
-        workers: Union[Sequence[WorkerSpec], str, Path],
+        workers: Union[Sequence[HandlerSpec], str, Path],
         *,
         ray_backend: RayBackend | None = None,
         checkpoint_store: CheckpointStore | None = None,
         failure_store: FailureStore | None = None,
-        policy: SchedulingPolicy | None = None,
+        trigger: TriggerPolicy | None = None,
+        config: DispatcherConfig | None = None,
         listener_interval: float = 5.0,
         trigger_interval: float = 1.0,
         status_interval: float = 1.0,
+        event_log_interval: float = 5.0,
+        reload_interval: float = 0.0,
         operation_timeout: float = 30.0,
+        source_registry: SourceRegistry | None = None,
+        resource_registry: ResourceRegistry | None = None,
+        payload_reader: PayloadReader | None = None,
+        event_log: EventLog | None = None,
     ) -> None:
+        self._injected_source_registry = source_registry
+        self._injected_resource_registry = resource_registry
+        self.source_registry = source_registry
+        self.resource_registry = resource_registry
+        self.payload_reader = payload_reader or CompositePayloadReader()
+        self.resource_loader = ResourceLoader(resource_registry)
+        self._workers_dir: Path | None = None
+
         if ray_backend is None:
             from ray_dispatcher.backend import NativeRayBackend
 
-            ray_backend = NativeRayBackend()
+            ray_backend = NativeRayBackend(resource_loader=self.resource_loader)
         self.ray_backend = ray_backend
+
+        if hasattr(ray_backend, "set_payload_fetch_remote") and getattr(
+            ray_backend, "ray", None
+        ):
+            remote = ray_backend.ray.remote(max_retries=0)(self.payload_reader.fetch)
+            ray_backend.set_payload_fetch_remote(remote)
+        if hasattr(ray_backend, "set_merge_remote") and getattr(
+            ray_backend, "ray", None
+        ):
+            from ray_dispatcher.readers import merge_fetch_results
+
+            ray_backend.set_merge_remote(
+                ray_backend.ray.remote(max_retries=0)(merge_fetch_results)
+            )
+        if hasattr(ray_backend, "resource_loader"):
+            ray_backend.resource_loader = self.resource_loader
 
         if isinstance(workers, (str, Path)):
             from ray_dispatcher.discovery import discover_workers
 
-            workers = discover_workers(
-                workers,
+            self._workers_dir = Path(workers).expanduser().resolve()
+            workers, merged_sources, merged_resources = discover_workers(
+                self._workers_dir,
                 ray_module=getattr(ray_backend, "ray", None),
+                source_registry=source_registry,
+                resource_registry=resource_registry,
             )
+            self.source_registry = merged_sources
+            self.resource_registry = merged_resources
+            self.resource_loader = ResourceLoader(merged_resources)
+            if hasattr(ray_backend, "resource_loader"):
+                ray_backend.resource_loader = self.resource_loader
 
         if not workers:
             raise ValueError("at least one worker is required")
         names = [worker.name for worker in workers]
         if len(names) != len(set(names)):
             raise ValueError("worker names must be unique")
-        for worker in workers:
-            source_ids = [source.source_id for source in worker.sources]
-            if len(source_ids) != len(set(source_ids)):
-                raise ValueError(f"source IDs for worker {worker.name!r} must be unique")
         if min(listener_interval, trigger_interval, status_interval, operation_timeout) <= 0:
             raise ValueError("polling intervals and operation_timeout must be positive")
+        if reload_interval < 0:
+            raise ValueError("reload_interval must be >= 0")
+        if reload_interval > 0 and self._workers_dir is None:
+            raise ValueError("reload_interval requires workers to be a directory path")
 
+        self._install_worker_groups(tuple(workers))
+        self.source_observer = SourceObserver()
+        self.checkpoint_store = checkpoint_store or MemoryCheckpointStore()
+        self.failure_store = failure_store or MemoryFailureStore()
+        self.event_log = event_log if event_log is not None else create_event_log()
+        self.trigger = trigger or TriggerPolicy.default()
+        self.config = config or DispatcherConfig()
+        self.listener_interval = listener_interval
+        self.trigger_interval = trigger_interval
+        self.status_interval = status_interval
+        self.event_log_interval = event_log_interval
+        self.reload_interval = reload_interval
+        self.operation_timeout = operation_timeout
+        self.state = DispatcherState()
+        self._sync_multisource_windows()
+        self._config_fingerprint = self._fingerprint_config(
+            self.workers,
+            self.source_registry,
+            self.resource_registry,
+            workers_dir=self._workers_dir,
+        )
+        self._lock = asyncio.Lock()
+        self._tasks: list[asyncio.Task[None]] = []
+        self._stopping = asyncio.Event()
+
+    @staticmethod
+    def _shared_state_key(source_id: str, shard: str) -> str:
+        return f"shared:{source_id}:{shard}"
+
+    @staticmethod
+    def _mswin_checkpoint_key(group_key: str) -> str:
+        return f"mswin:{group_key}"
+
+    @staticmethod
+    def _stable_id(*parts: Any) -> str:
+        raw = "|".join(repr(part) for part in parts).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()[:24]
+
+    @staticmethod
+    def _ewma(old: float, new: float, alpha: float) -> float:
+        return new if old == 0 else alpha * new + (1 - alpha) * old
+
+    def _install_worker_groups(self, workers: Sequence[HandlerSpec]) -> None:
         self.workers = {worker.name: worker for worker in workers}
-        self._shared_groups: dict[str, tuple[HandlerSpec, ...]] = {}
+        self._shared_groups = {}
         shared_groups: dict[str, list[HandlerSpec]] = {}
         for worker in workers:
-            if worker.shared_source_group is not None:
-                shared_groups.setdefault(worker.shared_source_group, []).append(worker)
-        for group_name, members in shared_groups.items():
-            if len(members) < 2:
-                raise ValueError(
-                    f"shared source group {group_name!r} requires at least two handlers"
-                )
+            shared_groups.setdefault(worker.group_key, []).append(worker)
+        for group_key, members in shared_groups.items():
+            if members[0].is_multisource:
+                source_signatures = {
+                    tuple(
+                        (source.source_id, self._physical_source_key(source))
+                        for source in member.sources
+                    )
+                    for member in members
+                }
+                if len(source_signatures) != 1:
+                    raise ValueError(
+                        f"handlers sharing group_key {group_key!r} must use identical "
+                        "sources"
+                    )
+                self._shared_groups[group_key] = tuple(members)
+                continue
+
             physical_keys = {
                 self._physical_source_key(member.sources[0]) for member in members
             }
-            fetcher_ids = {member.fetcher_id for member in members}
-            fetch_policies = {
-                (member.fetch_cpus, member.fetch_max_retries)
-                for member in members
-            }
-            if (
-                len(physical_keys) != 1
-                or len(fetcher_ids) != 1
-                or len(fetch_policies) != 1
-            ):
+            if len(physical_keys) != 1:
                 raise ValueError(
-                    f"shared source group {group_name!r} must use one physical "
-                    "source, fetcher_id and fetch policy"
-                )
-            source_ids = {member.sources[0].source_id for member in members}
-            if len(source_ids) != 1:
-                raise ValueError(
-                    f"shared source group {group_name!r} must use one source_id"
+                    f"handlers sharing source_id {group_key!r} must use one physical "
+                    "source"
                 )
             representative_source = members[0].sources[0]
             if isinstance(representative_source, KafkaSource):
@@ -139,7 +340,7 @@ class RayDispatcher:
                 }
                 if len(startup_policies) != 1:
                     raise ValueError(
-                        f"shared source group {group_name!r} must use identical "
+                        f"handlers sharing source_id {group_key!r} must use identical "
                         "initial_offset and retention_policy"
                     )
             else:
@@ -150,102 +351,332 @@ class RayDispatcher:
                 }
                 if len(initial_cursors) != 1:
                     raise ValueError(
-                        f"shared source group {group_name!r} must use one initial_cursor"
+                        f"handlers sharing source_id {group_key!r} must use one "
+                        "initial_cursor"
                     )
-            self._shared_groups[group_name] = tuple(members)
-        self._output_limits: dict[tuple[str, str], int] = {}
-        for worker in workers:
-            if worker.output is None:
+            self._shared_groups[group_key] = tuple(members)
+
+    def _sync_multisource_windows(self) -> None:
+        active = {
+            group_key
+            for group_key, members in self._shared_groups.items()
+            if members[0].is_multisource
+        }
+        for group_key in list(self.state.multisource_windows):
+            if group_key not in active:
+                del self.state.multisource_windows[group_key]
+        for group_key, members in self._shared_groups.items():
+            if not members[0].is_multisource:
                 continue
-            output_key = (worker.output.connection_id, worker.output.target)
-            configured = self._output_limits.get(output_key)
-            self._output_limits[output_key] = (
-                worker.output.max_parallelism
-                if configured is None
-                else min(configured, worker.output.max_parallelism)
+            if group_key in self.state.multisource_windows:
+                continue
+            self.state.multisource_windows[group_key] = MultiSourceWindowState(
+                group_key=group_key,
+                source_ids=tuple(source.source_id for source in members[0].sources),
             )
-        self.source_observer = SourceObserver()
-        self.checkpoint_store = checkpoint_store or MemoryCheckpointStore()
-        self.failure_store = failure_store or MemoryFailureStore()
-        self.policy = policy or SchedulingPolicy()
-        self.listener_interval = listener_interval
-        self.trigger_interval = trigger_interval
-        self.status_interval = status_interval
-        self.operation_timeout = operation_timeout
-        self.state = DispatcherState()
-        self._lock = asyncio.Lock()
-        self._tasks: list[asyncio.Task[None]] = []
-        self._stopping = asyncio.Event()
 
     @staticmethod
-    def _state_key(worker: str, source: str, shard: str) -> str:
-        return f"{worker}:{source}:{shard}"
+    def _fingerprint_config(
+        workers: Mapping[str, HandlerSpec],
+        source_registry: SourceRegistry | None,
+        resource_registry: ResourceRegistry | None,
+        *,
+        workers_dir: Path | None = None,
+    ) -> str:
+        handler_rows = []
+        for worker in sorted(workers.values(), key=lambda item: item.name):
+            handler_rows.append(
+                {
+                    "name": worker.name,
+                    "mode": worker.mode.value,
+                    "remote_method": worker.remote_method,
+                    "batch_size": worker.batch_size,
+                    "cpus_per_task": worker.cpus_per_task,
+                    "max_retries": worker.max_retries,
+                    "priority": worker.priority,
+                    "output": None if worker.output is None else dict(worker.output),
+                    "resource_ids": list(worker.resource_ids),
+                    "sources": [
+                        source_canonical_dict(source) for source in worker.sources
+                    ],
+                }
+            )
+        sources = {
+            name: source_canonical_dict(source)
+            for name, source in sorted((source_registry or {}).items())
+        }
+        resources = {
+            name: spec.canonical_dict()
+            for name, spec in sorted((resource_registry or {}).items())
+        }
+        return canonical_json(
+            {
+                "handlers": handler_rows,
+                "sources": sources,
+                "resources": resources,
+                "code": RayDispatcher._workers_dir_fingerprint(workers_dir),
+            }
+        )
 
     @staticmethod
-    def _shared_state_key(group: str, source: str, shard: str) -> str:
-        return f"shared:{group}:{source}:{shard}"
+    def _workers_dir_fingerprint(
+        workers_dir: Path | None,
+    ) -> list[tuple[str, int, int]]:
+        """Stable digest of worker module files (path, mtime_ns, size)."""
+
+        if workers_dir is None:
+            return []
+        rows: list[tuple[str, int, int]] = []
+        for path in sorted(workers_dir.rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            rows.append(
+                (str(path.relative_to(workers_dir)), int(stat.st_mtime_ns), int(stat.st_size))
+            )
+        return rows
+
+    def _has_inflight_work(self) -> bool:
+        if any(
+            batch.status is BatchStatus.RUNNING for batch in self.state.batches.values()
+        ):
+            return True
+        if any(state.active_batch_id for state in self.state.sources.values()):
+            return True
+        if any(
+            window.active_batch_id for window in self.state.multisource_windows.values()
+        ):
+            return True
+        return False
+
+    def _emit_event(self, event: str, payload: Mapping[str, Any]) -> None:
+        try:
+            errors = self.event_log.emit(event, payload)
+        except Exception as exc:  # noqa: BLE001 - never break scheduling on hooks
+            self.state.loop_errors.append(
+                f"event_log:{event}:{type(exc).__name__}: {exc}"
+            )
+            return
+        self.state.loop_errors.extend(errors)
+
+    def _batch_event_payload(
+        self,
+        batch: BatchRun,
+        *,
+        progress_key: str,
+        failure_id: str | None = None,
+    ) -> dict[str, Any]:
+        handlers = list(
+            batch.worker_names
+            or ((batch.worker_name,) if batch.worker_name else ())
+        )
+        payload: dict[str, Any] = {
+            "batch_id": batch.batch_id,
+            "progress_key": progress_key,
+            "start": repr(batch.start),
+            "end": repr(batch.end),
+            "item_count": batch.item_count,
+            "handlers": handlers,
+        }
+        if failure_id is not None:
+            payload["failure_id"] = failure_id
+        elif batch.failure_id is not None:
+            payload["failure_id"] = batch.failure_id
+        return payload
 
     @staticmethod
-    def _stable_id(*parts: Any) -> str:
-        raw = "|".join(repr(part) for part in parts).encode("utf-8")
-        return hashlib.sha256(raw).hexdigest()[:24]
+    def _actor_checkpoint_key(handler_id: str, progress_key: str) -> str:
+        return f"actor:{handler_id}:{progress_key}"
 
     @staticmethod
-    def _ewma(old: float, new: float, alpha: float) -> float:
-        return new if old == 0 else alpha * new + (1 - alpha) * old
+    def _split_handler_result(value: Any) -> tuple[Any, Any | None]:
+        if isinstance(value, dict) and "checkpoint_state" in value:
+            state = value["checkpoint_state"]
+            rest = {key: item for key, item in value.items() if key != "checkpoint_state"}
+            return rest, state
+        return value, None
+
+    async def _build_handler_request(
+        self,
+        member: HandlerSpec,
+        run_id: str,
+        progress_key: str,
+    ) -> HandlerRequest:
+        checkpoint_state = None
+        if member.mode is ExecutionMode.ACTOR:
+            needs_restore = False
+            prepare = getattr(self.ray_backend, "prepare_actor_restore", None)
+            if callable(prepare):
+                needs_restore = bool(prepare(member))
+            else:
+                claim = getattr(self.ray_backend, "claim_actor_restore", None)
+                if callable(claim):
+                    needs_restore = bool(claim(member.name))
+            if needs_restore:
+                document = await self._io(
+                    self.checkpoint_store.load(
+                        self._actor_checkpoint_key(member.name, progress_key)
+                    )
+                )
+                if document is not None:
+                    checkpoint_state = document.state
+        return HandlerRequest(
+            dispatch_id=run_id,
+            handler_id=member.name,
+            output=member.output,
+            checkpoint_state=checkpoint_state,
+        )
+
+    @staticmethod
+    def _handler_request_for_retry(request: HandlerRequest) -> HandlerRequest:
+        """Drop restore payload on retry; Actor already applied it on first submit."""
+
+        if request.checkpoint_state is None:
+            return request
+        return HandlerRequest(
+            dispatch_id=request.dispatch_id,
+            handler_id=request.handler_id,
+            output=request.output,
+            checkpoint_state=None,
+        )
+
+    def _checkpoint_writes_for_batch(
+        self,
+        batch: BatchRun,
+        *,
+        progress_key: str,
+        progress: Any,
+    ) -> dict[str, CheckpointDocument | Any]:
+        writes: dict[str, CheckpointDocument | Any] = {progress_key: progress}
+        for run_id in batch.run_ids:
+            run = self.state.runs[run_id]
+            if run.checkpoint_state is None:
+                continue
+            writes[self._actor_checkpoint_key(run.worker_name, progress_key)] = (
+                CheckpointDocument(progress=progress, state=run.checkpoint_state)
+            )
+        return writes
 
     async def data_listener(self) -> dict[str, int]:
-        """Observe each physical source once, then fan out to handler checkpoints."""
+        """Observe each physical source once, then fan out to handler checkpoints.
+
+        Remote watermark / checkpoint / count IO runs outside ``_lock`` (physical
+        sources in parallel). The lock is held only while merging into memory.
+        """
+
+        errors: list[Exception] = []
+        source_bindings = self._collect_source_bindings()
+        fetched = await asyncio.gather(
+            *[
+                self._fetch_physical_source(bindings)
+                for bindings in source_bindings.values()
+            ],
+            return_exceptions=True,
+        )
+
+        prepared: list[tuple[str, Any]] = []
+        for item in fetched:
+            if isinstance(item, BaseException):
+                # One broken physical source must not prevent later sources
+                # from refreshing their independent watermarks.
+                errors.append(item if isinstance(item, Exception) else Exception(str(item)))
+                continue
+            kind, bindings, payload = item
+            try:
+                if kind == "kafka":
+                    assert isinstance(payload, Mapping)
+                    observed_source_ids: set[str] = set()
+                    for worker, source in bindings:
+                        assert isinstance(source, KafkaSource)
+                        if source.source_id in observed_source_ids:
+                            continue
+                        observed_source_ids.add(source.source_id)
+                        try:
+                            prepared.append(
+                                (
+                                    "kafka",
+                                    await self._prepare_kafka_observe(
+                                        worker, source, payload
+                                    ),
+                                )
+                            )
+                        except Exception as exc:
+                            errors.append(exc)
+                else:
+                    assert isinstance(payload, PostgresCursor)
+                    observed_source_ids = set()
+                    for worker, source in bindings:
+                        assert isinstance(source, PostgresSource)
+                        if source.source_id in observed_source_ids:
+                            continue
+                        observed_source_ids.add(source.source_id)
+                        try:
+                            prepared.append(
+                                (
+                                    "postgres",
+                                    await self._prepare_postgres_observe(
+                                        worker, source, payload
+                                    ),
+                                )
+                            )
+                        except Exception as exc:
+                            errors.append(exc)
+            except Exception as exc:
+                errors.append(exc)
 
         async with self._lock:
-            errors: list[Exception] = []
-            source_bindings: dict[tuple[Any, ...], list[tuple[HandlerSpec, SourceSpec]]] = {}
-            for worker in self.workers.values():
-                for source in worker.sources:
-                    source_bindings.setdefault(self._physical_source_key(source), []).append(
-                        (worker, source)
-                    )
-
-            for bindings in source_bindings.values():
-                representative = bindings[0][1]
+            for kind, prep in prepared:
                 try:
-                    if isinstance(representative, KafkaSource):
-                        watermarks = await self._io(
-                            self.source_observer.kafka_watermarks(representative)
-                        )
-                        observed_shared_groups: set[str] = set()
-                        for worker, source in bindings:
-                            group = worker.shared_source_group
-                            if group is not None:
-                                if group in observed_shared_groups:
-                                    continue
-                                observed_shared_groups.add(group)
-                            try:
-                                await self._observe_kafka(worker, source, watermarks)
-                            except Exception as exc:
-                                errors.append(exc)
+                    if kind == "kafka":
+                        self._apply_kafka_observe(prep)
                     else:
-                        upper = await self._io(
-                            self.source_observer.postgres_high_watermark(representative)
-                        )
-                        observed_shared_groups = set()
-                        for worker, source in bindings:
-                            group = worker.shared_source_group
-                            if group is not None:
-                                if group in observed_shared_groups:
-                                    continue
-                                observed_shared_groups.add(group)
-                            try:
-                                await self._observe_postgres(worker, source, upper)
-                            except Exception as exc:
-                                errors.append(exc)
+                        self._apply_postgres_observe(prep)
                 except Exception as exc:
-                    # One broken physical source must not prevent later sources
-                    # from refreshing their independent watermarks.
+                    errors.append(exc)
+            ms_plans = self._plan_multisource_observe()
+
+        ms_results = await self._fetch_multisource_observe(ms_plans)
+
+        async with self._lock:
+            for result in ms_results:
+                if result.error is not None:
+                    errors.append(result.error)
+                    continue
+                try:
+                    self._apply_multisource_observe(result)
+                except Exception as exc:
                     errors.append(exc)
             if errors:
                 raise errors[0]
             return {key: state.backlog for key, state in self.state.sources.items()}
+
+    def _collect_source_bindings(
+        self,
+    ) -> dict[tuple[Any, ...], list[tuple[HandlerSpec, SourceSpec]]]:
+        source_bindings: dict[tuple[Any, ...], list[tuple[HandlerSpec, SourceSpec]]] = {}
+        for worker in self.workers.values():
+            for source in worker.sources:
+                source_bindings.setdefault(self._physical_source_key(source), []).append(
+                    (worker, source)
+                )
+        return source_bindings
+
+    async def _fetch_physical_source(
+        self, bindings: list[tuple[HandlerSpec, SourceSpec]]
+    ) -> tuple[str, list[tuple[HandlerSpec, SourceSpec]], Any]:
+        representative = bindings[0][1]
+        if isinstance(representative, KafkaSource):
+            watermarks = await self._io(
+                self.source_observer.kafka_watermarks(representative)
+            )
+            return ("kafka", bindings, watermarks)
+        upper = await self._io(
+            self.source_observer.postgres_high_watermark(representative)
+        )
+        return ("postgres", bindings, upper)
 
     @staticmethod
     def _physical_source_key(source: SourceSpec) -> tuple[Any, ...]:
@@ -265,131 +696,405 @@ class RayDispatcher:
     async def _io(self, awaitable: Any) -> Any:
         return await asyncio.wait_for(awaitable, timeout=self.operation_timeout)
 
-    async def _observe_kafka(
+    async def _prepare_kafka_observe(
         self,
         worker: HandlerSpec,
         source: KafkaSource,
-        watermarks: Mapping[int, tuple[int, int]] | None = None,
-    ) -> None:
-        if watermarks is None:
-            watermarks = await self._io(self.source_observer.kafka_watermarks(source))
-        now = time.monotonic()
+        watermarks: Mapping[int, tuple[int, int]],
+    ) -> _KafkaObservePrep:
+        keys = [
+            self._shared_state_key(source.source_id, str(partition))
+            for partition in watermarks
+        ]
+        async with self._lock:
+            snapshots: dict[str, tuple[int, str | None, int, float, float]] = {}
+            for key in keys:
+                state = self.state.sources.get(key)
+                if state is None:
+                    continue
+                snapshots[key] = (
+                    int(state.committed),
+                    state.active_batch_id,
+                    int(state.observed),
+                    state.last_observed_at,
+                    state.arrival_rate,
+                )
+
+        partitions: list[_KafkaPartitionPrep] = []
         for partition, (low, high) in watermarks.items():
             if low < 0 or high < low:
-                raise ValueError(f"invalid Kafka watermarks for {source.source_id}/{partition}")
-            key = (
-                self._shared_state_key(
-                    worker.shared_source_group, source.source_id, str(partition)
+                raise ValueError(
+                    f"invalid Kafka watermarks for {source.source_id}/{partition}"
                 )
-                if worker.shared_source_group is not None
-                else self._state_key(worker.name, source.source_id, str(partition))
-            )
-            state = self.state.sources.get(key)
-            if state is None:
+            key = self._shared_state_key(source.source_id, str(partition))
+            snapshot = snapshots.get(key)
+            if snapshot is None:
                 checkpoint = await self._io(self.checkpoint_store.load(key))
-                if checkpoint is not None and not isinstance(checkpoint, int):
+                progress = None if checkpoint is None else checkpoint.progress
+                if progress is not None and not isinstance(progress, int):
                     raise TypeError(f"Kafka checkpoint {key} must be int")
-                committed = checkpoint if checkpoint is not None else (
+                committed = progress if progress is not None else (
                     low if source.initial_offset == "earliest" else high
                 )
-                if checkpoint is None:
+                if progress is None:
                     # Persist the baseline immediately. Otherwise a restart
                     # after this poll could adopt a newer high watermark and
                     # silently skip records that arrived in between.
                     await self._io(self.checkpoint_store.save(key, committed))
-                state = SourceState(
-                    key,
-                    worker.name,
-                    source.source_id,
-                    source.kind,
-                    str(partition),
+                create = True
+                active_batch_id = None
+                snapshot_committed = None
+                snapshot_observed = None
+                snapshot_last_observed_at = None
+                snapshot_arrival_rate = None
+            else:
+                (
                     committed,
-                    high,
-                    shared_source_group=worker.shared_source_group,
-                )
-                self.state.sources[key] = state
+                    active_batch_id,
+                    snapshot_observed,
+                    snapshot_last_observed_at,
+                    snapshot_arrival_rate,
+                ) = snapshot
+                create = False
+                snapshot_committed = committed
 
-            committed = int(state.committed)
+            reset_committed: int | None = None
+            retention_message: str | None = None
+            retention_error = False
             if committed < low or committed > high:
-                relation = "below retained low watermark" if committed < low else "above high watermark"
+                relation = (
+                    "below retained low watermark"
+                    if committed < low
+                    else "above high watermark"
+                )
                 boundary = low if committed < low else high
-                message = f"checkpoint {committed} is {relation} {boundary}"
-                state.retention_gap = message
-                if state.active_batch_id is not None:
+                retention_message = f"checkpoint {committed} is {relation} {boundary}"
+                if active_batch_id is not None:
                     raise KafkaRetentionGap(
-                        f"{key}: {message}; cannot reset while batch "
-                        f"{state.active_batch_id} is active"
+                        f"{key}: {retention_message}; cannot reset while batch "
+                        f"{active_batch_id} is active"
                     )
                 if source.retention_policy == "error":
-                    raise KafkaRetentionGap(f"{key}: {message}")
-                committed = low
-                state.committed = low
-                await self._io(self.checkpoint_store.save(key, low))
-                state.retention_gap = None
-            else:
-                state.retention_gap = None
+                    retention_error = True
+                else:
+                    await self._io(self.checkpoint_store.save(key, low))
+                    reset_committed = low
+                    committed = low
+                    retention_message = None
 
-            elapsed = max(now - state.last_observed_at, 1e-6)
-            previous_high = int(state.observed)
-            arrived = max(0, high - previous_high)
-            state.arrival_rate = self._ewma(
-                state.arrival_rate, arrived / elapsed, self.policy.ewma_alpha
+            partitions.append(
+                _KafkaPartitionPrep(
+                    key=key,
+                    worker_name=worker.name,
+                    source_id=source.source_id,
+                    shard=str(partition),
+                    low=low,
+                    high=high,
+                    create=create,
+                    committed=committed,
+                    reset_committed=reset_committed,
+                    snapshot_committed=snapshot_committed,
+                    snapshot_observed=snapshot_observed,
+                    snapshot_last_observed_at=snapshot_last_observed_at,
+                    snapshot_arrival_rate=snapshot_arrival_rate,
+                    retention_message=retention_message,
+                    retention_error=retention_error,
+                )
             )
-            state.observed = high
-            state.backlog = max(0, high - committed)
+        return _KafkaObservePrep(partitions=tuple(partitions), now=time.monotonic())
+
+    def _apply_kafka_observe(self, prep: _KafkaObservePrep) -> None:
+        now = prep.now
+        for item in prep.partitions:
+            state = self.state.sources.get(item.key)
+            if state is None:
+                if not item.create:
+                    continue
+                state = SourceState(
+                    item.key,
+                    item.worker_name,
+                    item.source_id,
+                    SourceKind.KAFKA,
+                    item.shard,
+                    item.committed,
+                    item.high,
+                )
+                self.state.sources[item.key] = state
+            elif item.create:
+                # Another loop created the key; keep existing committed / batch.
+                pass
+
+            if item.retention_error:
+                message = item.retention_message or (
+                    f"checkpoint {int(state.committed)} is outside watermarks"
+                )
+                state.retention_gap = message
+                raise KafkaRetentionGap(f"{item.key}: {message}")
+
+            if item.reset_committed is not None:
+                if state.active_batch_id is not None:
+                    message = item.retention_message or (
+                        f"checkpoint {int(state.committed)} is outside watermarks"
+                    )
+                    state.retention_gap = message
+                    raise KafkaRetentionGap(
+                        f"{item.key}: {message}; cannot reset while batch "
+                        f"{state.active_batch_id} is active"
+                    )
+                if int(state.committed) < item.low or int(state.committed) > item.high:
+                    state.committed = item.reset_committed
+
+            committed = int(state.committed)
+            if committed < item.low or committed > item.high:
+                relation = (
+                    "below retained low watermark"
+                    if committed < item.low
+                    else "above high watermark"
+                )
+                boundary = item.low if committed < item.low else item.high
+                message = f"checkpoint {committed} is {relation} {boundary}"
+                state.retention_gap = message
+                raise KafkaRetentionGap(f"{item.key}: {message}")
+
+            state.retention_gap = None
+            previous_high = (
+                item.snapshot_observed
+                if item.snapshot_observed is not None
+                else int(state.observed)
+            )
+            last_observed_at = (
+                item.snapshot_last_observed_at
+                if item.snapshot_last_observed_at is not None
+                else state.last_observed_at
+            )
+            arrival_rate = (
+                item.snapshot_arrival_rate
+                if item.snapshot_arrival_rate is not None
+                else state.arrival_rate
+            )
+            elapsed = max(now - last_observed_at, 1e-6)
+            arrived = max(0, item.high - previous_high)
+            state.arrival_rate = self._ewma(
+                arrival_rate, arrived / elapsed, self.config.ewma_alpha
+            )
+            state.observed = item.high
+            state.backlog = max(0, item.high - committed)
             state.last_observed_at = now
 
-    async def _observe_postgres(
+    async def _prepare_postgres_observe(
         self,
         worker: HandlerSpec,
         source: PostgresSource,
-        upper: PostgresCursor | None = None,
-    ) -> None:
-        if upper is None:
-            upper = await self._io(self.source_observer.postgres_high_watermark(source))
-        key = (
-            self._shared_state_key(
-                worker.shared_source_group, source.source_id, source.table
-            )
-            if worker.shared_source_group is not None
-            else self._state_key(worker.name, source.source_id, source.table)
-        )
-        state = self.state.sources.get(key)
-        if state is None:
-            checkpoint = await self._io(self.checkpoint_store.load(key))
-            if checkpoint is not None and not isinstance(checkpoint, PostgresCursor):
-                raise TypeError(f"Postgres checkpoint {key} must be PostgresCursor")
-            committed = checkpoint or source.initial_cursor or upper
-            if checkpoint is None:
-                await self._io(self.checkpoint_store.save(key, committed))
-            state = SourceState(
-                key,
-                worker.name,
-                source.source_id,
-                source.kind,
-                source.table,
-                committed,
-                upper,
-                shared_source_group=worker.shared_source_group,
-            )
-            self.state.sources[key] = state
+        upper: PostgresCursor,
+    ) -> _PostgresObservePrep:
+        key = self._shared_state_key(source.source_id, source.table)
+        async with self._lock:
+            state = self.state.sources.get(key)
+            snapshot: tuple[PostgresCursor, int, float, float] | None = None
+            if state is not None:
+                if not isinstance(state.committed, PostgresCursor):
+                    raise TypeError(f"invalid Postgres state for {key}")
+                snapshot = (
+                    state.committed,
+                    state.backlog,
+                    state.last_observed_at,
+                    state.arrival_rate,
+                )
 
-        committed = state.committed
-        if not isinstance(committed, PostgresCursor):
-            raise TypeError(f"invalid Postgres state for {key}")
+        create = False
+        if snapshot is None:
+            checkpoint = await self._io(self.checkpoint_store.load(key))
+            progress = None if checkpoint is None else checkpoint.progress
+            if progress is not None and not isinstance(progress, PostgresCursor):
+                raise TypeError(f"Postgres checkpoint {key} must be PostgresCursor")
+            committed = progress or source.initial_cursor or upper
+            if progress is None:
+                await self._io(self.checkpoint_store.save(key, committed))
+            create = True
+            snapshot_committed = None
+            snapshot_backlog = None
+            snapshot_last_observed_at = None
+            snapshot_arrival_rate = None
+        else:
+            (
+                committed,
+                snapshot_backlog,
+                snapshot_last_observed_at,
+                snapshot_arrival_rate,
+            ) = snapshot
+            snapshot_committed = committed
+
         count = 0 if upper <= committed else await self._io(
             self.source_observer.postgres_count(source, committed, upper)
         )
-        now = time.monotonic()
-        elapsed = max(now - state.last_observed_at, 1e-6)
-        previous = state.backlog
-        arrived = max(0, count - previous)
-        state.arrival_rate = self._ewma(
-            state.arrival_rate, arrived / elapsed, self.policy.ewma_alpha
+        return _PostgresObservePrep(
+            key=key,
+            worker_name=worker.name,
+            source_id=source.source_id,
+            table=source.table,
+            create=create,
+            committed=committed,
+            upper=upper,
+            count=count,
+            snapshot_committed=snapshot_committed,
+            snapshot_backlog=snapshot_backlog,
+            snapshot_last_observed_at=snapshot_last_observed_at,
+            snapshot_arrival_rate=snapshot_arrival_rate,
+            now=time.monotonic(),
         )
-        state.observed = upper
-        state.backlog = max(0, count)
-        state.last_observed_at = now
+
+    def _apply_postgres_observe(self, prep: _PostgresObservePrep) -> None:
+        state = self.state.sources.get(prep.key)
+        if state is None:
+            if not prep.create:
+                return
+            state = SourceState(
+                prep.key,
+                prep.worker_name,
+                prep.source_id,
+                SourceKind.POSTGRES,
+                prep.table,
+                prep.committed,
+                prep.upper,
+            )
+            self.state.sources[prep.key] = state
+        elif prep.create:
+            # Key appeared concurrently; keep existing committed.
+            if state.committed != prep.committed:
+                return
+        elif (
+            prep.snapshot_committed is not None
+            and state.committed != prep.snapshot_committed
+        ):
+            # Commit landed between prepare and apply; skip stale rate update.
+            return
+
+        if not isinstance(state.committed, PostgresCursor):
+            raise TypeError(f"invalid Postgres state for {prep.key}")
+        previous = (
+            prep.snapshot_backlog
+            if prep.snapshot_backlog is not None
+            else state.backlog
+        )
+        last_observed_at = (
+            prep.snapshot_last_observed_at
+            if prep.snapshot_last_observed_at is not None
+            else state.last_observed_at
+        )
+        arrival_rate = (
+            prep.snapshot_arrival_rate
+            if prep.snapshot_arrival_rate is not None
+            else state.arrival_rate
+        )
+        elapsed = max(prep.now - last_observed_at, 1e-6)
+        arrived = max(0, prep.count - previous)
+        state.arrival_rate = self._ewma(
+            arrival_rate, arrived / elapsed, self.config.ewma_alpha
+        )
+        state.observed = prep.upper
+        state.backlog = max(0, prep.count)
+        state.last_observed_at = prep.now
+
+    def _plan_multisource_observe(self) -> list[_MultisourceObservePlan]:
+        plans: list[_MultisourceObservePlan] = []
+        for group_key, members in self._shared_groups.items():
+            if not members[0].is_multisource:
+                continue
+            window = self.state.multisource_windows[group_key]
+            source_plans: list[_MultisourceSourcePlan] = []
+            for source in members[0].sources:
+                assert isinstance(source, KafkaSource)
+                watermarks: dict[int, tuple[int, int]] = {}
+                for state in self.state.sources.values():
+                    if state.source_id != source.source_id:
+                        continue
+                    partition = int(state.shard)
+                    high = int(state.observed)
+                    # Low is unknown here; event-time highs only need highs.
+                    watermarks[partition] = (0, high)
+                source_plans.append(
+                    _MultisourceSourcePlan(
+                        source=source,
+                        watermarks=watermarks,
+                        need_watermarks=not watermarks,
+                    )
+                )
+            plans.append(
+                _MultisourceObservePlan(
+                    group_key=group_key,
+                    sources=source_plans,
+                    need_checkpoint=window.committed_time is None,
+                )
+            )
+        return plans
+
+    async def _fetch_multisource_observe(
+        self, plans: Sequence[_MultisourceObservePlan]
+    ) -> list[_MultisourceObserveResult]:
+        async def fetch_one(plan: _MultisourceObservePlan) -> _MultisourceObserveResult:
+            try:
+                async def source_event_high(
+                    source_plan: _MultisourceSourcePlan,
+                ) -> datetime | None:
+                    watermarks = source_plan.watermarks
+                    if source_plan.need_watermarks:
+                        watermarks = dict(
+                            await self._io(
+                                self.source_observer.kafka_watermarks(source_plan.source)
+                            )
+                        )
+                    event_highs = await self._io(
+                        self.source_observer.kafka_event_time_highs(
+                            source_plan.source, watermarks
+                        )
+                    )
+                    if not event_highs:
+                        return None
+                    return max(event_highs.values())
+
+                highs = await asyncio.gather(
+                    *[source_event_high(item) for item in plan.sources]
+                )
+                if any(high is None for high in highs) or not highs:
+                    t_right: datetime | None = None
+                else:
+                    t_right = min(high for high in highs if high is not None)
+
+                checkpoint_progress: datetime | None = None
+                if plan.need_checkpoint:
+                    checkpoint = await self._io(
+                        self.checkpoint_store.load(
+                            self._mswin_checkpoint_key(plan.group_key)
+                        )
+                    )
+                    if checkpoint is not None:
+                        if not isinstance(checkpoint.progress, datetime):
+                            raise TypeError(
+                                f"multi-source checkpoint {plan.group_key} must be datetime"
+                            )
+                        checkpoint_progress = checkpoint.progress
+                return _MultisourceObserveResult(
+                    group_key=plan.group_key,
+                    observed_time=t_right,
+                    checkpoint_progress=checkpoint_progress,
+                )
+            except Exception as exc:
+                return _MultisourceObserveResult(
+                    group_key=plan.group_key,
+                    observed_time=None,
+                    checkpoint_progress=None,
+                    error=exc,
+                )
+
+        if not plans:
+            return []
+        return list(await asyncio.gather(*[fetch_one(plan) for plan in plans]))
+
+    def _apply_multisource_observe(self, result: _MultisourceObserveResult) -> None:
+        window = self.state.multisource_windows[result.group_key]
+        if window.committed_time is None and result.checkpoint_progress is not None:
+            window.committed_time = result.checkpoint_progress
+        window.observed_time = result.observed_time
 
     async def ray_trigger(self) -> list[str]:
         """Schedule one wave of eligible source ranges and return run IDs."""
@@ -405,16 +1110,19 @@ class RayDispatcher:
                 for batch in self.state.batches.values()
                 if batch.status is BatchStatus.RUNNING
             )
-            free_slots = max(0, self.policy.max_in_flight - active_global)
+            free_slots = max(0, self.config.max_in_flight - active_global)
             available_cpus = self.ray_backend.available_cpus()
             now = time.monotonic()
+            # Coarse prefilter; TriggerPolicy is authoritative.
             candidates = [
                 state
                 for state in self.state.sources.values()
-                if state.backlog > 0 and state.active_batch_id is None and not state.retention_gap
+                if state.backlog > 0
+                and state.active_batch_id is None
+                and not state.retention_gap
             ]
             candidates.sort(
-                key=lambda state: self.policy.priority(
+                key=lambda state: self.trigger.rank_key(
                     self.workers[state.worker_name], state, now
                 ),
                 reverse=True,
@@ -423,74 +1131,147 @@ class RayDispatcher:
             for source_state in candidates:
                 if free_slots <= 0:
                     break
-                if source_state.shared_source_group is not None:
-                    members = self._shared_groups[source_state.shared_source_group]
-                    n = self._shared_task_count(
-                        members,
-                        source_state,
-                        free_slots,
-                        available_cpus,
-                    )
-                    if n == 0:
-                        continue
-                    run_ids = await self._create_shared_batch(
-                        members, source_state, n
-                    )
-                    submitted.extend(run_ids)
-                    reserved = len(run_ids) * (len(members) + 1)
-                    free_slots = max(0, free_slots - reserved)
-                    if available_cpus is not None:
-                        available_cpus = max(
-                            0.0,
-                            available_cpus - len(run_ids) * members[0].fetch_cpus,
-                        )
+                members = self._shared_groups.get(source_state.source_id)
+                if members is None or members[0].is_multisource:
                     continue
-                worker = self.workers[source_state.worker_name]
-                worker_active = sum(
-                    run.worker_name == worker.name
-                    and run.status in (RunStatus.SUBMITTED, RunStatus.RUNNING)
-                    for run in self.state.runs.values()
-                )
-                worker_slots = max(0, worker.max_parallelism - worker_active)
-                output_slots = worker_slots
-                if worker.output is not None:
-                    output_key = (
-                        worker.output.connection_id,
-                        worker.output.target,
+                representative = members[0]
+                slots_per_slice = len(members) + 1
+                phase_cpus = self._phase_cpus(members)
+                decision = self.trigger.evaluate(
+                    TriggerContext(
+                        handler=representative,
+                        source_state=source_state,
+                        free_slots=free_slots,
+                        available_cpus=available_cpus,
+                        now=now,
+                        config=self.config,
+                        slots_per_slice=slots_per_slice,
+                        phase_cpus=phase_cpus,
                     )
-                    output_active = sum(
-                        run.status in (RunStatus.SUBMITTED, RunStatus.RUNNING)
-                        and self.workers[run.worker_name].output is not None
-                        and (
-                            self.workers[run.worker_name].output.connection_id,
-                            self.workers[run.worker_name].output.target,
-                        )
-                        == output_key
-                        for run in self.state.runs.values()
-                    )
-                    output_slots = max(
-                        0, self._output_limits[output_key] - output_active
-                    )
-                # Actors already own their CPU allocation. Requiring free cluster
-                # CPU again for each method call would prevent a full actor pool
-                # from ever accepting its second wave.
-                cpu_budget = (
-                    None if worker.mode is ExecutionMode.ACTOR else available_cpus
                 )
-                n = self.policy.task_count(
-                    worker,
-                    source_state.backlog,
-                    min(free_slots, worker_slots, output_slots),
-                    cpu_budget,
+                self._emit_event(
+                    EVENT_TRIGGER_EVALUATED,
+                    decision.to_event_payload(source_key=source_state.key),
                 )
+                if decision.decision is Decision.SKIP:
+                    continue
+                if decision.decision is Decision.BLOCK:
+                    break
+                n = self._shared_task_count(
+                    members,
+                    source_state,
+                    free_slots,
+                    available_cpus,
+                )
+                if (
+                    decision.decision is Decision.DEGRADE
+                    and decision.soft_action is SoftAction.THROTTLE
+                    and decision.concurrency_factor is not None
+                ):
+                    n = max(0, math.floor(n * decision.concurrency_factor))
                 if n == 0:
                     continue
-                run_ids = await self._create_batch(worker, source_state, n)
+                run_ids = await self._create_shared_batch(
+                    members, source_state, n
+                )
                 submitted.extend(run_ids)
-                free_slots -= len(run_ids)
-                if available_cpus is not None and worker.mode is ExecutionMode.TASK:
-                    available_cpus = max(0.0, available_cpus - len(run_ids) * worker.cpus_per_task)
+                reserved = len(run_ids) * (len(members) + 1)
+                free_slots = max(0, free_slots - reserved)
+                if available_cpus is not None:
+                    available_cpus = max(
+                        0.0,
+                        available_cpus - len(run_ids) * self.config.fetch_cpus,
+                    )
+
+            for group_key, window in self.state.multisource_windows.items():
+                if free_slots <= 0:
+                    break
+                members = self._shared_groups[group_key]
+                if window.observed_time is None:
+                    continue
+                if window.committed_time is None:
+                    checkpoint = await self._io(
+                        self.checkpoint_store.load(
+                            self._mswin_checkpoint_key(group_key)
+                        )
+                    )
+                    if checkpoint is not None:
+                        if not isinstance(checkpoint.progress, datetime):
+                            raise TypeError(
+                                f"multi-source checkpoint {group_key} must be datetime"
+                            )
+                        window.committed_time = checkpoint.progress
+                    else:
+                        window.committed_time = window.observed_time
+                        await self._io(
+                            self.checkpoint_store.save(
+                                self._mswin_checkpoint_key(group_key),
+                                window.committed_time,
+                            )
+                        )
+                        continue
+                t_left, t_right = window_bounds(
+                    window, max_window_seconds=self.config.max_window_seconds
+                )
+                representative = members[0]
+                slots_per_slice = len(members) + 1
+                phase_cpus = self._phase_cpus(members)
+                decision = self.trigger.evaluate(
+                    TriggerContext(
+                        handler=representative,
+                        source_state=None,
+                        free_slots=free_slots,
+                        available_cpus=available_cpus,
+                        now=now,
+                        config=self.config,
+                        window=window,
+                        window_start=t_left,
+                        window_end=t_right,
+                        slots_per_slice=slots_per_slice,
+                        phase_cpus=phase_cpus,
+                    ),
+                    multisource=True,
+                )
+                self._emit_event(
+                    EVENT_TRIGGER_EVALUATED,
+                    decision.to_event_payload(group_key=group_key),
+                )
+                if decision.decision is Decision.SKIP:
+                    continue
+                if decision.decision is Decision.BLOCK:
+                    break
+                assert t_left is not None and t_right is not None
+                run_ids = await self._create_multisource_window_batch(
+                    members, window, t_left, t_right
+                )
+                if not run_ids and not any(
+                    batch.group_key == group_key
+                    and batch.status is BatchStatus.RUNNING
+                    for batch in self.state.batches.values()
+                ):
+                    continue
+                submitted.extend(run_ids)
+                batch = self.state.batches.get(window.active_batch_id or "")
+                reserved = (
+                    len(run_ids) + 1 + len(members)
+                    if batch is not None
+                    else 0
+                )
+                free_slots = max(0, free_slots - reserved)
+                if available_cpus is not None and run_ids:
+                    available_cpus = max(
+                        0.0,
+                        available_cpus - len(run_ids) * self.config.fetch_cpus,
+                    )
             return submitted
+
+    def _phase_cpus(self, members: Sequence[HandlerSpec]) -> float:
+        downstream_cpus = sum(
+            member.cpus_per_task
+            for member in members
+            if member.mode is ExecutionMode.TASK
+        )
+        return max(self.config.fetch_cpus, downstream_cpus)
 
     def _shared_task_count(
         self,
@@ -505,47 +1286,8 @@ class RayDispatcher:
             math.ceil(state.backlog / batch_size),
             free_slots // per_slice_slots,
         )
-        output_multiplicity: dict[tuple[str, str], int] = {}
-        for member in members:
-            active = sum(
-                run.worker_name == member.name
-                and run.kind == "handler"
-                and run.status in (RunStatus.SUBMITTED, RunStatus.RUNNING)
-                for run in self.state.runs.values()
-            )
-            count = min(count, max(0, member.max_parallelism - active))
-            if member.output is not None:
-                output_key = (
-                    member.output.connection_id,
-                    member.output.target,
-                )
-                output_multiplicity[output_key] = (
-                    output_multiplicity.get(output_key, 0) + 1
-                )
-        for output_key, per_slice in output_multiplicity.items():
-            output_active = sum(
-                run.kind == "handler"
-                and run.status in (RunStatus.SUBMITTED, RunStatus.RUNNING)
-                and self.workers[run.worker_name].output is not None
-                and (
-                    self.workers[run.worker_name].output.connection_id,
-                    self.workers[run.worker_name].output.target,
-                )
-                == output_key
-                for run in self.state.runs.values()
-            )
-            count = min(
-                count,
-                max(0, self._output_limits[output_key] - output_active)
-                // per_slice,
-            )
         if available_cpus is not None:
-            downstream_cpus = sum(
-                member.cpus_per_task
-                for member in members
-                if member.mode is ExecutionMode.TASK
-            )
-            phase_cpus = max(members[0].fetch_cpus, downstream_cpus)
+            phase_cpus = self._phase_cpus(members)
             count = min(count, math.floor(available_cpus / phase_cpus))
         return max(0, count)
 
@@ -555,9 +1297,7 @@ class RayDispatcher:
         source_state: SourceState,
         n: int,
     ) -> list[str]:
-        group = source_state.shared_source_group
-        if group is None:
-            raise ValueError("shared batch requires shared_source_group")
+        group = source_state.source_id
         representative = members[0]
         source = representative.sources[0]
         start, observed = source_state.committed, source_state.observed
@@ -610,7 +1350,6 @@ class RayDispatcher:
             end,
             item_count,
             [],
-            shared_source_group=group,
             worker_names=tuple(member.name for member in members),
             fetch_run_ids=fetch_run_ids,
             reserved_handler_count=n * len(members),
@@ -642,7 +1381,12 @@ class RayDispatcher:
                 table=source.table if isinstance(source, PostgresSource) else None,
             )
             try:
-                ref = self.ray_backend.submit_fetch(representative, request)
+                ref = self.ray_backend.submit_fetch(
+                    representative,
+                    request,
+                    source,
+                    fetch_cpus=self.config.fetch_cpus,
+                )
                 run = TaskRun(
                     fetch_id,
                     batch_id,
@@ -665,140 +1409,258 @@ class RayDispatcher:
             fetch_run_ids.append(fetch_id)
         return fetch_run_ids
 
-    async def _create_batch(
-        self, worker: WorkerSpec, source_state: SourceState, n: int
+    async def _create_multisource_window_batch(
+        self,
+        members: tuple[HandlerSpec, ...],
+        window: MultiSourceWindowState,
+        t_left: datetime,
+        t_right: datetime,
     ) -> list[str]:
-        start, end = source_state.committed, source_state.observed
-        item_count = source_state.backlog
-        if source_state.kind is SourceKind.KAFKA:
-            # A constrained wave must not silently turn one task into an
-            # unbounded batch. Leave the remainder for later trigger cycles.
-            end = min(int(end), int(start) + n * worker.batch_size)
-            item_count = int(end) - int(start)
-        batch_id = self._stable_id(worker.name, source_state.key, start, end)
-        requests: list[DispatchRequest] = []
-        if source_state.kind is SourceKind.KAFKA:
-            source = next(
-                candidate
-                for candidate in worker.sources
-                if isinstance(candidate, KafkaSource)
-                and candidate.source_id == source_state.source_id
-            )
-            start_i, end_i = int(start), int(end)
-            n = min(n, end_i - start_i)
-            base, remainder = divmod(end_i - start_i, n)
-            cursor = start_i
-            ranges: list[tuple[int, int]] = []
-            for index in range(n):
-                size = base + (1 if index < remainder else 0)
-                ranges.append((cursor, cursor + size))
-                cursor += size
-            for index, (chunk_start, chunk_end) in enumerate(ranges):
-                dispatch_id = self._stable_id(batch_id, index, chunk_start, chunk_end)
-                requests.append(
-                    DispatchRequest(
-                        dispatch_id,
-                        worker.name,
-                        source_state.source_id,
-                        source_state.kind,
-                        index,
-                        n,
-                        partition=int(source_state.shard),
-                        start_offset=chunk_start,
-                        end_offset=chunk_end,
-                        output_connection_id=(
-                            worker.output.connection_id if worker.output else None
-                        ),
-                        output_target=worker.output.target if worker.output else None,
-                        output_format=worker.output.output_format if worker.output else None,
-                        source_connection_id=source.connection_id,
-                        topic=source.topic,
-                    )
-                )
-        else:
-            if not isinstance(start, PostgresCursor) or not isinstance(end, PostgresCursor):
-                raise TypeError("Postgres batch requires PostgresCursor bounds")
-            source = next(
-                candidate
-                for candidate in worker.sources
-                if isinstance(candidate, PostgresSource)
-                and candidate.source_id == source_state.source_id
-                and candidate.table == source_state.shard
-            )
-            splitter = getattr(self.source_observer, "postgres_ranges", None)
-            if splitter is None:
-                postgres_ranges = [(start, end, source_state.backlog)]
-            else:
-                postgres_ranges = list(
-                    await self._io(
-                        splitter(source, start, end, n, worker.batch_size)
-                    )
-                )
-            if not postgres_ranges:
-                return []
-            n = len(postgres_ranges)
-            end = postgres_ranges[-1][1]
-            item_count = sum(count for _, _, count in postgres_ranges)
-            batch_id = self._stable_id(worker.name, source_state.key, start, end)
-            for index, (chunk_start, chunk_end, _) in enumerate(postgres_ranges):
-                dispatch_id = self._stable_id(
-                    batch_id, index, chunk_start, chunk_end
-                )
-                requests.append(
-                    DispatchRequest(
-                        dispatch_id,
-                        worker.name,
-                        source_state.source_id,
-                        source_state.kind,
-                        index,
-                        n,
-                        start_cursor=chunk_start,
-                        end_cursor=chunk_end,
-                        output_connection_id=(
-                            worker.output.connection_id if worker.output else None
-                        ),
-                        output_target=worker.output.target if worker.output else None,
-                        output_format=worker.output.output_format if worker.output else None,
-                        source_connection_id=source.connection_id,
-                        table=source.table,
-                    )
-                )
+        representative = members[0]
+        group_key = window.group_key
+        source_ids = tuple(source.source_id for source in representative.sources)
+        planned: list[
+            tuple[KafkaSource, SourceState, int, int]
+        ] = []
+        partition_commits: dict[str, int] = {}
+        source_state_keys: list[str] = []
+        involved_states: list[SourceState] = []
+        item_count = 0
 
-        run_ids: list[str] = []
+        for source in representative.sources:
+            assert isinstance(source, KafkaSource)
+            partition_states = [
+                state
+                for state in self.state.sources.values()
+                if state.source_id == source.source_id
+            ]
+            if any(state.active_batch_id is not None for state in partition_states):
+                return []
+            if not partition_states:
+                continue
+            partitions = [int(state.shard) for state in partition_states]
+            watermarks = await self._io(self.source_observer.kafka_watermarks(source))
+            start_map = await self._io(
+                self.source_observer.kafka_offsets_for_times(
+                    source, {partition: t_left for partition in partitions}
+                )
+            )
+            end_map = await self._io(
+                self.source_observer.kafka_offsets_for_times(
+                    source, {partition: t_right for partition in partitions}
+                )
+            )
+            for state in partition_states:
+                partition = int(state.shard)
+                low, high = watermarks.get(partition, (0, int(state.observed)))
+                start_offset = int(start_map.get(partition, high))
+                end_offset = int(end_map.get(partition, high))
+                committed = int(state.committed)
+                observed_high = int(state.observed)
+                start_offset = max(start_offset, committed)
+                end_offset = min(end_offset, observed_high)
+                if end_offset < start_offset:
+                    end_offset = start_offset
+                source_state_keys.append(state.key)
+                partition_commits[state.key] = end_offset
+                involved_states.append(state)
+                if end_offset > start_offset:
+                    item_count += end_offset - start_offset
+                    planned.append((source, state, start_offset, end_offset))
+
+        batch_id = self._stable_id("mswin", group_key, t_left, t_right)
+        fetch_run_ids: list[str] = []
+        fetch_source_ids: list[str] = []
         batch = BatchRun(
             batch_id,
-            source_state.key,
-            worker.name,
-            start,
-            end,
+            group_key,
+            representative.name,
+            t_left,
+            t_right,
             item_count,
-            run_ids,
+            [],
+            worker_names=tuple(member.name for member in members),
+            fetch_run_ids=fetch_run_ids,
+            reserved_handler_count=len(members),
+            window_start=t_left,
+            window_end=t_right,
+            source_state_keys=tuple(source_state_keys),
+            partition_commits=partition_commits,
+            group_key=group_key,
+            fetch_source_ids=tuple(fetch_source_ids),
         )
         self.state.batches[batch_id] = batch
-        source_state.active_batch_id = batch_id
-        source_state.last_scheduled_at = time.monotonic()
-        for request in requests:
-            run_id = request.dispatch_id
+        window.active_batch_id = batch_id
+        window.last_scheduled_at = time.monotonic()
+        for state in involved_states:
+            state.active_batch_id = batch_id
+            state.last_scheduled_at = time.monotonic()
+
+        for source, state, start_offset, end_offset in planned:
+            fetch_id = self._stable_id(
+                batch_id,
+                "fetch",
+                source.source_id,
+                state.shard,
+                start_offset,
+                end_offset,
+            )
+            request = DispatchRequest(
+                fetch_id,
+                f"fetch:{group_key}",
+                source.source_id,
+                source.kind,
+                0,
+                1,
+                partition=int(state.shard),
+                start_offset=start_offset,
+                end_offset=end_offset,
+                source_connection_id=source.connection_id,
+                topic=source.topic,
+                window_start=t_left,
+                window_end=t_right,
+                source_ids=source_ids,
+            )
             try:
-                ref = self.ray_backend.submit(worker, request)
-                run = TaskRun(run_id, batch_id, worker.name, request, ref)
+                ref = self.ray_backend.submit_fetch(
+                    representative,
+                    request,
+                    source,
+                    fetch_cpus=self.config.fetch_cpus,
+                )
+                run = TaskRun(
+                    fetch_id,
+                    batch_id,
+                    representative.name,
+                    request,
+                    ref,
+                    kind="fetch",
+                )
+            except Exception as exc:
+                run = TaskRun(
+                    fetch_id,
+                    batch_id,
+                    representative.name,
+                    request,
+                    None,
+                    error=f"fetch submission failed: {type(exc).__name__}: {exc}",
+                    kind="fetch",
+                )
+            self.state.runs[fetch_id] = run
+            fetch_run_ids.append(fetch_id)
+            fetch_source_ids.append(source.source_id)
+        batch.fetch_source_ids = tuple(fetch_source_ids)
+        return fetch_run_ids
+
+    async def _submit_multisource_merge(self, batch: BatchRun) -> str:
+        members = tuple(self.workers[name] for name in batch.worker_names)
+        representative = members[0]
+        group_source_ids = tuple(
+            source.source_id for source in representative.sources
+        )
+        fetch_refs = [
+            self.state.runs[run_id].ref for run_id in batch.fetch_run_ids
+        ]
+        # Parallel ids for zip; append missing group sources so merge fills [].
+        merge_source_ids = batch.fetch_source_ids + tuple(
+            source_id
+            for source_id in group_source_ids
+            if source_id not in batch.fetch_source_ids
+        )
+        merge_id = self._stable_id(batch.batch_id, "merge", batch.start, batch.end)
+        request = DispatchRequest(
+            merge_id,
+            f"merge:{batch.group_key}",
+            representative.source_id,
+            SourceKind.KAFKA,
+            0,
+            1,
+            window_start=batch.window_start,
+            window_end=batch.window_end,
+            source_ids=merge_source_ids,
+        )
+        try:
+            ref = self.ray_backend.submit_merge(
+                representative, merge_source_ids, fetch_refs
+            )
+            run = TaskRun(
+                merge_id,
+                batch.batch_id,
+                representative.name,
+                request,
+                ref,
+                kind="merge",
+            )
+        except Exception as exc:
+            run = TaskRun(
+                merge_id,
+                batch.batch_id,
+                representative.name,
+                request,
+                None,
+                error=f"merge submission failed: {type(exc).__name__}: {exc}",
+                kind="merge",
+            )
+        self.state.runs[merge_id] = run
+        batch.merge_run_id = merge_id
+        return merge_id
+
+    async def _submit_multisource_handlers(self, batch: BatchRun) -> list[str]:
+        members = tuple(self.workers[name] for name in batch.worker_names)
+        assert batch.merge_run_id is not None
+        merge_run = self.state.runs[batch.merge_run_id]
+        assert batch.group_key is not None
+        actor_progress_key = self._mswin_checkpoint_key(batch.group_key)
+        submitted: list[str] = []
+        for member in members:
+            run_id = self._stable_id(
+                batch.batch_id,
+                member.name,
+                batch.window_start,
+                batch.window_end,
+            )
+            handler_request = await self._build_handler_request(
+                member, run_id, actor_progress_key
+            )
+            try:
+                ref = self.ray_backend.submit(
+                    member, handler_request, merge_run.ref
+                )
+                run = TaskRun(
+                    run_id,
+                    batch.batch_id,
+                    member.name,
+                    handler_request,
+                    ref,
+                    data_ref=merge_run.ref,
+                )
             except Exception as exc:
                 run = TaskRun(
                     run_id,
-                    batch_id,
-                    worker.name,
-                    request,
+                    batch.batch_id,
+                    member.name,
+                    handler_request,
                     None,
-                    status=RunStatus.SUBMITTED,
-                    error=f"submission failed: {type(exc).__name__}: {exc}",
+                    error=(
+                        "handler submission failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                    data_ref=merge_run.ref,
                 )
             self.state.runs[run_id] = run
-            run_ids.append(run_id)
-        return run_ids
+            batch.run_ids.append(run_id)
+            submitted.append(run_id)
+        batch.reserved_handler_count = 0
+        return submitted
 
     async def ray_status(self) -> dict[str, RunStatus]:
-        """Poll current refs, retry failures, and commit completed batches."""
+        """Poll current refs, retry failures, and commit completed batches.
 
+        Checkpoint / failure durability runs outside ``_lock``; the lock is held
+        only while polling refs, mutating run/batch state, and finalizing after IO.
+        """
+
+        pending: list[_PendingBatchDurability] = []
         async with self._lock:
             # A local Ray submission can fail before an ObjectRef exists. Treat
             # that exactly like a failed Ray execution so it gets the configured
@@ -826,7 +1688,14 @@ class RayDispatcher:
                     # Fetch payloads stay in Ray's object store and are shared
                     # through run.ref; retaining outcome.value here would pin a
                     # second driver-side reference for the life of Dispatcher.
-                    run.result = outcome.value if run.kind == "handler" else None
+                    if run.kind == "handler":
+                        result, checkpoint_state = self._split_handler_result(
+                            outcome.value
+                        )
+                        run.result = result
+                        run.checkpoint_state = checkpoint_state
+                    else:
+                        run.result = None
                     run.finished_at = time.monotonic()
                 else:
                     await self._handle_failure(run, outcome.error or "unknown Ray failure")
@@ -834,33 +1703,55 @@ class RayDispatcher:
             for batch in list(self.state.batches.values()):
                 if batch.status is not BatchStatus.RUNNING:
                     continue
-                if batch.shared_source_group is not None:
-                    fetch_runs = [
-                        self.state.runs[run_id]
-                        for run_id in batch.fetch_run_ids
-                    ]
-                    if fetch_runs and self._all_terminal(fetch_runs):
-                        if any(run.status is RunStatus.FAILED for run in fetch_runs):
-                            batch.reserved_handler_count = 0
-                            await self._record_failed_batch(batch)
-                            await self._skip_failed_batch(batch)
-                            continue
+                fetch_runs = [
+                    self.state.runs[run_id]
+                    for run_id in batch.fetch_run_ids
+                ]
+                if fetch_runs and self._all_terminal(fetch_runs):
+                    if any(run.status is RunStatus.FAILED for run in fetch_runs):
+                        batch.reserved_handler_count = 0
+                        pending.append(self._begin_skip_failed_batch(batch))
+                        continue
+                if batch.group_key:
+                    fetches_ready = (not fetch_runs) or all(
+                        run.status is RunStatus.SUCCEEDED for run in fetch_runs
+                    )
                     if (
-                        fetch_runs
-                        and all(
-                            run.status is RunStatus.SUCCEEDED for run in fetch_runs
-                        )
+                        fetches_ready
+                        and not batch.merge_run_id
                         and not batch.run_ids
                     ):
-                        await self._submit_shared_handlers(batch)
+                        await self._submit_multisource_merge(batch)
+                    if batch.merge_run_id and not batch.run_ids:
+                        merge_run = self.state.runs[batch.merge_run_id]
+                        if merge_run.status is RunStatus.FAILED:
+                            batch.reserved_handler_count = 0
+                            pending.append(self._begin_skip_failed_batch(batch))
+                            continue
+                        if merge_run.status is RunStatus.SUCCEEDED:
+                            await self._submit_multisource_handlers(batch)
+                elif (
+                    fetch_runs
+                    and all(
+                        run.status is RunStatus.SUCCEEDED for run in fetch_runs
+                    )
+                    and not batch.run_ids
+                ):
+                    await self._submit_shared_handlers(batch)
                 runs = [self.state.runs[run_id] for run_id in batch.run_ids]
                 if not runs or not self._all_terminal(runs):
                     continue
                 if any(run.status is RunStatus.FAILED for run in runs):
-                    await self._record_failed_batch(batch)
-                    await self._skip_failed_batch(batch)
+                    pending.append(self._begin_skip_failed_batch(batch))
                 else:
-                    await self._commit_batch(batch)
+                    pending.append(self._begin_commit_batch(batch))
+
+        for item in pending:
+            await self._persist_batch_durability(item)
+
+        async with self._lock:
+            for item in pending:
+                self._finalize_batch_durability(item)
             return {run_id: run.status for run_id, run in self.state.runs.items()}
 
     async def _submit_shared_handlers(self, batch: BatchRun) -> list[str]:
@@ -879,28 +1770,8 @@ class RayDispatcher:
                     request.start_cursor,
                     request.end_cursor,
                 )
-                handler_request = DispatchRequest(
-                    run_id,
-                    member.name,
-                    request.source_id,
-                    request.source_kind,
-                    request.task_index,
-                    request.task_count,
-                    partition=request.partition,
-                    start_offset=request.start_offset,
-                    end_offset=request.end_offset,
-                    start_cursor=request.start_cursor,
-                    end_cursor=request.end_cursor,
-                    output_connection_id=(
-                        member.output.connection_id if member.output else None
-                    ),
-                    output_target=member.output.target if member.output else None,
-                    output_format=(
-                        member.output.output_format if member.output else None
-                    ),
-                    source_connection_id=request.source_connection_id,
-                    topic=request.topic,
-                    table=request.table,
+                handler_request = await self._build_handler_request(
+                    member, run_id, batch.source_state_key
                 )
                 try:
                     ref = self.ray_backend.submit(
@@ -936,19 +1807,50 @@ class RayDispatcher:
     async def _handle_failure(self, run: TaskRun, error: str) -> None:
         worker = self.workers[run.worker_name]
         max_retries = (
-            worker.fetch_max_retries if run.kind == "fetch" else worker.max_retries
+            self.config.fetch_max_retries
+            if run.kind in ("fetch", "merge")
+            else worker.max_retries
         )
         if run.attempt <= max_retries:
             run.attempt += 1
             run.error = error
             try:
-                run.ref = (
-                    self.ray_backend.submit_fetch(worker, run.request)
-                    if run.kind == "fetch"
-                    else self.ray_backend.submit(worker, run.request, run.data_ref)
-                    if run.data_ref is not None
-                    else self.ray_backend.submit(worker, run.request)
-                )
+                if run.kind == "fetch":
+                    source = next(
+                        (
+                            item
+                            for item in worker.sources
+                            if item.source_id == run.request.source_id
+                        ),
+                        worker.sources[0],
+                    )
+                    run.ref = self.ray_backend.submit_fetch(
+                        worker,
+                        run.request,
+                        source,
+                        fetch_cpus=self.config.fetch_cpus,
+                    )
+                elif run.kind == "merge":
+                    batch = self.state.batches[run.batch_id]
+                    fetch_refs = [
+                        self.state.runs[run_id].ref
+                        for run_id in batch.fetch_run_ids
+                    ]
+                    run.ref = self.ray_backend.submit_merge(
+                        worker,
+                        run.request.source_ids or batch.fetch_source_ids,
+                        fetch_refs,
+                    )
+                elif run.data_ref is not None:
+                    assert isinstance(run.request, HandlerRequest)
+                    run.request = self._handler_request_for_retry(run.request)
+                    run.ref = self.ray_backend.submit(
+                        worker, run.request, run.data_ref
+                    )
+                else:
+                    assert isinstance(run.request, HandlerRequest)
+                    run.request = self._handler_request_for_retry(run.request)
+                    run.ref = self.ray_backend.submit(worker, run.request)
                 run.status = RunStatus.SUBMITTED
                 run.submitted_at = time.monotonic()
                 return
@@ -957,6 +1859,18 @@ class RayDispatcher:
         run.status = RunStatus.FAILED
         run.error = error
         run.finished_at = time.monotonic()
+        self._emit_event(
+            EVENT_RUN_FAILED,
+            {
+                "run_id": run.run_id,
+                "batch_id": run.batch_id,
+                "handler": run.worker_name,
+                "kind": run.kind,
+                "attempt": run.attempt,
+                "error": error,
+                "permanent": True,
+            },
+        )
 
     @staticmethod
     def _all_terminal(runs: Sequence[TaskRun]) -> bool:
@@ -964,7 +1878,35 @@ class RayDispatcher:
             run.status in (RunStatus.SUCCEEDED, RunStatus.FAILED) for run in runs
         )
 
-    async def _commit_batch(self, batch: BatchRun) -> None:
+    def _begin_commit_batch(self, batch: BatchRun) -> _PendingBatchDurability:
+        """Validate and mark COMMITTING under lock; return checkpoint writes."""
+
+        if batch.group_key:
+            assert batch.group_key is not None
+            window = self.state.multisource_windows[batch.group_key]
+            if (
+                window.active_batch_id != batch.batch_id
+                or window.committed_time != batch.start
+            ):
+                batch.status = BatchStatus.FAILED
+                batch.finished_at = time.monotonic()
+                raise StaleBatchError(
+                    f"refusing stale commit for {batch.batch_id}: "
+                    "window cursor or generation changed"
+                )
+            progress_key = self._mswin_checkpoint_key(batch.group_key)
+            writes = self._checkpoint_writes_for_batch(
+                batch, progress_key=progress_key, progress=batch.end
+            )
+            for state_key, end_offset in batch.partition_commits.items():
+                writes[state_key] = end_offset
+            batch.status = BatchStatus.COMMITTING
+            return _PendingBatchDurability(
+                batch_id=batch.batch_id,
+                action="commit",
+                writes=writes,
+            )
+
         source_state = self.state.sources[batch.source_state_key]
         if (
             source_state.active_batch_id != batch.batch_id
@@ -975,82 +1917,359 @@ class RayDispatcher:
             raise StaleBatchError(
                 f"refusing stale commit for {batch.batch_id}: source cursor or generation changed"
             )
-        await self._io(self.checkpoint_store.save(source_state.key, batch.end))
+        writes = self._checkpoint_writes_for_batch(
+            batch, progress_key=source_state.key, progress=batch.end
+        )
+        batch.status = BatchStatus.COMMITTING
+        return _PendingBatchDurability(
+            batch_id=batch.batch_id,
+            action="commit",
+            writes=writes,
+        )
+
+    def _begin_skip_failed_batch(self, batch: BatchRun) -> _PendingBatchDurability:
+        """Validate and mark SKIPPING under lock; prepare failure + checkpoint IO."""
+
+        run_ids = [*batch.fetch_run_ids, *batch.run_ids]
+        if batch.merge_run_id:
+            run_ids.append(batch.merge_run_id)
+        runs = [self.state.runs[run_id] for run_id in run_ids if run_id in self.state.runs]
+        fetch_refs = tuple(
+            run.ref
+            for run in runs
+            if run.kind == "fetch"
+            and run.status is RunStatus.SUCCEEDED
+            and run.ref is not None
+        )
+        failure_id = self._stable_id("failure", batch.batch_id, batch.start, batch.end)
+        run_details = tuple(
+            FailureRunDetail(
+                run_id=run.run_id,
+                kind=run.kind,
+                worker_name=run.worker_name,
+                status=run.status.value,
+                attempt=run.attempt,
+                error=run.error,
+                request=self._request_summary(run.request),
+            )
+            for run in runs
+        )
+        worker_names = batch.worker_names or (
+            (batch.worker_name,) if batch.worker_name else ()
+        )
+
+        if batch.group_key:
+            window = self.state.multisource_windows[batch.group_key]
+            if window.active_batch_id != batch.batch_id:
+                batch.status = BatchStatus.FAILED
+                batch.finished_at = time.monotonic()
+                return _PendingBatchDurability(
+                    batch_id=batch.batch_id,
+                    action="skip_abort",
+                    writes={},
+                )
+            if window.committed_time != batch.start:
+                batch.status = BatchStatus.FAILED
+                batch.finished_at = time.monotonic()
+                window.active_batch_id = None
+                for state_key in batch.source_state_keys:
+                    state = self.state.sources[state_key]
+                    if state.active_batch_id == batch.batch_id:
+                        state.active_batch_id = None
+                return _PendingBatchDurability(
+                    batch_id=batch.batch_id,
+                    action="skip_abort",
+                    writes={},
+                )
+            writes: dict[str, Any] = {
+                self._mswin_checkpoint_key(batch.group_key): batch.end
+            }
+            for state_key, end_offset in batch.partition_commits.items():
+                writes[state_key] = end_offset
+            batch.status = BatchStatus.SKIPPING
+            return _PendingBatchDurability(
+                batch_id=batch.batch_id,
+                action="skip",
+                writes=writes,
+                failure_id=failure_id,
+                source_state_key=batch.source_state_key,
+                start=batch.start,
+                end=batch.end,
+                item_count=batch.item_count,
+                worker_names=worker_names,
+                run_details=run_details,
+                fetch_refs=fetch_refs,
+            )
+
+        source_state = self.state.sources[batch.source_state_key]
+        if source_state.active_batch_id != batch.batch_id:
+            batch.status = BatchStatus.FAILED
+            batch.finished_at = time.monotonic()
+            return _PendingBatchDurability(
+                batch_id=batch.batch_id,
+                action="skip_abort",
+                writes={},
+            )
+        if source_state.committed != batch.start:
+            batch.status = BatchStatus.FAILED
+            batch.finished_at = time.monotonic()
+            source_state.active_batch_id = None
+            return _PendingBatchDurability(
+                batch_id=batch.batch_id,
+                action="skip_abort",
+                writes={},
+            )
+        batch.status = BatchStatus.SKIPPING
+        return _PendingBatchDurability(
+            batch_id=batch.batch_id,
+            action="skip",
+            writes={source_state.key: batch.end},
+            failure_id=failure_id,
+            source_state_key=batch.source_state_key,
+            start=batch.start,
+            end=batch.end,
+            item_count=batch.item_count,
+            worker_names=worker_names,
+            run_details=run_details,
+            fetch_refs=fetch_refs,
+        )
+
+    async def _persist_batch_durability(self, pending: _PendingBatchDurability) -> None:
+        if pending.action == "skip_abort":
+            return
+        try:
+            if pending.action == "skip":
+                payload: Any = None
+                payload_error: str | None = None
+                fetch_payloads: list[Any] = []
+                for ref in pending.fetch_refs:
+                    try:
+                        fetch_payloads.append(await self.ray_backend.get(ref))
+                    except Exception as exc:
+                        payload_error = (
+                            f"failed to materialize fetch: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        fetch_payloads = []
+                        break
+                if payload_error is None and fetch_payloads:
+                    payload = (
+                        fetch_payloads[0]
+                        if len(fetch_payloads) == 1
+                        else fetch_payloads
+                    )
+                pending.materialized_payload = payload
+                pending.payload_error = payload_error
+                assert pending.failure_id is not None
+                record = FailureRecord(
+                    failure_id=pending.failure_id,
+                    batch_id=pending.batch_id,
+                    source_state_key=pending.source_state_key,
+                    start=pending.start,
+                    end=pending.end,
+                    item_count=pending.item_count,
+                    worker_names=pending.worker_names,
+                    runs=pending.run_details,
+                    payload=payload,
+                    payload_error=payload_error,
+                )
+                try:
+                    await self._io(self.failure_store.save_failure(record))
+                except Exception as exc:
+                    pending.failure_store_error = exc
+            if pending.writes:
+                await self._io(self.checkpoint_store.save_many(pending.writes))
+        except Exception as exc:
+            pending.persist_error = exc
+
+    def _finalize_batch_durability(self, pending: _PendingBatchDurability) -> None:
+        batch = self.state.batches.get(pending.batch_id)
+        if batch is None:
+            return
+        if pending.action == "skip_abort":
+            return
+        if pending.persist_error is not None:
+            self.state.loop_errors.append(
+                f"ray_status durability: {type(pending.persist_error).__name__}: "
+                f"{pending.persist_error}"
+            )
+            # Retry on the next status tick while the source stays blocked.
+            batch.status = BatchStatus.RUNNING
+            return
+        if pending.action == "commit":
+            self._apply_commit_batch(batch)
+            return
+        if pending.failure_store_error is not None:
+            self.state.loop_errors.append(
+                f"failure_store: {type(pending.failure_store_error).__name__}: "
+                f"{pending.failure_store_error}"
+            )
+        if pending.failure_id is not None:
+            batch.failure_id = pending.failure_id
+        self._apply_skip_failed_batch(batch)
+
+    def _apply_commit_batch(self, batch: BatchRun) -> None:
+        if batch.group_key:
+            self._apply_commit_multisource_batch(batch)
+            return
+        source_state = self.state.sources[batch.source_state_key]
+        if (
+            source_state.active_batch_id != batch.batch_id
+            or source_state.committed != batch.start
+            or batch.status is not BatchStatus.COMMITTING
+        ):
+            batch.status = BatchStatus.FAILED
+            batch.finished_at = time.monotonic()
+            raise StaleBatchError(
+                f"refusing stale commit for {batch.batch_id}: source cursor or generation changed"
+            )
         source_state.committed = batch.end
         source_state.backlog = max(0, source_state.backlog - batch.item_count)
         source_state.active_batch_id = None
         elapsed = max(time.monotonic() - batch.started_at, 1e-6)
         measured = batch.item_count / elapsed
         source_state.processing_rate = self._ewma(
-            source_state.processing_rate, measured, self.policy.ewma_alpha
+            source_state.processing_rate, measured, self.config.ewma_alpha
         )
         batch.status = BatchStatus.SUCCEEDED
         batch.finished_at = time.monotonic()
-        # Release completed ObjectRefs after checkpoint durability. Until this
-        # point they must remain pinned so failed handlers can reuse the fetch.
-        for run_id in [*batch.fetch_run_ids, *batch.run_ids]:
+        self._release_batch_refs(batch)
+        self._emit_event(
+            EVENT_BATCH_COMMITTED,
+            self._batch_event_payload(batch, progress_key=source_state.key),
+        )
+
+    def _apply_commit_multisource_batch(self, batch: BatchRun) -> None:
+        assert batch.group_key is not None
+        window = self.state.multisource_windows[batch.group_key]
+        progress_key = self._mswin_checkpoint_key(batch.group_key)
+        if (
+            window.active_batch_id != batch.batch_id
+            or window.committed_time != batch.start
+            or batch.status is not BatchStatus.COMMITTING
+        ):
+            batch.status = BatchStatus.FAILED
+            batch.finished_at = time.monotonic()
+            raise StaleBatchError(
+                f"refusing stale commit for {batch.batch_id}: "
+                "window cursor or generation changed"
+            )
+        window.committed_time = (
+            batch.end if isinstance(batch.end, datetime) else window.committed_time
+        )
+        window.active_batch_id = None
+        elapsed = max(time.monotonic() - batch.started_at, 1e-6)
+        measured = batch.item_count / elapsed
+        for state_key, end_offset in batch.partition_commits.items():
+            state = self.state.sources[state_key]
+            previous = int(state.committed)
+            state.committed = end_offset
+            state.backlog = max(0, int(state.observed) - end_offset)
+            state.active_batch_id = None
+            state.processing_rate = self._ewma(
+                state.processing_rate,
+                (end_offset - previous) / elapsed if elapsed else measured,
+                self.config.ewma_alpha,
+            )
+        for state_key in batch.source_state_keys:
+            if state_key in batch.partition_commits:
+                continue
+            state = self.state.sources[state_key]
+            state.active_batch_id = None
+        batch.status = BatchStatus.SUCCEEDED
+        batch.finished_at = time.monotonic()
+        self._release_batch_refs(batch)
+        self._emit_event(
+            EVENT_BATCH_COMMITTED,
+            self._batch_event_payload(batch, progress_key=progress_key),
+        )
+
+    def _release_batch_refs(self, batch: BatchRun) -> None:
+        run_ids = [*batch.fetch_run_ids, *batch.run_ids]
+        if batch.merge_run_id:
+            run_ids.append(batch.merge_run_id)
+        for run_id in run_ids:
             run = self.state.runs[run_id]
             run.ref = None
             run.data_ref = None
 
-    async def _record_failed_batch(self, batch: BatchRun) -> None:
-        """Persist failure metadata and any recoverable payload before skip."""
+    def _apply_skip_failed_batch(self, batch: BatchRun) -> None:
+        """Advance past a poison range after durable skip IO succeeded."""
 
-        run_ids = [*batch.fetch_run_ids, *batch.run_ids]
-        runs = [self.state.runs[run_id] for run_id in run_ids if run_id in self.state.runs]
-        payload: Any = None
-        payload_error: str | None = None
-        fetch_payloads: list[Any] = []
-        for run in runs:
-            if run.kind != "fetch" or run.status is not RunStatus.SUCCEEDED:
-                continue
-            if run.ref is None:
-                continue
-            try:
-                fetch_payloads.append(await self.ray_backend.get(run.ref))
-            except Exception as exc:
-                payload_error = (
-                    f"failed to materialize fetch {run.run_id}: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-                break
-        if payload_error is None and fetch_payloads:
-            payload = fetch_payloads[0] if len(fetch_payloads) == 1 else fetch_payloads
-
-        record = FailureRecord(
-            failure_id=self._stable_id("failure", batch.batch_id, batch.start, batch.end),
-            batch_id=batch.batch_id,
-            source_state_key=batch.source_state_key,
-            shared_source_group=batch.shared_source_group,
-            start=batch.start,
-            end=batch.end,
-            item_count=batch.item_count,
-            worker_names=batch.worker_names
-            or ((batch.worker_name,) if batch.worker_name else ()),
-            runs=tuple(
-                FailureRunDetail(
-                    run_id=run.run_id,
-                    kind=run.kind,
-                    worker_name=run.worker_name,
-                    status=run.status.value,
-                    attempt=run.attempt,
-                    error=run.error,
-                    request=self._request_summary(run.request),
-                )
-                for run in runs
-            ),
-            payload=payload,
-            payload_error=payload_error,
+        if batch.group_key:
+            self._apply_skip_failed_multisource_batch(batch)
+            return
+        source_state = self.state.sources[batch.source_state_key]
+        if (
+            source_state.active_batch_id != batch.batch_id
+            or source_state.committed != batch.start
+            or batch.status is not BatchStatus.SKIPPING
+        ):
+            batch.status = BatchStatus.FAILED
+            batch.finished_at = time.monotonic()
+            if source_state.active_batch_id == batch.batch_id:
+                source_state.active_batch_id = None
+            return
+        source_state.committed = batch.end
+        source_state.backlog = max(0, source_state.backlog - batch.item_count)
+        source_state.active_batch_id = None
+        batch.status = BatchStatus.FAILED
+        batch.finished_at = time.monotonic()
+        self._release_batch_refs(batch)
+        self._emit_event(
+            EVENT_BATCH_SKIPPED,
+            self._batch_event_payload(batch, progress_key=source_state.key),
         )
-        try:
-            await self._io(self.failure_store.save_failure(record))
-        except Exception as exc:
-            self.state.loop_errors.append(
-                f"failure_store: {type(exc).__name__}: {exc}"
-            )
+
+    def _apply_skip_failed_multisource_batch(self, batch: BatchRun) -> None:
+        assert batch.group_key is not None
+        window = self.state.multisource_windows[batch.group_key]
+        if (
+            window.active_batch_id != batch.batch_id
+            or window.committed_time != batch.start
+            or batch.status is not BatchStatus.SKIPPING
+        ):
+            batch.status = BatchStatus.FAILED
+            batch.finished_at = time.monotonic()
+            if window.active_batch_id == batch.batch_id:
+                window.active_batch_id = None
+            for state_key in batch.source_state_keys:
+                state = self.state.sources[state_key]
+                if state.active_batch_id == batch.batch_id:
+                    state.active_batch_id = None
+            return
+        window.committed_time = (
+            batch.end if isinstance(batch.end, datetime) else window.committed_time
+        )
+        window.active_batch_id = None
+        for state_key, end_offset in batch.partition_commits.items():
+            state = self.state.sources[state_key]
+            state.committed = end_offset
+            state.backlog = max(0, int(state.observed) - end_offset)
+            state.active_batch_id = None
+        for state_key in batch.source_state_keys:
+            state = self.state.sources[state_key]
+            if state.active_batch_id == batch.batch_id:
+                state.active_batch_id = None
+        batch.status = BatchStatus.FAILED
+        batch.finished_at = time.monotonic()
+        self._release_batch_refs(batch)
+        self._emit_event(
+            EVENT_BATCH_SKIPPED,
+            self._batch_event_payload(
+                batch,
+                progress_key=self._mswin_checkpoint_key(batch.group_key),
+            ),
+        )
 
     @staticmethod
-    def _request_summary(request: DispatchRequest) -> dict[str, Any]:
+    def _request_summary(request: DispatchRequest | HandlerRequest) -> dict[str, Any]:
+        if isinstance(request, HandlerRequest):
+            return {
+                "dispatch_id": request.dispatch_id,
+                "handler_id": request.handler_id,
+                "output": None if request.output is None else dict(request.output),
+            }
         return {
             "dispatch_id": request.dispatch_id,
             "worker_name": request.worker_name,
@@ -1077,62 +2296,108 @@ class RayDispatcher:
                     "primary_key": request.end_cursor.primary_key,
                 }
             ),
-            "output_connection_id": request.output_connection_id,
-            "output_target": request.output_target,
-            "output_format": request.output_format,
             "source_connection_id": request.source_connection_id,
             "topic": request.topic,
             "table": request.table,
+            "window_start": (
+                None
+                if request.window_start is None
+                else request.window_start.isoformat()
+            ),
+            "window_end": (
+                None if request.window_end is None else request.window_end.isoformat()
+            ),
+            "source_ids": list(request.source_ids),
         }
 
-    async def _skip_failed_batch(self, batch: BatchRun) -> None:
-        """Mark the batch failed, advance past its range, and unblock the source."""
-
-        source_state = self.state.sources[batch.source_state_key]
-        if source_state.active_batch_id != batch.batch_id:
-            batch.status = BatchStatus.FAILED
-            batch.finished_at = time.monotonic()
-            return
-        if source_state.committed != batch.start:
-            batch.status = BatchStatus.FAILED
-            batch.finished_at = time.monotonic()
-            source_state.active_batch_id = None
-            return
-        await self._io(self.checkpoint_store.save(source_state.key, batch.end))
-        source_state.committed = batch.end
-        source_state.backlog = max(0, source_state.backlog - batch.item_count)
-        source_state.active_batch_id = None
-        batch.status = BatchStatus.FAILED
-        batch.finished_at = time.monotonic()
-        for run_id in [*batch.fetch_run_ids, *batch.run_ids]:
-            run = self.state.runs[run_id]
-            run.ref = None
-            run.data_ref = None
-
-    async def retry_failed_batch(self, batch_id: str) -> list[str]:
-        """No-op: permanent failures are recorded then skipped to unblock the source.
-
-        Kept for API compatibility. Reprocess via FailureStore payload/range
-        data (rewind checkpoint manually if needed); this method does not resubmit.
-        """
-
-        return []
-
     async def start(self) -> None:
-        """Start the listener, trigger and status loops."""
+        """Preload resources, then start periodic dispatcher loops."""
 
         if self._tasks:
             return
+        await self.resource_loader.preload()
         self._stopping.clear()
-        loops = (
+        loops: list[tuple[str, Callable[[], Any], float]] = [
             ("data_listener", self.data_listener, self.listener_interval),
             ("ray_trigger", self.ray_trigger, self.trigger_interval),
             ("ray_status", self.ray_status, self.status_interval),
-        )
+        ]
+        if self.event_log_interval > 0:
+            loops.append(
+                ("event_log", self.event_log_tick, self.event_log_interval)
+            )
+        if self.reload_interval > 0:
+            loops.append(
+                ("workers_reload", self.reload_workers, self.reload_interval)
+            )
         self._tasks = [
             asyncio.create_task(self._periodic(name, callback, interval), name=name)
             for name, callback, interval in loops
         ]
+
+    async def event_log_tick(self) -> None:
+        """Emit a periodic operational snapshot through the event log."""
+
+        self._emit_event(EVENT_SNAPSHOT, await self.snapshot())
+
+    async def reload_workers(self) -> bool:
+        """Rescan the workers directory and swap config when safe.
+
+        Returns True when a new configuration was installed.
+        """
+
+        if self._workers_dir is None:
+            return False
+        from ray_dispatcher.discovery import discover_workers
+
+        workers, merged_sources, merged_resources = discover_workers(
+            self._workers_dir,
+            ray_module=getattr(self.ray_backend, "ray", None),
+            source_registry=self._injected_source_registry,
+            resource_registry=self._injected_resource_registry,
+        )
+        worker_map = {worker.name: worker for worker in workers}
+        fingerprint = self._fingerprint_config(
+            worker_map,
+            merged_sources,
+            merged_resources,
+            workers_dir=self._workers_dir,
+        )
+        if fingerprint == self._config_fingerprint:
+            return False
+
+        async with self._lock:
+            if self._has_inflight_work():
+                return False
+
+        new_loader = ResourceLoader(merged_resources)
+        try:
+            await new_loader.preload()
+        except Exception as exc:
+            self.state.loop_errors.append(
+                f"workers_reload:preload:{type(exc).__name__}: {exc}"
+            )
+            return False
+
+        async with self._lock:
+            if self._has_inflight_work():
+                return False
+            if fingerprint == self._config_fingerprint:
+                return False
+            old_names = set(self.workers)
+            self._install_worker_groups(tuple(workers))
+            self.source_registry = merged_sources
+            self.resource_registry = merged_resources
+            self.resource_loader = new_loader
+            if hasattr(self.ray_backend, "resource_loader"):
+                self.ray_backend.resource_loader = new_loader
+            self._sync_multisource_windows()
+            self._config_fingerprint = fingerprint
+            drop = getattr(self.ray_backend, "drop_actor", None)
+            if callable(drop):
+                for name in old_names | set(self.workers):
+                    drop(name)
+            return True
 
     async def __aenter__(self) -> "RayDispatcher":
         await self.start()
@@ -1174,14 +2439,13 @@ class RayDispatcher:
             if inspect.isawaitable(result):
                 await result
 
-    def snapshot(self) -> dict[str, Any]:
-        """Return a JSON-friendly operational snapshot (refs are represented)."""
+    def _build_snapshot(self) -> dict[str, Any]:
+        """Build a JSON-friendly operational snapshot (caller must hold lock)."""
 
         return {
             "sources": {
                 key: {
                     "handler": state.worker_name,
-                    "shared_source_group": state.shared_source_group,
                     "source": state.source_id,
                     "kind": state.kind.value,
                     "shard": state.shard,
@@ -1200,7 +2464,6 @@ class RayDispatcher:
                     "status": batch.status.value,
                     "handler": batch.worker_name,
                     "handlers": list(batch.worker_names),
-                    "shared_source_group": batch.shared_source_group,
                     "item_count": batch.item_count,
                     "fetch_run_ids": list(batch.fetch_run_ids),
                     "run_ids": list(batch.run_ids),
@@ -1214,12 +2477,23 @@ class RayDispatcher:
                     "attempt": run.attempt,
                     "ref": repr(run.ref),
                     "error": run.error,
-                    "output_connection": run.request.output_connection_id,
-                    "output_target": run.request.output_target,
-                    "output_format": run.request.output_format,
-                    "source_connection": run.request.source_connection_id,
-                    "topic": run.request.topic,
-                    "table": run.request.table,
+                    **(
+                        {
+                            "handler_id": run.request.handler_id,
+                            "output": (
+                                None
+                                if run.request.output is None
+                                else dict(run.request.output)
+                            ),
+                        }
+                        if isinstance(run.request, HandlerRequest)
+                        else {
+                            "output": None,
+                            "source_connection": run.request.source_connection_id,
+                            "topic": run.request.topic,
+                            "table": run.request.table,
+                        }
+                    ),
                 }
                 for key, run in self.state.runs.items()
             },
@@ -1228,3 +2502,9 @@ class RayDispatcher:
                 "store": type(self.failure_store).__name__,
             },
         }
+
+    async def snapshot(self) -> dict[str, Any]:
+        """Return a lock-consistent JSON-friendly operational snapshot."""
+
+        async with self._lock:
+            return self._build_snapshot()

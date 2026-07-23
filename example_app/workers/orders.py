@@ -1,10 +1,7 @@
-"""Two independently scheduled handlers reading one logical input source."""
+"""Two thin handlers that auto-share one colocated Kafka source."""
 
 from __future__ import annotations
 
-import csv
-import io
-import json
 import os
 from pathlib import Path
 from typing import Any
@@ -17,80 +14,55 @@ OUTPUT_ROOT = Path(
     )
 )
 
+SOURCES = {
+    "demo-orders": {
+        "kind": "kafka",
+        "connection_id": "demo-kafka",
+        "brokers": ["demo-kafka:9092"],
+        "topic": "orders",
+        "initial_offset": "earliest",
+    }
+}
+
+# static is for small inline config only; large dims use file (or a future DB snapshot kind).
+RESOURCES = {
+    "user-dim-v1": {
+        "kind": "static",
+        "data": {offset: {"name": f"user-{offset}"} for offset in range(100)},
+    }
+}
 
 HANDLERS = [
     {
-        "name": "orders_to_jsonl",
-        "handler_id": "orders:orders_to_jsonl",
+        # Binding
         "entrypoint": "orders_to_jsonl",
-        "sources": [
-            {
-                "kind": "kafka",
-                "source_id": "demo-orders",
-                "connection_id": "demo-kafka",
-                "brokers": ["demo-kafka:9092"],
-                "topic": "orders",
-                "initial_offset": "earliest",
-            }
-        ],
+        "sources": ["demo-orders"],
+        "resources": ["user-dim-v1"],
+        # Write-side passthrough (opaque to the dispatcher)
         "output": {
-            "connection_id": "local-jsonl",
-            "target": str(OUTPUT_ROOT / "jsonl"),
-            "output_format": "jsonl",
-            "max_parallelism": 3,
+            "path": str(OUTPUT_ROOT / "jsonl"),
         },
+        # Scheduling knobs (explicit for discoverability)
         "batch_size": 10,
-        "max_parallelism": 3,
         "cpus_per_task": 1,
-        "shared_source_group": "orders-fanout",
-        "data_fetcher": "fetch_orders",
-        "fetcher_id": "orders-range-reader-v1",
+        "max_retries": 2,
+        "priority": 0,
     },
     {
-        "name": "orders_to_csv",
-        "handler_id": "orders:orders_to_csv",
+        # Binding
         "entrypoint": "orders_to_csv",
-        "sources": [
-            {
-                "kind": "kafka",
-                "source_id": "demo-orders",
-                "connection_id": "demo-kafka",
-                "brokers": ["demo-kafka:9092"],
-                "topic": "orders",
-                "initial_offset": "earliest",
-            }
-        ],
+        "sources": ["demo-orders"],
+        # Write-side passthrough
         "output": {
-            "connection_id": "local-csv",
-            "target": str(OUTPUT_ROOT / "csv"),
-            "output_format": "csv",
-            "max_parallelism": 2,
+            "path": str(OUTPUT_ROOT / "csv"),
         },
+        # Scheduling knobs
         "batch_size": 5,
-        "max_parallelism": 4,
         "cpus_per_task": 1,
-        "shared_source_group": "orders-fanout",
-        "data_fetcher": "fetch_orders",
-        "fetcher_id": "orders-range-reader-v1",
+        "max_retries": 2,
+        "priority": 0,
     },
 ]
-
-
-def fetch_orders(request: Any) -> list[dict[str, Any]]:
-    """Demo range reader; a real deployment consumes Kafka here once."""
-
-    if request.start_offset is None or request.end_offset is None:
-        raise ValueError("this example expects a Kafka offset request")
-    return [
-        {
-            "order_id": offset,
-            "topic": request.topic,
-            "partition": request.partition,
-            "amount": round(10.0 + offset * 1.25, 2),
-            "dispatch_id": request.dispatch_id,
-        }
-        for offset in range(request.start_offset, request.end_offset)
-    ]
 
 
 def _atomic_write(target: Path, content: str) -> None:
@@ -101,34 +73,53 @@ def _atomic_write(target: Path, content: str) -> None:
 
 
 def orders_to_jsonl(
-    request: Any, records: list[dict[str, Any]]
+    request: Any,
+    records: list[dict[str, Any]],
+    resources: dict[str, Any],
 ) -> dict[str, Any]:
-    output_dir = Path(request.output_target)
+    # Imports stay inside the function so drop-in workers survive Ray serialization.
+    import json
+    from pathlib import Path
+
+    user_dim = resources.get("user-dim-v1") or {}
+    enriched: list[dict[str, Any]] = []
+    for row in records:
+        item = dict(row)
+        user_id = item.get("user_id")
+        if user_id in user_dim:
+            item["user"] = user_dim[user_id]
+        enriched.append(item)
+
+    output_dir = Path(request.output["path"])
     target = output_dir / f"{request.dispatch_id}.jsonl"
-    content = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in records)
+    content = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in enriched)
     _atomic_write(target, content)
     return {
         "handler": request.handler_id,
-        "processed": len(records),
-        "output": str(target),
+        "count": len(enriched),
+        "path": str(target),
     }
 
 
-def orders_to_csv(
-    request: Any, records: list[dict[str, Any]]
-) -> dict[str, Any]:
-    output_dir = Path(request.output_target)
+def orders_to_csv(request: Any, records: list[dict[str, Any]]) -> dict[str, Any]:
+    import csv
+    import io
+    from pathlib import Path
+
+    output_dir = Path(request.output["path"])
     target = output_dir / f"{request.dispatch_id}.csv"
     buffer = io.StringIO()
     writer = csv.DictWriter(
         buffer,
-        fieldnames=("order_id", "topic", "partition", "amount", "dispatch_id"),
+        fieldnames=["order_id", "user_id", "amount"],
+        extrasaction="ignore",
     )
     writer.writeheader()
-    writer.writerows(records)
+    for row in records:
+        writer.writerow(row)
     _atomic_write(target, buffer.getvalue())
     return {
         "handler": request.handler_id,
-        "processed": len(records),
-        "output": str(target),
+        "count": len(records),
+        "path": str(target),
     }

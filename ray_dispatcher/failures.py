@@ -8,9 +8,25 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Protocol, Sequence
 
 from ray_dispatcher.models import FailureRecord, FailureRunDetail, PostgresCursor
+
+
+class FailureStore(Protocol):
+    """永久失败（毒区间）落盘接口。"""
+
+    async def save_failure(self, record: FailureRecord) -> None:
+        """写入跳过批次的区间元信息，并尽量附带可物化的 fetch payload。"""
+        ...
+
+    async def get_failure(self, failure_id: str) -> FailureRecord | None:
+        """按 failure_id 查询单条失败记录。"""
+        ...
+
+    async def list_failures(self, *, limit: int = 100) -> Sequence[FailureRecord]:
+        """列出最近的失败记录，供排查或事后重读。"""
+        ...
 
 
 class MemoryFailureStore:
@@ -90,7 +106,6 @@ class SQLiteFailureStore:
             "failure_id": record.failure_id,
             "batch_id": record.batch_id,
             "source_state_key": record.source_state_key,
-            "shared_source_group": record.shared_source_group,
             "start": self._serialize_bound(record.start),
             "end": self._serialize_bound(record.end),
             "item_count": record.item_count,
@@ -137,7 +152,6 @@ class SQLiteFailureStore:
             failure_id=str(body["failure_id"]),
             batch_id=str(body["batch_id"]),
             source_state_key=str(body["source_state_key"]),
-            shared_source_group=body.get("shared_source_group"),
             start=self._deserialize_bound(body["start"]),
             end=self._deserialize_bound(body["end"]),
             item_count=int(body["item_count"]),
@@ -209,4 +223,4 @@ class SQLiteFailureStore:
         return await asyncio.to_thread(self._list_sync, limit)
 
 
-__all__ = ["MemoryFailureStore", "SQLiteFailureStore"]
+__all__ = ["FailureStore", "MemoryFailureStore", "SQLiteFailureStore"]

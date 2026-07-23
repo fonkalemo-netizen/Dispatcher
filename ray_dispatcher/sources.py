@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import re
+import threading
+from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from ray_dispatcher.models import KafkaSource, PostgresCursor, PostgresSource
@@ -25,7 +27,7 @@ class EmptyPostgresSource(RuntimeError):
 class SourceObserver:
     """Fixed watermark observer / range planner used by RayDispatcher.
 
-    Not a payload reader: handlers and ``data_fetcher`` still perform record I/O.
+    Not a payload reader: ``PayloadReader`` performs record I/O.
     This observer only answers "how far has the source progressed?" and optionally
     plans Postgres task slices. It is not a user-facing extension point.
     """
@@ -41,6 +43,7 @@ class SourceObserver:
         self.postgres_timeout = postgres_timeout
         self.postgres_pool_size = postgres_pool_size
         self._kafka_consumers: dict[tuple[Any, ...], Any] = {}
+        self._kafka_lock = threading.RLock()
         self._postgres_pools: dict[str, Any] = {}
 
     async def kafka_watermarks(
@@ -52,42 +55,147 @@ class SourceObserver:
 
     def _kafka_watermarks_sync(self, source: KafkaSource) -> dict[int, tuple[int, int]]:
         try:
-            from confluent_kafka import Consumer, KafkaException, TopicPartition
+            from confluent_kafka import KafkaException, TopicPartition
         except ImportError as exc:
             raise SourceDependencyError(
                 "Kafka observation requires: pip install confluent-kafka"
             ) from exc
 
+        with self._kafka_lock:
+            consumer = self._kafka_consumer(source)
+            metadata = consumer.list_topics(source.topic, timeout=self.kafka_timeout)
+            topic_metadata = metadata.topics.get(source.topic)
+            if topic_metadata is None:
+                raise RuntimeError(f"Kafka topic not found: {source.topic}")
+            if topic_metadata.error is not None:
+                raise KafkaException(topic_metadata.error)
+
+            result: dict[int, tuple[int, int]] = {}
+            for partition in sorted(topic_metadata.partitions):
+                low, high = consumer.get_watermark_offsets(
+                    TopicPartition(source.topic, partition),
+                    timeout=self.kafka_timeout,
+                    cached=False,
+                )
+                result[int(partition)] = (int(low), int(high))
+            return result
+
+    async def kafka_event_time_highs(
+        self,
+        source: KafkaSource,
+        watermarks: Mapping[int, tuple[int, int]] | None = None,
+    ) -> Mapping[int, datetime]:
+        """Return the record timestamp at ``high-1`` for each non-empty partition."""
+
+        return await asyncio.to_thread(
+            self._kafka_event_time_highs_sync, source, watermarks
+        )
+
+    def _kafka_event_time_highs_sync(
+        self,
+        source: KafkaSource,
+        watermarks: Mapping[int, tuple[int, int]] | None,
+    ) -> dict[int, datetime]:
+        try:
+            from confluent_kafka import KafkaError, TopicPartition
+        except ImportError as exc:
+            raise SourceDependencyError(
+                "Kafka observation requires: pip install confluent-kafka"
+            ) from exc
+
+        if watermarks is None:
+            watermarks = self._kafka_watermarks_sync(source)
+        with self._kafka_lock:
+            consumer = self._kafka_consumer(source)
+            result: dict[int, datetime] = {}
+            for partition, (low, high) in watermarks.items():
+                if high <= low:
+                    continue
+                consumer.assign([TopicPartition(source.topic, partition, high - 1)])
+                message = consumer.poll(self.kafka_timeout)
+                if message is None:
+                    raise TimeoutError(
+                        f"timed out reading event-time high for "
+                        f"{source.topic}/{partition} at offset {high - 1}"
+                    )
+                if message.error():
+                    if message.error().code() == KafkaError._PARTITION_EOF:
+                        continue
+                    raise RuntimeError(message.error())
+                _ts_type, ts_value = message.timestamp()
+                if ts_value < 0:
+                    raise RuntimeError(
+                        f"missing Kafka timestamp for {source.topic}/{partition}"
+                    )
+                result[int(partition)] = datetime.fromtimestamp(
+                    ts_value / 1000.0, tz=timezone.utc
+                )
+            return result
+
+    async def kafka_offsets_for_times(
+        self,
+        source: KafkaSource,
+        timestamps: Mapping[int, datetime],
+    ) -> Mapping[int, int]:
+        """Map event-times to the earliest offset at or after each timestamp."""
+
+        return await asyncio.to_thread(
+            self._kafka_offsets_for_times_sync, source, timestamps
+        )
+
+    def _kafka_offsets_for_times_sync(
+        self,
+        source: KafkaSource,
+        timestamps: Mapping[int, datetime],
+    ) -> dict[int, int]:
+        try:
+            from confluent_kafka import TopicPartition
+        except ImportError as exc:
+            raise SourceDependencyError(
+                "Kafka observation requires: pip install confluent-kafka"
+            ) from exc
+
+        query = []
+        for partition, moment in timestamps.items():
+            if moment.tzinfo is None:
+                raise ValueError("offsets_for_times requires timezone-aware datetimes")
+            millis = int(moment.timestamp() * 1000)
+            query.append(TopicPartition(source.topic, int(partition), millis))
+        with self._kafka_lock:
+            consumer = self._kafka_consumer(source)
+            answered = consumer.offsets_for_times(query, timeout=self.kafka_timeout)
+            result: dict[int, int] = {}
+            for item in answered:
+                if item is None or item.offset is None or item.offset < 0:
+                    # No message at/after timestamp: treat as high watermark later.
+                    continue
+                result[int(item.partition)] = int(item.offset)
+            return result
+
+    def _kafka_consumer(self, source: KafkaSource) -> Any:
+        """Return a shared metadata consumer. Caller must hold ``_kafka_lock``."""
+
         brokers = tuple(source.brokers)
         connection_key = (source.connection_id, *sorted(brokers))
         consumer = self._kafka_consumers.get(connection_key)
-        if consumer is None:
-            consumer = Consumer(
-                {
-                    "bootstrap.servers": ",".join(brokers),
-                    "group.id": "ray-dispatcher-metadata",
-                    "enable.auto.commit": False,
-                    "allow.auto.create.topics": False,
-                }
-            )
-            self._kafka_consumers[connection_key] = consumer
-
-        metadata = consumer.list_topics(source.topic, timeout=self.kafka_timeout)
-        topic_metadata = metadata.topics.get(source.topic)
-        if topic_metadata is None:
-            raise RuntimeError(f"Kafka topic not found: {source.topic}")
-        if topic_metadata.error is not None:
-            raise KafkaException(topic_metadata.error)
-
-        result: dict[int, tuple[int, int]] = {}
-        for partition in sorted(topic_metadata.partitions):
-            low, high = consumer.get_watermark_offsets(
-                TopicPartition(source.topic, partition),
-                timeout=self.kafka_timeout,
-                cached=False,
-            )
-            result[int(partition)] = (int(low), int(high))
-        return result
+        if consumer is not None:
+            return consumer
+        try:
+            from confluent_kafka import Consumer
+        except ImportError as exc:
+            raise SourceDependencyError(
+                "Kafka observation requires: pip install confluent-kafka"
+            ) from exc
+        consumer = Consumer(
+            {
+                "bootstrap.servers": ",".join(brokers),
+                "group.id": "ray-dispatcher-metadata",
+                "enable.auto.commit": False,
+                "allow.auto.create.topics": False,
+            }
+        )
+        self._kafka_consumers[connection_key] = consumer
+        return consumer
 
     async def postgres_high_watermark(self, source: PostgresSource) -> PostgresCursor:
         """Return the largest ``(timestamp, primary_key)`` currently visible."""
@@ -231,8 +339,9 @@ class SourceObserver:
         return pool
 
     async def close(self) -> None:
-        consumers = list(self._kafka_consumers.values())
-        self._kafka_consumers.clear()
+        with self._kafka_lock:
+            consumers = list(self._kafka_consumers.values())
+            self._kafka_consumers.clear()
         for consumer in consumers:
             await asyncio.to_thread(consumer.close)
         pools = list(self._postgres_pools.values())

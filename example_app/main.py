@@ -25,12 +25,13 @@ try:  # noqa: E402
 except ImportError:  # The complete demo can still run through its local fallback.
     ray = None
 
+from demo_reader import DemoPayloadReader  # noqa: E402
 from demo_source import DemoSourceObserver  # noqa: E402
 from local_backend import LocalThreadBackend  # noqa: E402
 from ray_dispatcher import (  # noqa: E402
+    DispatcherConfig,
     NativeRayBackend,
     RayDispatcher,
-    SchedulingPolicy,
     SQLiteCheckpointStore,
     SQLiteFailureStore,
 )
@@ -70,6 +71,7 @@ async def main() -> None:
     # Reset only so every demo invocation deterministically processes 25 rows.
     # A production process must keep this file across restarts.
     clear_previous_demo_state()
+    payload_reader = DemoPayloadReader()
     local_backend = None
     if ray is not None:
         try:
@@ -86,10 +88,14 @@ async def main() -> None:
                 raise
             ray.shutdown()
             print(f"Ray unavailable ({type(exc).__name__}: {exc}); using thread fallback")
-            local_backend = LocalThreadBackend(max_workers=4)
+            local_backend = LocalThreadBackend(
+                max_workers=4, payload_reader=payload_reader
+            )
             backend = local_backend
     else:
-        local_backend = LocalThreadBackend(max_workers=4)
+        local_backend = LocalThreadBackend(
+            max_workers=4, payload_reader=payload_reader
+        )
         backend = local_backend
         print("Ray is not installed; using thread fallback")
 
@@ -103,10 +109,11 @@ async def main() -> None:
         failure_store=SQLiteFailureStore(
             EXAMPLE_ROOT / "demo_state/failures.sqlite3"
         ),
-        policy=SchedulingPolicy(max_in_flight=8),
+        config=DispatcherConfig(max_in_flight=8),
         listener_interval=0.1,
         trigger_interval=0.05,
         status_interval=0.05,
+        payload_reader=payload_reader,
     )
     dispatcher.source_observer = source_observer
 
@@ -124,7 +131,7 @@ async def main() -> None:
         "shared source fetches: "
         f"{sum(run.kind == 'fetch' for run in dispatcher.state.runs.values())}"
     )
-    print(json.dumps(dispatcher.snapshot(), indent=2, ensure_ascii=False))
+    print(json.dumps(await dispatcher.snapshot(), indent=2, ensure_ascii=False))
     print(f"JSONL files: {len(list((EXAMPLE_ROOT / 'demo_output/jsonl').glob('*.jsonl')))}")
     print(f"CSV files: {len(list((EXAMPLE_ROOT / 'demo_output/csv').glob('*.csv')))}")
 

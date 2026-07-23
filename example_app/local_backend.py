@@ -5,12 +5,29 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Mapping
 
-from ray_dispatcher import DispatchRequest, ExecutionResult, HandlerSpec
+from ray_dispatcher import (
+    DispatchRequest,
+    ExecutionResult,
+    HandlerRequest,
+    HandlerSpec,
+    SourceSpec,
+)
+from ray_dispatcher.resources import ResourceLoader
 
 
 class LocalThreadBackend:
-    def __init__(self, max_workers: int = 4) -> None:
+    """无 Ray 时的本地线程后端，方法语义与 ``RayBackend`` 一致。"""
+
+    def __init__(
+        self,
+        max_workers: int = 4,
+        *,
+        payload_reader: Any | None = None,
+        resource_loader: ResourceLoader | None = None,
+    ) -> None:
         self.max_workers = max_workers
+        self.payload_reader = payload_reader
+        self.resource_loader = resource_loader or ResourceLoader()
         self.executor = ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix="ray-dispatcher-demo",
@@ -19,29 +36,45 @@ class LocalThreadBackend:
     def submit(
         self,
         handler: HandlerSpec,
-        request: DispatchRequest,
+        request: HandlerRequest,
         data_ref: Future[Any] | None = None,
     ) -> Future[Any]:
+        """提交业务 Handler：``request`` → ``records`` → ``resources?``。"""
+
         if handler.mode.value != "task":
             raise RuntimeError("the demo fallback supports task handlers only")
-        if data_ref is not None:
-            def invoke_shared() -> Any:
-                return handler.worker(request, data_ref.result())
+        if data_ref is None:
+            raise ValueError("handlers require a fetched data_ref")
 
-            return self.executor.submit(invoke_shared)
-        args, kwargs = handler.args_builder(request) if handler.args_builder else ((request,), {})
-        return self.executor.submit(handler.worker, *args, **kwargs)
+        def invoke() -> Any:
+            records = data_ref.result()
+            if handler.resource_ids:
+                resources = self.resource_loader.load_many(handler.resource_ids)
+                return handler.worker(request, records, resources)
+            return handler.worker(request, records)
+
+        return self.executor.submit(invoke)
 
     def submit_fetch(
-        self, handler: HandlerSpec, request: DispatchRequest
+        self,
+        handler: HandlerSpec,
+        request: DispatchRequest,
+        source: SourceSpec,
+        *,
+        fetch_cpus: float = 0.25,
     ) -> Future[Any]:
-        if handler.data_fetcher is None:
-            raise ValueError(f"handler {handler.name!r} has no data_fetcher")
-        return self.executor.submit(handler.data_fetcher, request)
+        """提交读数任务：按区间从源拉取 records。"""
+
+        if self.payload_reader is None:
+            raise RuntimeError("payload_reader is not configured on LocalThreadBackend")
+        del fetch_cpus  # thread backend does not enforce Ray CPU quotas
+        return self.executor.submit(self.payload_reader.fetch, request, source)
 
     def poll(
         self, refs: Mapping[str, Future[Any]]
     ) -> Mapping[str, ExecutionResult]:
+        """非阻塞检查 Future；只返回已完成项。"""
+
         outcomes: dict[str, ExecutionResult] = {}
         for run_id, future in refs.items():
             if not future.done():
@@ -56,9 +89,13 @@ class LocalThreadBackend:
         return outcomes
 
     def available_cpus(self) -> float:
+        """本地线程池规模，用作可用 CPU 近似。"""
+
         return float(self.max_workers)
 
     async def get(self, ref: Future[Any]) -> Any:
+        """物化 Future 结果。"""
+
         return ref.result()
 
     def close(self) -> None:
