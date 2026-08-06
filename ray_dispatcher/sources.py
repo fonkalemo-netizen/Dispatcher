@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import re
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from ray_dispatcher.models import KafkaSource, PostgresCursor, PostgresSource
@@ -198,7 +198,11 @@ class SourceObserver:
         return consumer
 
     async def postgres_high_watermark(self, source: PostgresSource) -> PostgresCursor:
-        """Return the largest ``(timestamp, primary_key)`` currently visible."""
+        """Return the largest ``(timestamp, primary_key)`` currently visible.
+
+        Naive datetimes from ``timestamp without time zone`` columns are
+        normalized to UTC by :class:`PostgresCursor`.
+        """
 
         pool = await self._postgres_pool(source.dsn)
         table = _quote_qualified_identifier(source.table)
@@ -219,6 +223,140 @@ class SourceObserver:
             return source.initial_cursor
         return PostgresCursor(row["cursor_timestamp"], row["cursor_primary_key"])
 
+    async def postgres_event_watermark(self, source: PostgresSource) -> datetime:
+        """Closed watermark ``W = now(UTC) - watermark_lag_seconds``."""
+
+        pool = await self._postgres_pool(source.dsn)
+        value = await pool.fetchval(
+            "SELECT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')",
+            timeout=self.postgres_timeout,
+        )
+        if isinstance(value, datetime):
+            now = (
+                value.replace(tzinfo=timezone.utc)
+                if value.tzinfo is None
+                else value.astimezone(timezone.utc)
+            )
+        else:
+            now = datetime.now(timezone.utc)
+        return now - timedelta(seconds=source.watermark_lag_seconds)
+
+    async def postgres_min_time(
+        self,
+        source: PostgresSource,
+        start_exclusive: datetime,
+        end_inclusive: datetime,
+    ) -> datetime | None:
+        """Earliest ``ts`` in ``(start, end]``; ``None`` when the range is empty."""
+
+        pool = await self._postgres_pool(source.dsn)
+        table = _quote_qualified_identifier(source.table)
+        timestamp_column = _quote_identifier(source.timestamp_column)
+        sql = (
+            f"SELECT min({timestamp_column}) FROM {table} "
+            f"WHERE {timestamp_column} > $1 AND {timestamp_column} <= $2"
+        )
+        value = await pool.fetchval(
+            sql,
+            _pg_timestamp_param(start_exclusive),
+            _pg_timestamp_param(end_inclusive),
+            timeout=self.postgres_timeout,
+        )
+        if value is None:
+            return None
+        if not isinstance(value, datetime):
+            raise TypeError(
+                f"min({source.timestamp_column}) must be datetime, got {type(value).__name__}"
+            )
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    async def postgres_count_time(
+        self,
+        source: PostgresSource,
+        start_exclusive: datetime,
+        end_inclusive: datetime,
+    ) -> int:
+        """Count rows in ``start < ts <= end`` (time-only, no ORDER BY)."""
+
+        pool = await self._postgres_pool(source.dsn)
+        table = _quote_qualified_identifier(source.table)
+        timestamp_column = _quote_identifier(source.timestamp_column)
+        sql = (
+            f"SELECT count(*) FROM {table} "
+            f"WHERE {timestamp_column} > $1 AND {timestamp_column} <= $2"
+        )
+        count = await pool.fetchval(
+            sql,
+            _pg_timestamp_param(start_exclusive),
+            _pg_timestamp_param(end_inclusive),
+            timeout=self.postgres_timeout,
+        )
+        return int(count or 0)
+
+    async def postgres_plan_event_window(
+        self,
+        source: PostgresSource,
+        committed: datetime,
+        watermark: datetime,
+    ) -> tuple[datetime, datetime, int, bool]:
+        """Plan one event-time window ``(L, R]`` under row/time caps.
+
+        Returns ``(L, R, count, over_capacity)``. When there is no row in
+        ``(committed, watermark]``, returns an idle jump to ``watermark`` with
+        ``count=0``. Otherwise aligns ``L`` to ``pred(min_ts)`` across gaps,
+        caps ``R`` by ``max_window_seconds``, and binary-shrinks the right bound
+        until ``count <= max_rows`` or the span reaches ``min_window_seconds``.
+        """
+
+        if watermark <= committed:
+            return (committed, watermark, 0, False)
+
+        first = await self.postgres_min_time(source, committed, watermark)
+        if first is None:
+            return (committed, watermark, 0, False)
+
+        left = committed
+        predecessor = first - timedelta(microseconds=1)
+        if predecessor > left:
+            left = predecessor
+
+        right0 = min(
+            watermark,
+            left + timedelta(seconds=source.max_window_seconds),
+        )
+        if right0 <= left:
+            return (left, right0, 0, False)
+
+        count = await self.postgres_count_time(source, left, right0)
+        if count <= source.max_rows:
+            return (left, right0, count, False)
+
+        min_right = left + timedelta(seconds=source.min_window_seconds)
+        if min_right >= right0:
+            return (left, right0, count, True)
+
+        count_at_min = await self.postgres_count_time(source, left, min_right)
+        if count_at_min > source.max_rows:
+            return (left, min_right, count_at_min, True)
+
+        # Largest R in [min_right, right0] with count <= max_rows.
+        lo = min_right
+        hi = right0
+        best_right = min_right
+        best_count = count_at_min
+        while (hi - lo).total_seconds() > 1e-6:
+            mid = lo + (hi - lo) / 2
+            mid_count = await self.postgres_count_time(source, left, mid)
+            if mid_count <= source.max_rows:
+                best_right = mid
+                best_count = mid_count
+                lo = mid
+            else:
+                hi = mid
+        return (left, best_right, best_count, False)
+
     async def postgres_count(
         self,
         source: PostgresSource,
@@ -233,14 +371,13 @@ class SourceObserver:
         primary_key_column = _quote_identifier(source.primary_key_column)
         sql = (
             f"SELECT count(*) FROM {table} "
-            f"WHERE ({timestamp_column}, {primary_key_column}) > ($1, $2) "
-            f"AND ({timestamp_column}, {primary_key_column}) <= ($3, $4)"
+            f"WHERE {_pg_keyset_between(timestamp_column, primary_key_column)}"
         )
         count = await pool.fetchval(
             sql,
-            start_exclusive.timestamp,
+            _pg_timestamp_param(start_exclusive.timestamp),
             start_exclusive.primary_key,
-            end_inclusive.timestamp,
+            _pg_timestamp_param(end_inclusive.timestamp),
             end_inclusive.primary_key,
             timeout=self.postgres_timeout,
         )
@@ -268,6 +405,7 @@ class SourceObserver:
         timestamp_column = _quote_identifier(source.timestamp_column)
         primary_key_column = _quote_identifier(source.primary_key_column)
         row_limit = max_ranges * batch_size
+        keyset = _pg_keyset_between(timestamp_column, primary_key_column)
         sql = f"""
             WITH windowed AS (
                 SELECT
@@ -277,8 +415,7 @@ class SourceObserver:
                         ORDER BY {timestamp_column}, {primary_key_column}
                     ) AS row_number
                 FROM {table}
-                WHERE ({timestamp_column}, {primary_key_column}) > ($1, $2)
-                  AND ({timestamp_column}, {primary_key_column}) <= ($3, $4)
+                WHERE {keyset}
                 ORDER BY {timestamp_column}, {primary_key_column}
                 LIMIT $5
             ), last_row AS (
@@ -295,9 +432,9 @@ class SourceObserver:
         """
         rows = await pool.fetch(
             sql,
-            start_exclusive.timestamp,
+            _pg_timestamp_param(start_exclusive.timestamp),
             start_exclusive.primary_key,
-            end_inclusive.timestamp,
+            _pg_timestamp_param(end_inclusive.timestamp),
             end_inclusive.primary_key,
             row_limit,
             batch_size,
@@ -362,6 +499,47 @@ def _quote_qualified_identifier(value: str) -> str:
     if len(parts) not in (1, 2):
         raise ValueError(f"expected table or schema.table, got {value!r}")
     return ".".join(_quote_identifier(part) for part in parts)
+
+
+def _pg_timestamp_param(value: datetime) -> datetime:
+    """Bind a cursor timestamp to a PostgreSQL ``timestamp`` column.
+
+    :class:`PostgresCursor` stores timezone-aware values (naive DB reads are
+    labeled UTC). asyncpg's ``timestamp without time zone`` codec requires
+    naive datetimes; passing aware values raises
+    ``can't subtract offset-naive and offset-aware datetimes``.
+    """
+
+    if value.tzinfo is None:
+        return value
+    return value.replace(tzinfo=None)
+
+
+def _pg_keyset_between(
+    timestamp_column: str,
+    primary_key_column: str,
+    *,
+    start_ts: str = "$1",
+    start_pk: str = "$2",
+    end_ts: str = "$3",
+    end_pk: str = "$4",
+) -> str:
+    """SQL predicate for ``start < (ts, pk) <= end`` without row constructors.
+
+    Expanded comparisons avoid PostgreSQL planner errors such as
+    ``variable not found in subplan target list`` on some versions.
+    ``primary_key`` may be any PG-ordered type (int, text, uuid, …).
+    """
+
+    return (
+        f"( "
+        f"{timestamp_column} > {start_ts} "
+        f"OR ({timestamp_column} = {start_ts} AND {primary_key_column} > {start_pk})"
+        f" ) AND ( "
+        f"{timestamp_column} < {end_ts} "
+        f"OR ({timestamp_column} = {end_ts} AND {primary_key_column} <= {end_pk})"
+        f" )"
+    )
 
 
 __all__ = [

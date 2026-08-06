@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal, Mapping
 
 from ray_dispatcher.models import (
@@ -95,6 +95,7 @@ def source_from_mapping(raw: Mapping[str, Any]) -> SourceSpec:
             retention_policy=str(raw.get("retention_policy", "error")),
         )
     if kind == "postgres":
+        mode = str(raw.get("mode", "cursor")).lower()
         initial = raw.get("initial_cursor")
         initial_cursor: PostgresCursor | None
         if initial is None or isinstance(initial, PostgresCursor):
@@ -106,13 +107,32 @@ def source_from_mapping(raw: Mapping[str, Any]) -> SourceSpec:
             initial_cursor = PostgresCursor(timestamp, initial["primary_key"])
         else:
             raise TypeError("initial_cursor must be PostgresCursor or mapping")
+        initial_time_raw = raw.get("initial_time")
+        initial_time: datetime | None
+        if initial_time_raw is None or isinstance(initial_time_raw, datetime):
+            initial_time = initial_time_raw
+        elif isinstance(initial_time_raw, str):
+            initial_time = datetime.fromisoformat(
+                initial_time_raw.replace("Z", "+00:00")
+            )
+            if initial_time.tzinfo is None:
+                initial_time = initial_time.replace(tzinfo=timezone.utc)
+        else:
+            raise TypeError("initial_time must be datetime or ISO string")
+        primary_key_column = str(raw.get("primary_key_column", ""))
         return PostgresSource(
             source_id=source_id,
             dsn=str(raw["dsn"]),
             table=str(raw["table"]),
             timestamp_column=str(raw["timestamp_column"]),
-            primary_key_column=str(raw["primary_key_column"]),
+            primary_key_column=primary_key_column,
             initial_cursor=initial_cursor,
+            mode=mode,  # type: ignore[arg-type]
+            watermark_lag_seconds=float(raw.get("watermark_lag_seconds", 60)),
+            max_window_seconds=float(raw.get("max_window_seconds", 300)),
+            min_window_seconds=float(raw.get("min_window_seconds", 60)),
+            max_rows=int(raw.get("max_rows", 100_000)),
+            initial_time=initial_time,
         )
     raise ValueError(f"unsupported source kind: {kind!r}")
 
@@ -250,6 +270,16 @@ def source_canonical_dict(source: SourceSpec) -> dict[str, Any]:
             "timestamp_column": source.timestamp_column,
             "primary_key_column": source.primary_key_column,
             "initial_cursor": initial,
+            "mode": source.mode,
+            "watermark_lag_seconds": source.watermark_lag_seconds,
+            "max_window_seconds": source.max_window_seconds,
+            "min_window_seconds": source.min_window_seconds,
+            "max_rows": source.max_rows,
+            "initial_time": (
+                None
+                if source.initial_time is None
+                else source.initial_time.isoformat()
+            ),
         }
     raise TypeError(f"unsupported source type: {type(source).__name__}")
 

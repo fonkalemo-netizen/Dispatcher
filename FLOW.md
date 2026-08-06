@@ -119,7 +119,7 @@ Kafka metadata Consumer 按 `brokers` 缓存，并用可重入锁串行
 `list_topics` / watermark / `offsets_for_times` 等调用（`asyncio.to_thread` 并发时也不共用
 裸 Consumer）。不同地址可并存；相同物理 topic 每个监听周期只查询一次，再共享 observed 水位。
 
-### Postgres
+### Postgres（`mode=cursor`，默认）
 
 1. 根据 source.dsn 获取/创建 asyncpg Pool；不同 DSN 对应不同 Pool。
 2. 查询：
@@ -146,6 +146,17 @@ shared:{source_id}:{table}
 ```
 
 6. 更新 `observed`、`backlog=count` 和 `arrival_rate`。
+
+### Postgres（`mode=event_time`）
+
+用于不能 `ORDER BY` 的特殊库。进度为 `datetime`（checkpoint 类型 `event_time`）。
+
+1. 水位 `W = now(UTC) - watermark_lag_seconds`（默认 60）。
+2. 基线：checkpoint 或必填的 `initial_time`（禁止静默用 W）。
+3. `T = min(ts) WHERE L < ts <= W`；无行则 checkpoint 跳到 `W`（避免空滚）。
+4. 有空洞时 `L = pred(T)`（`T - 1µs`），再 `R0 = min(W, L + max_window_seconds)`。
+5. `count(L, R0]`；若 `> max_rows` 对右界二分缩到 `<= max_rows` 或 `min_window_seconds`；仍超则 `over_capacity` 告警但仍调度整窗。
+6. Trigger **不**用 `batch_size` 的 min 门闩；一次时间窗 fetch（无 ORDER BY），再按各 Handler 的 `batch_size` 做内存/Ray 分片。
 
 ## 4. ray_trigger
 

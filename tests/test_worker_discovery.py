@@ -844,8 +844,22 @@ class Worker:
         self.assertEqual(end, observed)
         self.assertEqual(3, count)
         self.assertIn('FROM "public"."orders"', captured["watermark_sql"])
+        self.assertIn('"updated_at" > $1', captured["count_sql"])
+        self.assertIn('"updated_at" < $3', captured["count_sql"])
+        self.assertNotIn("($1, $2)", captured["count_sql"])
         self.assertEqual(
-            (start.timestamp, 9, end.timestamp, 14), captured["count_args"]
+            (
+                start.timestamp.replace(tzinfo=None),
+                9,
+                end.timestamp.replace(tzinfo=None),
+                14,
+            ),
+            captured["count_args"],
+        )
+        self.assertIn('"updated_at" > $1', captured["range_sql"])
+        self.assertEqual(
+            start.timestamp.replace(tzinfo=None),
+            captured["range_args"][0],
         )
         self.assertEqual([2, 2, 1], [item_count for _, _, item_count in ranges])
         self.assertEqual(start, ranges[0][0])

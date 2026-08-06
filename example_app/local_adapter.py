@@ -74,6 +74,15 @@ class LocalThreadAdapter:
         del fetch_cpus  # thread adapter does not enforce Ray CPU quotas
         return self.executor.submit(self.payload_reader.fetch, request, source)
 
+    def submit_slice(self, data_ref: Future[Any], start: int, end: int) -> Future[Any]:
+        """Slice a fetch Future into ``records[start:end]``."""
+
+        def slice_fn() -> Any:
+            records = data_ref.result()
+            return list(records[start:end])
+
+        return self.executor.submit(slice_fn)
+
     def poll(
         self, refs: Mapping[str, Future[Any]]
     ) -> Mapping[str, ExecutionResult]:

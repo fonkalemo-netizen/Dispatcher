@@ -36,7 +36,7 @@ class WorkerDiscoveryError(RuntimeError):
 
 
 def discover_workers(
-    directory: str | Path,
+    directory: str | Path | Sequence[str | Path],
     *,
     ray_module: Any | None = None,
     source_registry: SourceRegistry | None = None,
@@ -44,6 +44,7 @@ def discover_workers(
 ) -> tuple[tuple[HandlerSpec, ...], dict[str, SourceSpec], dict[str, ResourceSpec]]:
     """Import ``*.py`` files and build handlers plus merged registries.
 
+    ``directory`` may be one root or a sequence of roots (builtin + plugins).
     Modules are trusted application code and execute during import. Each module
     may export ``HANDLERS`` (a sequence of mappings/specs). Modules without
     ``HANDLERS`` or with an empty list are skipped for handler discovery (they
@@ -59,18 +60,45 @@ def discover_workers(
     optional ``ray.remote`` wrapping.
     """
 
-    root = Path(directory).expanduser().resolve()
-    if not root.is_dir():
-        raise WorkerDiscoveryError(f"worker directory does not exist: {root}")
+    if isinstance(directory, (str, Path)):
+        roots: list[Path] = [Path(directory)]
+    else:
+        roots = [Path(item) for item in directory]
+    return discover_worker_roots(
+        roots,
+        ray_module=ray_module,
+        source_registry=source_registry,
+        resource_registry=resource_registry,
+    )
+
+
+def discover_worker_roots(
+    directories: Sequence[str | Path],
+    *,
+    ray_module: Any | None = None,
+    source_registry: SourceRegistry | None = None,
+    resource_registry: ResourceRegistry | None = None,
+) -> tuple[tuple[HandlerSpec, ...], dict[str, SourceSpec], dict[str, ResourceSpec]]:
+    """Discover and merge workers from multiple directory roots."""
+
+    if not directories:
+        raise WorkerDiscoveryError("at least one worker root is required")
 
     loaded: list[tuple[Path, ModuleType]] = []
-    for path in sorted(root.glob("*.py")):
-        if path.name == "__init__.py" or path.name.startswith("_"):
-            continue
-        loaded.append((path, _load_module(path)))
+    resolved_roots: list[Path] = []
+    for directory in directories:
+        root = Path(directory).expanduser().resolve()
+        if not root.is_dir():
+            raise WorkerDiscoveryError(f"worker directory does not exist: {root}")
+        resolved_roots.append(root)
+        for path in sorted(root.glob("*.py")):
+            if path.name == "__init__.py" or path.name.startswith("_"):
+                continue
+            loaded.append((path, _load_module(path)))
 
     if not loaded:
-        raise WorkerDiscoveryError(f"no worker modules found in {root}")
+        joined = ", ".join(str(root) for root in resolved_roots)
+        raise WorkerDiscoveryError(f"no worker modules found in: {joined}")
 
     merged_sources = _merge_source_registry(
         source_registry,
@@ -103,11 +131,45 @@ def discover_workers(
             workers.append(_remote_wrap(spec, ray_module))
 
     if not workers:
-        raise WorkerDiscoveryError(f"no worker modules found in {root}")
+        joined = ", ".join(str(root) for root in resolved_roots)
+        raise WorkerDiscoveryError(f"no worker modules found in: {joined}")
     names = [worker.name for worker in workers]
     if len(names) != len(set(names)):
         raise WorkerDiscoveryError(f"duplicate worker names discovered: {names}")
     return tuple(workers), merged_sources, merged_resources
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def worker_roots_code_fingerprint(
+    roots: Sequence[Path | None],
+) -> list[tuple[str, str]]:
+    """Stable ``(label, sha256)`` rows for ``*.py`` under each root."""
+
+    rows: list[tuple[str, str]] = []
+    for index, workers_dir in enumerate(roots):
+        if workers_dir is None:
+            continue
+        root = Path(workers_dir)
+        if not root.is_dir():
+            continue
+        label_prefix = f"root{index}"
+        for path in sorted(root.rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            try:
+                digest = file_sha256(path)
+                rel = str(path.relative_to(root))
+            except OSError:
+                continue
+            rows.append((f"{label_prefix}:{rel}", digest))
+    return rows
 
 
 def _load_module(path: Path) -> ModuleType:
@@ -510,4 +572,10 @@ def _remote_wrap(spec: HandlerSpec, ray_module: Any | None) -> HandlerSpec:
     return replace(spec, worker=worker)
 
 
-__all__ = ["WorkerDiscoveryError", "discover_workers"]
+__all__ = [
+    "WorkerDiscoveryError",
+    "discover_worker_roots",
+    "discover_workers",
+    "file_sha256",
+    "worker_roots_code_fingerprint",
+]

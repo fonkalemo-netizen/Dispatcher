@@ -17,6 +17,12 @@ from ray_dispatcher.resources import ResourceLoader
 from ray_dispatcher.readers import merge_fetch_results
 
 
+def take_slice(records: Sequence[Any], start: int, end: int) -> list[Any]:
+    """Return ``records[start:end]`` for Ray / local slice fanout."""
+
+    return list(records[start:end])
+
+
 class RayAdapter(Protocol):
     """Dispatcher 与执行层之间的适配接口（鸭子类型）。"""
 
@@ -55,6 +61,10 @@ class RayAdapter(Protocol):
         fetch_refs: Sequence[Any],
     ) -> Any:
         """把多路 fetch ObjectRef 合并为 ``dict[source_id, records]``。"""
+        ...
+
+    def submit_slice(self, data_ref: Any, start: int, end: int) -> Any:
+        """Return a ref to ``records[start:end]`` without driver-side ``get``."""
         ...
 
     def poll(self, refs: Mapping[str, Any]) -> Any:
@@ -96,6 +106,7 @@ class NativeRayAdapter:
         self._actors_need_restore: set[str] = set()
         self._payload_fetch_remote = payload_fetch_remote
         self._merge_remote = None
+        self._slice_remote = None
         self._resource_loader = resource_loader or ResourceLoader()
         # Task-mode shared puts: resource_ids tuple -> ObjectRef of load_many payload.
         self._resource_put_refs: dict[tuple[str, ...], Any] = {}
@@ -244,6 +255,19 @@ class NativeRayAdapter:
             source_ids, *fetch_refs
         )
 
+    def submit_slice(self, data_ref: Any, start: int, end: int) -> Any:
+        """Slice a fetch ObjectRef into ``records[start:end]`` on a Ray worker."""
+
+        slice_remote = self._slice_remote
+        if slice_remote is None and self.ray is not None:
+            slice_remote = self.ray.remote(max_retries=0)(take_slice)
+            self._slice_remote = slice_remote
+        if slice_remote is None:
+            raise RuntimeError("slice remote is not configured")
+        return slice_remote.options(num_cpus=0.05, max_retries=0).remote(
+            data_ref, start, end
+        )
+
     async def poll(self, refs: Mapping[str, Any]) -> Mapping[str, ExecutionResult]:
         """非阻塞轮询 ObjectRef；只返回已完成项的 ``ExecutionResult``。"""
 
@@ -281,4 +305,4 @@ class NativeRayAdapter:
         return float(self.ray.available_resources().get("CPU", 0.0))
 
 
-__all__ = ["NativeRayAdapter", "RayAdapter"]
+__all__ = ["NativeRayAdapter", "RayAdapter", "take_slice"]

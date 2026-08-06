@@ -51,6 +51,11 @@ class FakeSourceObserver:
         self.event_time_highs: dict[str, dict[int, datetime]] = {}
         # source_id -> partition -> sorted (timestamp, offset) pairs
         self.offsets_for_times: dict[str, dict[int, list[tuple[datetime, int]]]] = {}
+        # event_time postgres: watermark / timestamps / optional rows-per-second density
+        self.pg_event_watermark: dict[str, datetime] = {}
+        self.pg_event_times: dict[str, list[datetime]] = {}
+        self.pg_event_row_rate: dict[str, float] = {}
+        self.pg_plan_calls = 0
 
     async def kafka_watermarks(
         self, source: KafkaSource
@@ -90,6 +95,51 @@ class FakeSourceObserver:
     ) -> int:
         self.pg_count_calls += 1
         return self.pg_count[source.source_id]
+
+    async def postgres_event_watermark(self, source: PostgresSource) -> datetime:
+        return self.pg_event_watermark[source.source_id]
+
+    async def postgres_min_time(
+        self,
+        source: PostgresSource,
+        start_exclusive: datetime,
+        end_inclusive: datetime,
+    ) -> datetime | None:
+        times = [
+            ts
+            for ts in self.pg_event_times.get(source.source_id, [])
+            if start_exclusive < ts <= end_inclusive
+        ]
+        return min(times) if times else None
+
+    async def postgres_count_time(
+        self,
+        source: PostgresSource,
+        start_exclusive: datetime,
+        end_inclusive: datetime,
+    ) -> int:
+        rate = self.pg_event_row_rate.get(source.source_id)
+        if rate is not None:
+            seconds = max(0.0, (end_inclusive - start_exclusive).total_seconds())
+            return int(rate * seconds)
+        return sum(
+            1
+            for ts in self.pg_event_times.get(source.source_id, [])
+            if start_exclusive < ts <= end_inclusive
+        )
+
+    async def postgres_plan_event_window(
+        self,
+        source: PostgresSource,
+        committed: datetime,
+        watermark: datetime,
+    ) -> tuple[datetime, datetime, int, bool]:
+        from ray_dispatcher.sources import SourceObserver
+
+        self.pg_plan_calls += 1
+        # Reuse production planner against this fake's min/count helpers.
+        planner = SourceObserver.__dict__["postgres_plan_event_window"]
+        return await planner(self, source, committed, watermark)
 
 
 class FakeRayAdapter:
@@ -133,6 +183,14 @@ class FakeRayAdapter:
         self.sequence += 1
         ref = f"fetch-ref-{self.sequence}"
         self.fetch_submissions.append((worker, request, source, ref))
+        return ref
+
+    def submit_slice(self, data_ref: Any, start: int, end: int) -> str:
+        self.sequence += 1
+        ref = f"slice-ref-{self.sequence}"
+        records = self.values.get(data_ref, [])
+        self.values[ref] = list(records[start:end])
+        self.data_refs[ref] = (data_ref, start, end)
         return ref
 
     def submit_merge(
@@ -611,6 +669,31 @@ class RayDispatcherTests(unittest.IsolatedAsyncioTestCase):
         backlog = await dispatcher.data_listener()
         self.assertEqual(1, backlog["shared:orders:orders"])
         self.assertEqual(1, client.pg_count_calls)
+
+    async def test_postgres_naive_timestamp_is_treated_as_utc(self) -> None:
+        """asyncpg returns naive datetimes for timestamp-without-time-zone."""
+
+        client = FakeSourceObserver()
+        backend = FakeRayAdapter()
+        naive = datetime(2026, 1, 1, 12, 0, 0)  # no tzinfo
+        start = PostgresCursor(naive, 0)
+        self.assertEqual(timezone.utc, start.timestamp.tzinfo)
+        end = PostgresCursor(datetime(2026, 1, 1, 13, 0, 0), 10)
+        source = PostgresSource(
+            "orders", "dsn", "orders", "updated_at", "id", initial_cursor=start
+        )
+        worker = HandlerSpec("worker", object(), (source,))
+        dispatcher = RayDispatcher((worker,), ray_adapter=backend)
+        dispatcher.source_observer = client
+        client.pg_upper["orders"] = end
+        client.pg_count["orders"] = 3
+
+        backlog = await dispatcher.data_listener()
+        key = "shared:orders:orders"
+        self.assertEqual(3, backlog[key])
+        state = dispatcher.state.sources[key]
+        self.assertIsNotNone(state.observed.timestamp.tzinfo)
+        self.assertEqual(timezone.utc, state.observed.timestamp.tzinfo)
 
     async def test_retention_gap_fails_without_silently_skipping_data(self) -> None:
         client = FakeSourceObserver()
@@ -1702,6 +1785,389 @@ class TriggerDispatcherIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], more)
         self.assertTrue(evaluated)
         self.assertEqual("block", evaluated[0]["decision"])
+
+
+class PostgresEventTimeModeTests(unittest.IsolatedAsyncioTestCase):
+    async def _complete_fetches(
+        self,
+        dispatcher: RayDispatcher,
+        backend: FakeRayAdapter,
+        *,
+        value: Any,
+    ) -> None:
+        pending = [
+            (request, ref)
+            for _, request, _, ref in backend.fetch_submissions
+            if ref not in backend.values and ref not in backend.ready
+        ]
+        for _, ref in pending:
+            backend.finish(ref, value=value)
+        await dispatcher.ray_status()
+
+    async def test_idle_jumps_to_watermark_without_empty_roll(self) -> None:
+        client = FakeSourceObserver()
+        backend = FakeRayAdapter()
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        watermark = t0 + timedelta(minutes=30)
+        source = PostgresSource(
+            "orders",
+            "postgresql://example/db",
+            "orders",
+            "updated_at",
+            mode="event_time",
+            initial_time=t0,
+            max_window_seconds=300,
+        )
+        worker = HandlerSpec("w", object(), (source,), batch_size=10_000)
+        checkpoints = MemoryCheckpointStore()
+        dispatcher = RayDispatcher(
+            (worker,), ray_adapter=backend, checkpoint_store=checkpoints
+        )
+        dispatcher.source_observer = client
+        client.pg_event_watermark["orders"] = watermark
+        client.pg_event_times["orders"] = []
+
+        key = "shared:orders:orders"
+        backlog = await dispatcher.data_listener()
+        self.assertEqual(0, backlog[key])
+        state = dispatcher.state.sources[key]
+        self.assertEqual(watermark, state.committed)
+        self.assertEqual(watermark, state.observed)
+        self.assertEqual([], await dispatcher.ray_trigger())
+        doc = await checkpoints.load(key)
+        assert doc is not None
+        self.assertEqual(watermark, doc.progress)
+
+    async def test_gap_aligns_to_min_ts_not_max_window_roll(self) -> None:
+        client = FakeSourceObserver()
+        backend = FakeRayAdapter()
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        first = t0 + timedelta(hours=2)
+        watermark = t0 + timedelta(hours=3)
+        source = PostgresSource(
+            "orders",
+            "postgresql://example/db",
+            "orders",
+            "updated_at",
+            mode="event_time",
+            initial_time=t0,
+            max_window_seconds=300,
+        )
+        worker = HandlerSpec("w", object(), (source,), batch_size=(1, 10_000))
+        dispatcher = RayDispatcher(
+            (worker,),
+            ray_adapter=backend,
+            checkpoint_store=MemoryCheckpointStore(),
+        )
+        dispatcher.source_observer = client
+        client.pg_event_watermark["orders"] = watermark
+        client.pg_event_times["orders"] = [first, first + timedelta(seconds=1)]
+
+        key = "shared:orders:orders"
+        await dispatcher.data_listener()
+        state = dispatcher.state.sources[key]
+        expected_left = first - timedelta(microseconds=1)
+        self.assertEqual(expected_left, state.committed)
+        self.assertLessEqual(
+            (state.observed - state.committed).total_seconds(), 300.0 + 1e-6
+        )
+        self.assertEqual(2, state.backlog)
+        self.assertNotEqual(t0 + timedelta(seconds=300), state.observed)
+
+    async def test_sparse_uses_max_window_under_max_rows(self) -> None:
+        client = FakeSourceObserver()
+        backend = FakeRayAdapter()
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        watermark = t0 + timedelta(hours=1)
+        source = PostgresSource(
+            "orders",
+            "postgresql://example/db",
+            "orders",
+            "updated_at",
+            mode="event_time",
+            initial_time=t0,
+            max_window_seconds=300,
+            max_rows=100_000,
+        )
+        worker = HandlerSpec("w", object(), (source,), batch_size=10_000)
+        dispatcher = RayDispatcher(
+            (worker,),
+            ray_adapter=backend,
+            checkpoint_store=MemoryCheckpointStore(),
+        )
+        dispatcher.source_observer = client
+        client.pg_event_watermark["orders"] = watermark
+        client.pg_event_times["orders"] = [
+            t0 + timedelta(seconds=1),
+            t0 + timedelta(seconds=2),
+            t0 + timedelta(seconds=3),
+        ]
+
+        key = "shared:orders:orders"
+        await dispatcher.data_listener()
+        state = dispatcher.state.sources[key]
+        self.assertAlmostEqual(300.0, (state.observed - state.committed).total_seconds())
+        self.assertEqual(3, state.backlog)
+        self.assertFalse(state.over_capacity)
+
+    async def test_dense_binary_shrinks_window(self) -> None:
+        client = FakeSourceObserver()
+        backend = FakeRayAdapter()
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        watermark = t0 + timedelta(hours=1)
+        source = PostgresSource(
+            "orders",
+            "postgresql://example/db",
+            "orders",
+            "updated_at",
+            mode="event_time",
+            initial_time=t0,
+            max_window_seconds=300,
+            min_window_seconds=60,
+            max_rows=100_000,
+        )
+        worker = HandlerSpec("w", object(), (source,), batch_size=10_000)
+        dispatcher = RayDispatcher(
+            (worker,),
+            ray_adapter=backend,
+            checkpoint_store=MemoryCheckpointStore(),
+        )
+        dispatcher.source_observer = client
+        client.pg_event_watermark["orders"] = watermark
+        client.pg_event_times["orders"] = [t0 + timedelta(seconds=1)]
+        client.pg_event_row_rate["orders"] = 1_000.0  # 300s → 300k rows
+
+        key = "shared:orders:orders"
+        await dispatcher.data_listener()
+        state = dispatcher.state.sources[key]
+        span = (state.observed - state.committed).total_seconds()
+        self.assertGreaterEqual(span, 60.0 - 1e-6)
+        self.assertLess(span, 300.0)
+        self.assertLessEqual(state.backlog, 100_000)
+        self.assertFalse(state.over_capacity)
+
+    async def test_over_capacity_alerts_and_still_schedules(self) -> None:
+        from ray_dispatcher import EVENT_WINDOW_OVER_CAPACITY, create_event_log
+
+        client = FakeSourceObserver()
+        backend = FakeRayAdapter()
+        events = create_event_log(default_logging=False)
+        alerts: list[Mapping[str, Any]] = []
+        events.register(EVENT_WINDOW_OVER_CAPACITY, alerts.append)
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        watermark = t0 + timedelta(hours=1)
+        source = PostgresSource(
+            "orders",
+            "postgresql://example/db",
+            "orders",
+            "updated_at",
+            mode="event_time",
+            initial_time=t0,
+            max_window_seconds=300,
+            min_window_seconds=60,
+            max_rows=1_000,
+        )
+        worker = HandlerSpec("w", object(), (source,), batch_size=500)
+        dispatcher = RayDispatcher(
+            (worker,),
+            ray_adapter=backend,
+            checkpoint_store=MemoryCheckpointStore(),
+            event_log=events,
+        )
+        dispatcher.source_observer = client
+        client.pg_event_watermark["orders"] = watermark
+        client.pg_event_times["orders"] = [t0 + timedelta(seconds=1)]
+        client.pg_event_row_rate["orders"] = 100.0  # 60s → 6000 > 1000
+
+        key = "shared:orders:orders"
+        await dispatcher.data_listener()
+        state = dispatcher.state.sources[key]
+        self.assertTrue(state.over_capacity)
+        self.assertTrue(alerts)
+        self.assertAlmostEqual(60.0, (state.observed - state.committed).total_seconds())
+        fetch_ids = await dispatcher.ray_trigger()
+        self.assertEqual(1, len(fetch_ids))
+        request = backend.fetch_submissions[0][1]
+        self.assertEqual(state.committed, request.window_start)
+        self.assertEqual(state.observed, request.window_end)
+        self.assertIsNone(request.start_cursor)
+
+    async def test_handler_shards_by_batch_size(self) -> None:
+        client = FakeSourceObserver()
+        backend = FakeRayAdapter()
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        watermark = t0 + timedelta(hours=1)
+        source = PostgresSource(
+            "orders",
+            "postgresql://example/db",
+            "orders",
+            "updated_at",
+            mode="event_time",
+            initial_time=t0,
+            max_window_seconds=300,
+            max_rows=100_000,
+        )
+        worker = HandlerSpec("w", object(), (source,), batch_size=10_000)
+        dispatcher = RayDispatcher(
+            (worker,),
+            ray_adapter=backend,
+            checkpoint_store=MemoryCheckpointStore(),
+            config=DispatcherConfig(max_in_flight=100),
+        )
+        dispatcher.source_observer = client
+        client.pg_event_watermark["orders"] = watermark
+        # 25k synthetic rows via rate over a short aligned window needs times+rate.
+        client.pg_event_times["orders"] = [t0 + timedelta(seconds=1)]
+        client.pg_event_row_rate["orders"] = 100.0  # 250s → 25k if shrunk? 
+        # Force a known count: use times list only (no rate) with 25k stamps is heavy.
+        # Instead patch backlog after observe via direct state + one planned window.
+        await dispatcher.data_listener()
+        key = "shared:orders:orders"
+        state = dispatcher.state.sources[key]
+        # Rebuild a deterministic backlog for shard math.
+        state.backlog = 25_000
+        # Keep committed/observed as planned so create_batch uses take=25000.
+        fetch_ids = await dispatcher.ray_trigger()
+        self.assertEqual(1, len(fetch_ids))
+        rows = [{"i": i} for i in range(25_000)]
+        await self._complete_fetches(dispatcher, backend, value=rows)
+        handler_runs = [
+            run for run in dispatcher.state.runs.values() if run.kind == "handler"
+        ]
+        self.assertEqual(3, len(handler_runs))
+        slice_refs = [
+            ref for ref in backend.data_refs if str(ref).startswith("slice-ref-")
+        ]
+        self.assertEqual(3, len(slice_refs))
+
+    async def test_skips_min_items_gate(self) -> None:
+        client = FakeSourceObserver()
+        backend = FakeRayAdapter()
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        watermark = t0 + timedelta(hours=1)
+        source = PostgresSource(
+            "orders",
+            "postgresql://example/db",
+            "orders",
+            "updated_at",
+            mode="event_time",
+            initial_time=t0,
+        )
+        # Large min_items would block cursor mode; event_time must still trigger.
+        worker = HandlerSpec("w", object(), (source,), batch_size=50_000)
+        dispatcher = RayDispatcher(
+            (worker,),
+            ray_adapter=backend,
+            checkpoint_store=MemoryCheckpointStore(),
+        )
+        dispatcher.source_observer = client
+        client.pg_event_watermark["orders"] = watermark
+        client.pg_event_times["orders"] = [t0 + timedelta(seconds=1)]
+
+        await dispatcher.data_listener()
+        self.assertEqual(1, dispatcher.state.sources["shared:orders:orders"].backlog)
+        self.assertEqual(1, len(await dispatcher.ray_trigger()))
+
+    async def test_requires_initial_time_without_checkpoint(self) -> None:
+        client = FakeSourceObserver()
+        backend = FakeRayAdapter()
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        source = PostgresSource(
+            "orders",
+            "postgresql://example/db",
+            "orders",
+            "updated_at",
+            mode="event_time",
+        )
+        worker = HandlerSpec("w", object(), (source,), batch_size=1)
+        dispatcher = RayDispatcher(
+            (worker,),
+            ray_adapter=backend,
+            checkpoint_store=MemoryCheckpointStore(),
+        )
+        dispatcher.source_observer = client
+        client.pg_event_watermark["orders"] = t0 + timedelta(minutes=5)
+        with self.assertRaisesRegex(ValueError, "initial_time"):
+            await dispatcher.data_listener()
+
+
+class PostgresEventTimePlannerUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_plan_idle_and_shrink(self) -> None:
+        from ray_dispatcher.sources import SourceObserver
+
+        class TinyObserver(SourceObserver):
+            def __init__(self) -> None:
+                super().__init__()
+                self.times: list[datetime] = []
+                self.rate: float | None = None
+
+            async def postgres_min_time(self, source, start, end):  # type: ignore[no-untyped-def]
+                hit = [ts for ts in self.times if start < ts <= end]
+                return min(hit) if hit else None
+
+            async def postgres_count_time(self, source, start, end):  # type: ignore[no-untyped-def]
+                if self.rate is not None:
+                    return int(self.rate * (end - start).total_seconds())
+                return sum(1 for ts in self.times if start < ts <= end)
+
+        obs = TinyObserver()
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        source = PostgresSource(
+            "orders",
+            "postgresql://x",
+            "orders",
+            "updated_at",
+            mode="event_time",
+            initial_time=t0,
+            max_rows=100,
+            max_window_seconds=300,
+            min_window_seconds=60,
+        )
+        left, right, count, over = await obs.postgres_plan_event_window(
+            source, t0, t0 + timedelta(hours=1)
+        )
+        self.assertEqual(0, count)
+        self.assertEqual(t0 + timedelta(hours=1), right)
+        self.assertFalse(over)
+
+        obs.times = [t0 + timedelta(seconds=10)]
+        obs.rate = 10.0  # 300s → 3000 > 100; 60s → 600 > 100 → over_capacity
+        left, right, count, over = await obs.postgres_plan_event_window(
+            source, t0, t0 + timedelta(hours=1)
+        )
+        self.assertTrue(over)
+        self.assertAlmostEqual(60.0, (right - left).total_seconds())
+        self.assertGreater(count, 100)
+
+
+class PostgresEventTimeRegistryTests(unittest.TestCase):
+    def test_source_from_mapping_event_time(self) -> None:
+        from ray_dispatcher.registries import source_canonical_dict, source_from_mapping
+
+        source = source_from_mapping(
+            {
+                "kind": "postgres",
+                "source_id": "orders",
+                "dsn": "postgresql://x",
+                "table": "orders",
+                "timestamp_column": "updated_at",
+                "mode": "event_time",
+                "watermark_lag_seconds": 60,
+                "max_window_seconds": 300,
+                "min_window_seconds": 60,
+                "max_rows": 100000,
+                "initial_time": "2026-01-01T00:00:00+00:00",
+            }
+        )
+        assert isinstance(source, PostgresSource)
+        self.assertEqual("event_time", source.mode)
+        self.assertEqual("", source.primary_key_column)
+        self.assertEqual(
+            datetime(2026, 1, 1, tzinfo=timezone.utc), source.initial_time
+        )
+        canonical = source_canonical_dict(source)
+        self.assertEqual("event_time", canonical["mode"])
+        self.assertEqual(100000, canonical["max_rows"])
 
 
 if __name__ == "__main__":

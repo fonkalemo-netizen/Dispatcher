@@ -23,6 +23,7 @@ EVENT_BATCH_SKIPPED = "batch_skipped"
 EVENT_RUN_FAILED = "run_failed"
 EVENT_SNAPSHOT = "snapshot"
 EVENT_TRIGGER_EVALUATED = "trigger_evaluated"
+EVENT_WINDOW_OVER_CAPACITY = "window_over_capacity"
 
 KNOWN_EVENTS = frozenset(
     {
@@ -31,6 +32,7 @@ KNOWN_EVENTS = frozenset(
         EVENT_RUN_FAILED,
         EVENT_SNAPSHOT,
         EVENT_TRIGGER_EVALUATED,
+        EVENT_WINDOW_OVER_CAPACITY,
     }
 )
 
@@ -242,6 +244,7 @@ __all__ = [
     "EVENT_RUN_FAILED",
     "EVENT_SNAPSHOT",
     "EVENT_TRIGGER_EVALUATED",
+    "EVENT_WINDOW_OVER_CAPACITY",
     "KNOWN_EVENTS",
     "EventHook",
     "EventLog",

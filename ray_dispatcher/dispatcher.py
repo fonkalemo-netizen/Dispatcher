@@ -24,6 +24,7 @@ from ray_dispatcher.event_log import (
     EVENT_RUN_FAILED,
     EVENT_SNAPSHOT,
     EVENT_TRIGGER_EVALUATED,
+    EVENT_WINDOW_OVER_CAPACITY,
     EventLog,
     create_event_log,
 )
@@ -47,6 +48,7 @@ from ray_dispatcher.models import (
     SourceSpec,
     SourceState,
     TaskRun,
+    handler_shard_size,
     merge_batch_windows,
 )
 from ray_dispatcher.policy import (
@@ -109,14 +111,17 @@ class _PostgresObservePrep:
     source_id: str
     table: str
     create: bool
-    committed: PostgresCursor
-    upper: PostgresCursor
+    committed: PostgresCursor | datetime
+    upper: PostgresCursor | datetime
     count: int
-    snapshot_committed: PostgresCursor | None
+    snapshot_committed: PostgresCursor | datetime | None
     snapshot_backlog: int | None
     snapshot_last_observed_at: float | None
     snapshot_arrival_rate: float | None
     now: float
+    mode: str = "cursor"
+    over_capacity: bool = False
+    idle_jump: bool = False
 
 
 @dataclass
@@ -197,6 +202,7 @@ class RayDispatcher:
         resource_registry: ResourceRegistry | None = None,
         payload_reader: PayloadReader | None = None,
         event_log: EventLog | None = None,
+        plugin_store: Any | None = None,
     ) -> None:
         self._injected_source_registry = source_registry
         self._injected_resource_registry = resource_registry
@@ -205,6 +211,7 @@ class RayDispatcher:
         self.payload_reader = payload_reader or CompositePayloadReader()
         self.resource_loader = ResourceLoader(resource_registry)
         self._workers_dir: Path | None = None
+        self._plugin_store = plugin_store
 
         if ray_adapter is None:
             from ray_dispatcher.adapter import NativeRayAdapter
@@ -237,7 +244,7 @@ class RayDispatcher:
 
             self._workers_dir = Path(workers).expanduser().resolve()
             workers, merged_sources, merged_resources = discover_workers(
-                self._workers_dir,
+                self._discover_roots(),
                 ray_module=getattr(ray_adapter, "ray", None),
                 source_registry=source_registry,
                 resource_registry=resource_registry,
@@ -279,11 +286,28 @@ class RayDispatcher:
             self.workers,
             self.source_registry,
             self.resource_registry,
-            workers_dir=self._workers_dir,
+            worker_roots=self._discover_roots(),
         )
         self._lock = asyncio.Lock()
         self._tasks: list[asyncio.Task[None]] = []
         self._stopping = asyncio.Event()
+
+    def _discover_roots(self) -> list[Path]:
+        roots: list[Path] = []
+        if self._workers_dir is not None:
+            roots.append(self._workers_dir)
+        store = self._plugin_store
+        if store is not None:
+            roots.extend(store.list_active_roots())
+        return roots
+
+    @property
+    def plugin_store(self) -> Any | None:
+        return self._plugin_store
+
+    @plugin_store.setter
+    def plugin_store(self, value: Any | None) -> None:
+        self._plugin_store = value
 
     @staticmethod
     def _shared_state_key(source_id: str, shard: str) -> str:
@@ -349,16 +373,43 @@ class RayDispatcher:
                         "initial_offset and retention_policy"
                     )
             else:
-                initial_cursors = {
-                    repr(member.sources[0].initial_cursor)
+                modes = {
+                    member.sources[0].mode
                     for member in members
                     if isinstance(member.sources[0], PostgresSource)
                 }
-                if len(initial_cursors) != 1:
+                if len(modes) != 1:
                     raise ValueError(
                         f"handlers sharing source_id {group_key!r} must use one "
-                        "initial_cursor"
+                        "PostgresSource.mode"
                     )
+                mode = next(iter(modes))
+                if mode == "event_time":
+                    initial_times = {
+                        (
+                            None
+                            if member.sources[0].initial_time is None
+                            else member.sources[0].initial_time.isoformat()
+                        )
+                        for member in members
+                        if isinstance(member.sources[0], PostgresSource)
+                    }
+                    if len(initial_times) != 1:
+                        raise ValueError(
+                            f"handlers sharing source_id {group_key!r} must use one "
+                            "initial_time"
+                        )
+                else:
+                    initial_cursors = {
+                        repr(member.sources[0].initial_cursor)
+                        for member in members
+                        if isinstance(member.sources[0], PostgresSource)
+                    }
+                    if len(initial_cursors) != 1:
+                        raise ValueError(
+                            f"handlers sharing source_id {group_key!r} must use one "
+                            "initial_cursor"
+                        )
             self._shared_groups[group_key] = tuple(members)
 
     def _sync_multisource_windows(self) -> None:
@@ -387,7 +438,10 @@ class RayDispatcher:
         resource_registry: ResourceRegistry | None,
         *,
         workers_dir: Path | None = None,
+        worker_roots: Sequence[Path] | None = None,
     ) -> str:
+        from ray_dispatcher.discovery import worker_roots_code_fingerprint
+
         handler_rows = []
         for worker in sorted(workers.values(), key=lambda item: item.name):
             handler_rows.append(
@@ -414,35 +468,30 @@ class RayDispatcher:
             name: spec.canonical_dict()
             for name, spec in sorted((resource_registry or {}).items())
         }
+        if worker_roots is None:
+            roots = [workers_dir] if workers_dir is not None else []
+        else:
+            roots = list(worker_roots)
         return canonical_json(
             {
                 "handlers": handler_rows,
                 "sources": sources,
                 "resources": resources,
-                "code": RayDispatcher._workers_dir_fingerprint(workers_dir),
+                "code": worker_roots_code_fingerprint(roots),
             }
         )
 
     @staticmethod
     def _workers_dir_fingerprint(
         workers_dir: Path | None,
-    ) -> list[tuple[str, int, int]]:
-        """Stable digest of worker module files (path, mtime_ns, size)."""
+    ) -> list[tuple[str, str]]:
+        """Stable digest of worker module files (relative path, sha256)."""
+
+        from ray_dispatcher.discovery import worker_roots_code_fingerprint
 
         if workers_dir is None:
             return []
-        rows: list[tuple[str, int, int]] = []
-        for path in sorted(workers_dir.rglob("*.py")):
-            if "__pycache__" in path.parts:
-                continue
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            rows.append(
-                (str(path.relative_to(workers_dir)), int(stat.st_mtime_ns), int(stat.st_size))
-            )
-        return rows
+        return worker_roots_code_fingerprint([workers_dir])
 
     def _has_inflight_work(self) -> bool:
         if any(
@@ -610,6 +659,25 @@ class RayDispatcher:
                             )
                         except Exception as exc:
                             errors.append(exc)
+                elif kind == "postgres_event_time":
+                    assert isinstance(payload, datetime)
+                    observed_source_ids = set()
+                    for worker, source in bindings:
+                        assert isinstance(source, PostgresSource)
+                        if source.source_id in observed_source_ids:
+                            continue
+                        observed_source_ids.add(source.source_id)
+                        try:
+                            prepared.append(
+                                (
+                                    "postgres_event_time",
+                                    await self._prepare_postgres_event_time_observe(
+                                        worker, source, payload
+                                    ),
+                                )
+                            )
+                        except Exception as exc:
+                            errors.append(exc)
                 else:
                     assert isinstance(payload, PostgresCursor)
                     observed_source_ids = set()
@@ -678,6 +746,12 @@ class RayDispatcher:
                 self.source_observer.kafka_watermarks(representative)
             )
             return ("kafka", bindings, watermarks)
+        assert isinstance(representative, PostgresSource)
+        if representative.mode == "event_time":
+            watermark = await self._io(
+                self.source_observer.postgres_event_watermark(representative)
+            )
+            return ("postgres_event_time", bindings, watermark)
         upper = await self._io(
             self.source_observer.postgres_high_watermark(representative)
         )
@@ -689,6 +763,7 @@ class RayDispatcher:
             return (SourceKind.KAFKA, tuple(sorted(source.brokers)), source.topic)
         return (
             SourceKind.POSTGRES,
+            source.mode,
             source.dsn,
             source.table,
             source.timestamp_column,
@@ -943,6 +1018,88 @@ class RayDispatcher:
             snapshot_last_observed_at=snapshot_last_observed_at,
             snapshot_arrival_rate=snapshot_arrival_rate,
             now=time.monotonic(),
+            mode="cursor",
+        )
+
+    async def _prepare_postgres_event_time_observe(
+        self,
+        worker: HandlerSpec,
+        source: PostgresSource,
+        watermark: datetime,
+    ) -> _PostgresObservePrep:
+        key = self._shared_state_key(source.source_id, source.table)
+        async with self._lock:
+            state = self.state.sources.get(key)
+            snapshot: tuple[datetime, int, float, float] | None = None
+            if state is not None:
+                if not isinstance(state.committed, datetime):
+                    raise TypeError(
+                        f"invalid Postgres event_time state for {key}"
+                    )
+                snapshot = (
+                    state.committed,
+                    state.backlog,
+                    state.last_observed_at,
+                    state.arrival_rate,
+                )
+
+        create = False
+        if snapshot is None:
+            checkpoint = await self._io(self.checkpoint_store.load(key))
+            progress = None if checkpoint is None else checkpoint.progress
+            if progress is not None and not isinstance(progress, datetime):
+                raise TypeError(
+                    f"Postgres event_time checkpoint {key} must be datetime"
+                )
+            committed = progress or source.initial_time
+            if committed is None:
+                raise ValueError(
+                    f"{source.source_id}: event_time mode requires checkpoint "
+                    "progress or initial_time"
+                )
+            if progress is None:
+                await self._io(self.checkpoint_store.save(key, committed))
+            create = True
+            snapshot_committed = None
+            snapshot_backlog = None
+            snapshot_last_observed_at = None
+            snapshot_arrival_rate = None
+        else:
+            (
+                committed,
+                snapshot_backlog,
+                snapshot_last_observed_at,
+                snapshot_arrival_rate,
+            ) = snapshot
+            snapshot_committed = committed
+
+        left, right, count, over_capacity = await self._io(
+            self.source_observer.postgres_plan_event_window(
+                source, committed, watermark
+            )
+        )
+        idle_jump = count == 0
+        if idle_jump and right != committed:
+            # Advance past empty gap to watermark so observe does not re-scan.
+            await self._io(self.checkpoint_store.save(key, right))
+            left = right
+        return _PostgresObservePrep(
+            key=key,
+            worker_name=worker.name,
+            source_id=source.source_id,
+            table=source.table,
+            create=create,
+            committed=left,
+            upper=right,
+            count=count,
+            snapshot_committed=snapshot_committed,
+            snapshot_backlog=snapshot_backlog,
+            snapshot_last_observed_at=snapshot_last_observed_at,
+            snapshot_arrival_rate=snapshot_arrival_rate,
+            now=time.monotonic(),
+            mode="event_time",
+            over_capacity=over_capacity,
+            idle_jump=idle_jump,
         )
 
     def _apply_postgres_observe(self, prep: _PostgresObservePrep) -> None:
@@ -962,7 +1119,7 @@ class RayDispatcher:
             self.state.sources[prep.key] = state
         elif prep.create:
             # Key appeared concurrently; keep existing committed.
-            if state.committed != prep.committed:
+            if state.committed != prep.committed and not prep.idle_jump:
                 return
         elif (
             prep.snapshot_committed is not None
@@ -971,8 +1128,21 @@ class RayDispatcher:
             # Commit landed between prepare and apply; skip stale rate update.
             return
 
-        if not isinstance(state.committed, PostgresCursor):
+        if prep.mode == "event_time":
+            if not isinstance(state.committed, datetime):
+                raise TypeError(f"invalid Postgres event_time state for {prep.key}")
+        elif not isinstance(state.committed, PostgresCursor):
             raise TypeError(f"invalid Postgres state for {prep.key}")
+
+        if prep.idle_jump:
+            # Empty (L, W]: checkpoint already advanced; keep backlog at 0.
+            state.committed = prep.committed
+            state.observed = prep.upper
+            state.backlog = 0
+            state.over_capacity = False
+            state.last_observed_at = prep.now
+            return
+
         previous = (
             prep.snapshot_backlog
             if prep.snapshot_backlog is not None
@@ -993,9 +1163,39 @@ class RayDispatcher:
         state.arrival_rate = self._ewma(
             arrival_rate, arrived / elapsed, self.config.ewma_alpha
         )
+        # Gap align may advance committed to pred(min_ts) before scheduling.
+        if prep.mode == "event_time":
+            state.committed = prep.committed
         state.observed = prep.upper
         state.backlog = max(0, prep.count)
+        state.over_capacity = prep.over_capacity
         state.last_observed_at = prep.now
+        if prep.over_capacity:
+            self._emit_event(
+                EVENT_WINDOW_OVER_CAPACITY,
+                {
+                    "source_id": prep.source_id,
+                    "source_key": prep.key,
+                    "committed": (
+                        prep.committed.isoformat()
+                        if isinstance(prep.committed, datetime)
+                        else str(prep.committed)
+                    ),
+                    "observed": (
+                        prep.upper.isoformat()
+                        if isinstance(prep.upper, datetime)
+                        else str(prep.upper)
+                    ),
+                    "count": prep.count,
+                    "alert": (
+                        "event_time window exceeds max_rows at min_window_seconds; "
+                        "fetching full window"
+                    ),
+                },
+            )
+            self.state.loop_errors.append(
+                f"window_over_capacity:{prep.source_id}:count={prep.count}"
+            )
 
     def _plan_multisource_observe(self) -> list[_MultisourceObservePlan]:
         plans: list[_MultisourceObservePlan] = []
@@ -1137,7 +1337,11 @@ class RayDispatcher:
                 if members is None or members[0].is_multisource:
                     continue
                 representative = members[0]
-                slots_per_slice = len(members) + 1
+                event_time = self._is_postgres_event_time(representative)
+                handler_slots = self._shared_handler_slots(
+                    members, source_state.backlog, event_time=event_time
+                )
+                slots_per_slice = handler_slots + 1
                 phase_cpus = self._phase_cpus(members)
                 decision = self.trigger.evaluate(
                     TriggerContext(
@@ -1162,12 +1366,14 @@ class RayDispatcher:
                 min_items, max_items = merge_batch_windows(
                     tuple(member.batch_window for member in members)
                 )
-                if source_state.backlog < min_items:
+                # event_time: batch_size is shard size only; backlog>0 is enough.
+                if not event_time and source_state.backlog < min_items:
                     continue
                 n = self._shared_wave_slots(
                     members,
                     free_slots,
                     available_cpus,
+                    handler_slots=handler_slots,
                 )
                 if (
                     decision.decision is Decision.DEGRADE
@@ -1178,10 +1384,16 @@ class RayDispatcher:
                 if n == 0:
                     continue
                 run_ids = await self._create_shared_batch(
-                    members, source_state, max_items=max_items
+                    members,
+                    source_state,
+                    max_items=None if event_time else max_items,
                 )
                 submitted.extend(run_ids)
-                reserved = len(run_ids) * (len(members) + 1)
+                reserved = (
+                    (1 + handler_slots)
+                    if run_ids
+                    else 0
+                )
                 free_slots = max(0, free_slots - reserved)
                 if available_cpus is not None:
                     available_cpus = max(
@@ -1287,15 +1499,37 @@ class RayDispatcher:
         )
         return max(self.config.fetch_cpus, downstream_cpus)
 
+    @staticmethod
+    def _is_postgres_event_time(handler: HandlerSpec) -> bool:
+        source = handler.sources[0]
+        return isinstance(source, PostgresSource) and source.mode == "event_time"
+
+    @staticmethod
+    def _shared_handler_slots(
+        members: tuple[HandlerSpec, ...],
+        backlog: int,
+        *,
+        event_time: bool,
+    ) -> int:
+        if not event_time or backlog <= 0:
+            return len(members)
+        total = 0
+        for member in members:
+            chunk = handler_shard_size(member.batch_window)
+            total += max(1, math.ceil(backlog / chunk))
+        return total
+
     def _shared_wave_slots(
         self,
         members: tuple[HandlerSpec, ...],
         free_slots: int,
         available_cpus: float | None,
+        *,
+        handler_slots: int | None = None,
     ) -> int:
         """Return 1 when capacity allows a single shared wave, else 0."""
 
-        per_slice_slots = len(members) + 1
+        per_slice_slots = (handler_slots if handler_slots is not None else len(members)) + 1
         if free_slots < per_slice_slots:
             return 0
         if available_cpus is not None:
@@ -1320,8 +1554,11 @@ class RayDispatcher:
         if take <= 0:
             return []
         ranges: list[
-            tuple[int | PostgresCursor, int | PostgresCursor, int]
+            tuple[int | PostgresCursor | datetime, int | PostgresCursor | datetime, int]
         ] = []
+        window_start: datetime | None = None
+        window_end: datetime | None = None
+        event_time = isinstance(source, PostgresSource) and source.mode == "event_time"
 
         if isinstance(source, KafkaSource):
             start_i = int(start)
@@ -1330,7 +1567,15 @@ class RayDispatcher:
             if item_count <= 0:
                 return []
             ranges.append((start_i, end_i, item_count))
-            end: int | PostgresCursor = end_i
+            end: int | PostgresCursor | datetime = end_i
+        elif event_time:
+            if not isinstance(start, datetime) or not isinstance(observed, datetime):
+                raise TypeError("Postgres event_time batch requires datetime bounds")
+            item_count = take
+            ranges.append((start, observed, item_count))
+            end = observed
+            window_start = start
+            window_end = observed
         else:
             if not isinstance(start, PostgresCursor) or not isinstance(
                 observed, PostgresCursor
@@ -1350,6 +1595,9 @@ class RayDispatcher:
             end = ranges[-1][1]
             item_count = sum(count for _, _, count in ranges)
 
+        handler_slots = self._shared_handler_slots(
+            members, item_count, event_time=event_time
+        )
         batch_id = self._stable_id("shared", group, source_state.key, start, end)
         fetch_run_ids: list[str] = []
         batch = BatchRun(
@@ -1362,7 +1610,9 @@ class RayDispatcher:
             [],
             worker_names=tuple(member.name for member in members),
             fetch_run_ids=fetch_run_ids,
-            reserved_handler_count=len(members),
+            reserved_handler_count=handler_slots,
+            window_start=window_start,
+            window_end=window_end,
         )
         self.state.batches[batch_id] = batch
         source_state.active_batch_id = batch_id
@@ -1384,10 +1634,20 @@ class RayDispatcher:
                 ),
                 start_offset=(int(chunk_start) if isinstance(source, KafkaSource) else None),
                 end_offset=(int(chunk_end) if isinstance(source, KafkaSource) else None),
-                start_cursor=(chunk_start if isinstance(source, PostgresSource) else None),
-                end_cursor=(chunk_end if isinstance(source, PostgresSource) else None),
+                start_cursor=(
+                    chunk_start
+                    if isinstance(source, PostgresSource) and not event_time
+                    else None
+                ),
+                end_cursor=(
+                    chunk_end
+                    if isinstance(source, PostgresSource) and not event_time
+                    else None
+                ),
                 topic=source.topic if isinstance(source, KafkaSource) else None,
                 table=source.table if isinstance(source, PostgresSource) else None,
+                window_start=window_start if event_time else None,
+                window_end=window_end if event_time else None,
             )
             try:
                 ref = self.ray_adapter.submit_fetch(
@@ -1807,50 +2067,79 @@ class RayDispatcher:
     async def _submit_shared_handlers(self, batch: BatchRun) -> list[str]:
         members = tuple(self.workers[name] for name in batch.worker_names)
         submitted: list[str] = []
+        event_time = batch.window_start is not None and batch.window_end is not None
         for fetch_run_id in batch.fetch_run_ids:
             fetch_run = self.state.runs[fetch_run_id]
             request = fetch_run.request
             for member in members:
-                run_id = self._stable_id(
-                    batch.batch_id,
-                    member.name,
-                    request.task_index,
-                    request.start_offset,
-                    request.end_offset,
-                    request.start_cursor,
-                    request.end_cursor,
+                shard_size = (
+                    handler_shard_size(member.batch_window) if event_time else None
                 )
-                handler_request = await self._build_handler_request(
-                    member, run_id, batch.source_state_key
+                n_shards = (
+                    max(1, math.ceil(batch.item_count / shard_size))
+                    if shard_size is not None and batch.item_count > 0
+                    else 1
                 )
-                try:
-                    ref = self.ray_adapter.submit(
-                        member, handler_request, fetch_run.ref
+                if batch.item_count == 0:
+                    n_shards = 0
+                for shard_index in range(n_shards):
+                    assert shard_size is not None or n_shards == 1
+                    start_i = shard_index * (shard_size or 0)
+                    end_i = (
+                        min(batch.item_count, start_i + shard_size)
+                        if shard_size is not None
+                        else batch.item_count
                     )
-                    run = TaskRun(
-                        run_id,
+                    run_id = self._stable_id(
                         batch.batch_id,
                         member.name,
-                        handler_request,
-                        ref,
-                        data_ref=fetch_run.ref,
+                        request.task_index,
+                        request.start_offset,
+                        request.end_offset,
+                        request.start_cursor,
+                        request.end_cursor,
+                        request.window_start,
+                        request.window_end,
+                        shard_index,
+                        start_i,
+                        end_i,
                     )
-                except Exception as exc:
-                    run = TaskRun(
-                        run_id,
-                        batch.batch_id,
-                        member.name,
-                        handler_request,
-                        None,
-                        error=(
-                            "handler submission failed: "
-                            f"{type(exc).__name__}: {exc}"
-                        ),
-                        data_ref=fetch_run.ref,
+                    handler_request = await self._build_handler_request(
+                        member, run_id, batch.source_state_key
                     )
-                self.state.runs[run_id] = run
-                batch.run_ids.append(run_id)
-                submitted.append(run_id)
+                    data_ref = fetch_run.ref
+                    try:
+                        if event_time and data_ref is not None:
+                            data_ref = self.ray_adapter.submit_slice(
+                                data_ref, start_i, end_i
+                            )
+                        ref = self.ray_adapter.submit(
+                            member, handler_request, data_ref
+                        )
+                        run = TaskRun(
+                            run_id,
+                            batch.batch_id,
+                            member.name,
+                            handler_request,
+                            ref,
+                            data_ref=data_ref,
+                        )
+                    except Exception as exc:
+                        run = TaskRun(
+                            run_id,
+                            batch.batch_id,
+                            member.name,
+                            handler_request,
+                            None,
+                            error=(
+                                "handler submission failed: "
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                            data_ref=data_ref,
+                        )
+                    self.state.runs[run_id] = run
+                    batch.run_ids.append(run_id)
+                    submitted.append(run_id)
         batch.reserved_handler_count = 0
         return submitted
 
@@ -2377,7 +2666,7 @@ class RayDispatcher:
             )
         if self.reload_interval > 0:
             loops.append(
-                ("workers_reload", self.reload_workers, self.reload_interval)
+                ("workers_reload", self._reload_workers_loop, self.reload_interval)
             )
         self._tasks = [
             asyncio.create_task(self._periodic(name, callback, interval), name=name)
@@ -2389,8 +2678,17 @@ class RayDispatcher:
 
         self._emit_event(EVENT_SNAPSHOT, await self.snapshot())
 
-    async def reload_workers(self) -> bool:
-        """Rescan the workers directory and swap config when safe.
+    async def reload_workers(
+        self,
+        *,
+        candidate_plugin_roots: Sequence[Path] | None = None,
+    ) -> bool:
+        """Rescan worker roots and swap config when safe.
+
+        ``candidate_plugin_roots`` are plugin directories only (not builtin). When
+        omitted, uses ``list_active_roots()`` via ``_discover_roots()``.
+        This method does not mutate PluginStore metadata except
+        ``finalize_after_reload`` after a successful swap.
 
         Returns True when a new configuration was installed.
         """
@@ -2399,18 +2697,31 @@ class RayDispatcher:
             return False
         from ray_dispatcher.discovery import discover_workers
 
-        workers, merged_sources, merged_resources = discover_workers(
-            self._workers_dir,
-            ray_module=getattr(self.ray_adapter, "ray", None),
-            source_registry=self._injected_source_registry,
-            resource_registry=self._injected_resource_registry,
-        )
+        store = self._plugin_store
+        if candidate_plugin_roots is None:
+            roots = self._discover_roots()
+        else:
+            roots = [self._workers_dir, *[Path(p) for p in candidate_plugin_roots]]
+
+        try:
+            workers, merged_sources, merged_resources = discover_workers(
+                roots,
+                ray_module=getattr(self.ray_adapter, "ray", None),
+                source_registry=self._injected_source_registry,
+                resource_registry=self._injected_resource_registry,
+            )
+        except Exception as exc:
+            self.state.loop_errors.append(
+                f"workers_reload:discover:{type(exc).__name__}: {exc}"
+            )
+            return False
+
         worker_map = {worker.name: worker for worker in workers}
         fingerprint = self._fingerprint_config(
             worker_map,
             merged_sources,
             merged_resources,
-            workers_dir=self._workers_dir,
+            worker_roots=roots,
         )
         if fingerprint == self._config_fingerprint:
             return False
@@ -2446,7 +2757,24 @@ class RayDispatcher:
             if callable(drop):
                 for name in old_names | set(self.workers):
                     drop(name)
+            if store is not None:
+                store.finalize_after_reload(set(self.workers))
             return True
+
+    def has_inflight_work(self) -> bool:
+        """Public view of whether reload must wait."""
+
+        return self._has_inflight_work()
+
+    async def _reload_workers_loop(self) -> bool:
+        """Periodic reload: prefer desired candidate plugin roots when store set."""
+
+        store = self._plugin_store
+        if store is not None:
+            return await self.reload_workers(
+                candidate_plugin_roots=store.list_candidate_plugin_roots()
+            )
+        return await self.reload_workers()
 
     async def __aenter__(self) -> "RayDispatcher":
         await self.start()

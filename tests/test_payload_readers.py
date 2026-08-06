@@ -214,16 +214,65 @@ class PostgresPayloadReaderTests(unittest.TestCase):
         sql = connection.fetch.await_args.args[0]
         self.assertIn('FROM "public"."orders"', sql)
         self.assertIn('ORDER BY "updated_at", "id"', sql)
+        self.assertIn('"updated_at" > $1', sql)
+        self.assertNotIn("($1, $2)", sql)
         self.assertEqual(
             (
-                start.timestamp,
+                start.timestamp.replace(tzinfo=None),
                 start.primary_key,
-                end.timestamp,
+                end.timestamp.replace(tzinfo=None),
                 end.primary_key,
             ),
             connection.fetch.await_args.args[1:5],
         )
         connection.close.assert_awaited()
+
+    def test_event_time_window_query_has_no_order_by(self) -> None:
+        source = PostgresSource(
+            "orders",
+            "postgresql://db/app",
+            "public.orders",
+            "updated_at",
+            mode="event_time",
+            initial_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        )
+        start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        end = datetime(2024, 1, 1, 0, 5, tzinfo=timezone.utc)
+        request = DispatchRequest(
+            "fetch-1",
+            "fetch:orders",
+            "orders",
+            SourceKind.POSTGRES,
+            0,
+            1,
+            table="public.orders",
+            window_start=start,
+            window_end=end,
+        )
+        connection = MagicMock()
+        connection.fetch = AsyncMock(return_value=[{"id": 1}])
+        connection.close = AsyncMock()
+        asyncpg = ModuleType("asyncpg")
+        asyncpg.connect = AsyncMock(return_value=connection)  # type: ignore[attr-defined]
+        previous = _install_module("asyncpg", asyncpg)
+        try:
+            records = PostgresPayloadReader(timeout=1.0).fetch(request, source)
+        finally:
+            _restore_module("asyncpg", previous)
+
+        self.assertEqual([{"id": 1}], records)
+        sql = connection.fetch.await_args.args[0]
+        self.assertIn('FROM "public"."orders"', sql)
+        self.assertIn('"updated_at" > $1', sql)
+        self.assertIn('"updated_at" <= $2', sql)
+        self.assertNotIn("ORDER BY", sql)
+        self.assertEqual(
+            (
+                start.replace(tzinfo=None),
+                end.replace(tzinfo=None),
+            ),
+            connection.fetch.await_args.args[1:3],
+        )
 
     def test_rejects_call_inside_running_loop(self) -> None:
         source = PostgresSource(

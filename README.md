@@ -24,8 +24,23 @@
 | [`ray_dispatcher/event_log.py`](./ray_dispatcher/event_log.py) | 运行事件钩子（函数登记） |
 | [`ray_dispatcher/failures.py`](./ray_dispatcher/failures.py) | 永久失败区间落盘 |
 | [`ray_dispatcher/policy.py`](./ray_dispatcher/policy.py) | 渐进式调度策略 |
+| [`ray_dispatcher/plugins/`](./ray_dispatcher/plugins/) | 用户 Worker 插件上传 / 校验 / 热启停 |
 
 调度核心没有强制第三方依赖；生产适配器按需加载。可用 `pip install -e .` 安装本包。
+HTTP 管理面可选：`pip install -e ".[api]"`（FastAPI）。
+
+## Worker 插件热启停
+
+用户上传的 `.py` 不进内置 `workers/`：经 `plugin_uploads/` staging → AST+子进程校验 → enable 时拷贝到 `plugin_active/` → `reload_workers()`。
+
+- 状态：`desired_enabled` / `effective_enabled` / `reload_pending`（见 `plugins.json`）
+- `list_active_roots()` **只**返回 `effective_enabled=true`；pending enable 由 `list_pending_enable_roots()` / `list_candidate_plugin_roots()` 交给 `reload_workers(candidate_plugin_roots=...)`
+- metadata 只在 swap 成功后 `finalize_after_reload`；失败不 rollback
+- 当前插件样本不假设 `output` / sink 字段；Handler 返回结构化结果即可
+- AST 仍支持受控写盘校验策略：禁 `subprocess`/`eval`/…；危险绝对路径拒绝，其它绝对路径 warning。若平台后续向插件开放 sink，应由运行时权限保证只能写 output 根
+- API：`PluginManager` + `create_plugin_router()`（`POST/GET /api/plugins`，enable/disable/delete）
+- 样本：[`examples/plugins/orders_filter_v1/worker.py`](./examples/plugins/orders_filter_v1/worker.py)
+- 详细上传、解析模块和接口样例：[`docs/plugin-upload-and-discovery.md`](./docs/plugin-upload-and-discovery.md)
 
 ## 推荐方式：扫描 workers 目录
 
@@ -351,7 +366,7 @@ Actor 应在 `__init__(self, resources)` 保存快照，`process(self, request, 
 框架 `PayloadReader`（或注入的自定义 reader）读取，Handler 只处理 `records`。`SourceObserver` 会：
 
 1. 查询 Kafka 分区 low/high watermark；
-2. 查询 Postgres 稳定上界游标，并统计窗口 count；
+2. 查询 Postgres 稳定上界游标，并统计窗口 count（`mode=cursor`）；
 3. 在数据库内按 `(timestamp, primary_key)` 排序，为本批上限（`batch_size` 区间的 max，或全部 backlog）
    生成**单一**有序游标范围（每个 wave 一个 fetch，不再按 batch_size 切多 task）。
 
@@ -370,6 +385,22 @@ WHERE (updated_at, id) > ($1, $2)
 ```
 
 单纯比较两次全表 count 会被 update/delete 抵消，因此实现没有采用该方式。
+
+#### `mode=event_time`（无 ORDER BY）
+
+当存储不能排序时，配置 `mode: event_time`（默认仍是 `cursor`，兼容现有部署）：
+
+| 字段 | 默认 | 含义 |
+| --- | --- | --- |
+| `watermark_lag_seconds` | `60` | `W = now(UTC) - lag` |
+| `max_window_seconds` | `300` | 单窗最大时长 |
+| `min_window_seconds` | `60` | 二分缩窗下限 |
+| `max_rows` | `100000` | 目标行数上限；触底仍超则整窗拉取并 `window_over_capacity` |
+| `initial_time` | — | 无 checkpoint 时必填 |
+
+- 观察：用 `min(ts)` 跳过空洞；谓词 `(L, R]`，**无 ORDER BY**。
+- 调度：`batch_size` **只**用于 Handler 内存分片（典型 `10000`），不是 trigger 的 min 门闩。
+- 读取：`SELECT * WHERE ts > $1 AND ts <= $2` 一次；再 `take_slice` 扇出给 Handler。
 
 ## Task 还是 Actor
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from functools import total_ordering
 from typing import Any, Literal, Mapping, Optional, Sequence, Tuple, Union
@@ -61,6 +61,17 @@ def merge_batch_windows(windows: Sequence[BatchWindow]) -> BatchWindow:
     return (min_items, max_items)
 
 
+def handler_shard_size(window: BatchWindow) -> int:
+    """In-memory fanout shard size from a handler ``batch_size`` window.
+
+    Uses max when set, otherwise min; always at least 1.
+    """
+
+    min_items, max_items = window
+    size = max_items if max_items is not None else min_items
+    return max(1, int(size))
+
+
 class SourceKind(str, Enum):
     KAFKA = "kafka"
     POSTGRES = "postgres"
@@ -89,14 +100,20 @@ class BatchStatus(str, Enum):
 @total_ordering
 @dataclass(frozen=True)
 class PostgresCursor:
-    """A deterministic cursor; timestamps must be timezone-aware."""
+    """A deterministic cursor.
+
+    Timestamps should be timezone-aware. Naive values (common when reading
+    PostgreSQL ``timestamp without time zone`` via asyncpg) are treated as UTC.
+    """
 
     timestamp: datetime
     primary_key: Any
 
     def __post_init__(self) -> None:
         if self.timestamp.tzinfo is None:
-            raise ValueError("PostgresCursor.timestamp must be timezone-aware")
+            object.__setattr__(
+                self, "timestamp", self.timestamp.replace(tzinfo=timezone.utc)
+            )
 
     def __lt__(self, other: Any) -> bool:
         if not isinstance(other, PostgresCursor):
@@ -123,13 +140,50 @@ class KafkaSource:
 
 @dataclass(frozen=True)
 class PostgresSource:
+    """Postgres incremental source.
+
+    ``mode="cursor"`` (default): composite ``(timestamp, primary_key)`` progress.
+    ``mode="event_time"``: closed watermark ``now()-lag``, time-only windows,
+    no ``ORDER BY`` (for stores that cannot sort).
+    """
+
     source_id: str
     dsn: str
     table: str
     timestamp_column: str
-    primary_key_column: str
+    primary_key_column: str = ""
     initial_cursor: PostgresCursor | None = None
+    mode: Literal["cursor", "event_time"] = "cursor"
+    watermark_lag_seconds: float = 60.0
+    max_window_seconds: float = 300.0
+    min_window_seconds: float = 60.0
+    max_rows: int = 100_000
+    initial_time: datetime | None = None
     kind: SourceKind = field(default=SourceKind.POSTGRES, init=False)
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("cursor", "event_time"):
+            raise ValueError(f"unsupported PostgresSource.mode: {self.mode!r}")
+        if self.mode == "cursor":
+            if not self.primary_key_column:
+                raise ValueError(
+                    "PostgresSource.primary_key_column is required when mode='cursor'"
+                )
+            return
+        if self.watermark_lag_seconds <= 0:
+            raise ValueError("watermark_lag_seconds must be positive")
+        if self.max_window_seconds <= 0 or self.min_window_seconds <= 0:
+            raise ValueError("max_window_seconds and min_window_seconds must be positive")
+        if self.min_window_seconds > self.max_window_seconds:
+            raise ValueError("min_window_seconds must be <= max_window_seconds")
+        if self.max_rows < 1:
+            raise ValueError("max_rows must be >= 1")
+        if self.initial_time is not None and self.initial_time.tzinfo is None:
+            object.__setattr__(
+                self,
+                "initial_time",
+                self.initial_time.replace(tzinfo=timezone.utc),
+            )
 
 
 SourceSpec = Union[KafkaSource, PostgresSource]
@@ -306,8 +360,8 @@ class SourceState:
     source_id: str
     kind: SourceKind
     shard: str
-    committed: int | PostgresCursor
-    observed: int | PostgresCursor
+    committed: int | PostgresCursor | datetime
+    observed: int | PostgresCursor | datetime
     backlog: int = 0
     arrival_rate: float = 0.0
     processing_rate: float = 0.0
@@ -315,6 +369,7 @@ class SourceState:
     last_scheduled_at: float = field(default_factory=time.monotonic)
     active_batch_id: str | None = None
     retention_gap: str | None = None
+    over_capacity: bool = False
 
 
 @dataclass

@@ -82,8 +82,6 @@ class PostgresPayloadReader:
     def fetch(self, request: DispatchRequest, source: SourceSpec) -> list[Any]:
         if not isinstance(source, PostgresSource):
             raise TypeError("PostgresPayloadReader requires a PostgresSource")
-        if request.start_cursor is None or request.end_cursor is None:
-            raise ValueError("Postgres fetch requires cursor bounds")
         try:
             import asyncpg
         except ImportError as exc:
@@ -92,31 +90,45 @@ class PostgresPayloadReader:
             ) from exc
 
         from ray_dispatcher.sources import (
+            _pg_keyset_between,
+            _pg_timestamp_param,
             _quote_identifier,
             _quote_qualified_identifier,
         )
 
         qualified = _quote_qualified_identifier(source.table)
         ts_q = _quote_identifier(source.timestamp_column)
-        pk_q = _quote_identifier(source.primary_key_column)
-        sql = (
-            f"SELECT * FROM {qualified} "
-            f"WHERE ({ts_q}, {pk_q}) > ($1, $2) "
-            f"AND ({ts_q}, {pk_q}) <= ($3, $4) "
-            f"ORDER BY {ts_q}, {pk_q}"
-        )
+
+        if request.window_start is not None and request.window_end is not None:
+            # event_time mode: time-only predicate, no ORDER BY / pk.
+            sql = (
+                f"SELECT * FROM {qualified} "
+                f"WHERE {ts_q} > $1 AND {ts_q} <= $2"
+            )
+            params: tuple[Any, ...] = (
+                _pg_timestamp_param(request.window_start),
+                _pg_timestamp_param(request.window_end),
+            )
+        else:
+            if request.start_cursor is None or request.end_cursor is None:
+                raise ValueError("Postgres fetch requires cursor bounds")
+            pk_q = _quote_identifier(source.primary_key_column)
+            sql = (
+                f"SELECT * FROM {qualified} "
+                f"WHERE {_pg_keyset_between(ts_q, pk_q)} "
+                f"ORDER BY {ts_q}, {pk_q}"
+            )
+            params = (
+                _pg_timestamp_param(request.start_cursor.timestamp),
+                request.start_cursor.primary_key,
+                _pg_timestamp_param(request.end_cursor.timestamp),
+                request.end_cursor.primary_key,
+            )
 
         async def _load() -> list[Any]:
             connection = await asyncpg.connect(source.dsn, timeout=self.timeout)
             try:
-                rows = await connection.fetch(
-                    sql,
-                    request.start_cursor.timestamp,
-                    request.start_cursor.primary_key,
-                    request.end_cursor.timestamp,
-                    request.end_cursor.primary_key,
-                    timeout=self.timeout,
-                )
+                rows = await connection.fetch(sql, *params, timeout=self.timeout)
                 return [dict(row) for row in rows]
             finally:
                 await connection.close()
