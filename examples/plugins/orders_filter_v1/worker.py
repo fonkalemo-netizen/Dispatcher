@@ -1,12 +1,12 @@
 """用户插件样例：过滤订单并返回结构化结果。
 
-上传时文件名固定为 ``worker.py``，plugin_id 使用 ``orders_filter_v1``。
-``handler_id`` 必须以 ``{plugin_id}:`` 开头。
+上传时文件名只要是安全的 ``.py`` 文件即可；示例 plugin_id 使用 ``orders_filter_v1``。
+``handler_id`` 由平台按 ``{plugin_id}:{entrypoint}`` 生成，用户不要手写。
 
 编写新插件时可以复制这个文件：
-1. 把所有 ``orders_filter_v1`` 前缀替换成你的 plugin_id。
+1. 上传时传入你的 plugin_id，用它标记这个 Worker 插件。
 2. 修改 ``SOURCES``，声明你要读取的 Kafka/Postgres 来源。
-3. 修改 ``HANDLERS``，让 ``entrypoint`` 指向你的处理函数。
+3. 修改 ``HANDLERS``，让 ``entrypoint`` 指向当前文件里的处理函数。
 4. Handler 返回一个简短的 dict 摘要；不要假设存在 output/sink 字段。
 """
 
@@ -76,10 +76,9 @@ RESOURCES = {
 
 HANDLERS = [
     {
-        # 上传插件必须显式声明 handler_id。前缀必须等于上传 API 使用的 plugin_id，
-        # 不要依赖默认模块名生成 handler_id。
-        "handler_id": "orders_filter_v1:filter_orders",
-        # 当前文件中的处理函数名。
+        # 当前文件中的处理函数名。平台会用上传时的 plugin_id 自动生成：
+        # orders_filter_v1:filter_orders
+        # 所以这里不要写 handler_id，避免用户指定内部唯一标识。
         "entrypoint": "filter_orders",
         # 引用 SOURCES 中声明的名称，或平台注入的 source registry 名称。
         "sources": ["plugin-orders"],

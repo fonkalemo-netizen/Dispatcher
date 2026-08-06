@@ -50,7 +50,9 @@ def discover_workers(
     ``HANDLERS`` or with an empty list are skipped for handler discovery (they
     may still contribute ``SOURCES`` / ``RESOURCES``). Each handler item
     normally only needs ``entrypoint`` (ID defaults to
-    ``{module}:{entrypoint}``, override with ``handler_id``).
+    ``{module}:{entrypoint}``, override with ``handler_id``). Uploaded plugin
+    roots under ``plugin_uploads/{id}`` or ``plugin_active/{id}`` default to
+    ``{id}:{entrypoint}`` so users do not need to declare a handler ID.
 
     Modules may also export declarative ``SOURCES`` / ``RESOURCES`` mappings.
     Those are merged with any injected registries (inject first, then modules).
@@ -342,11 +344,12 @@ def _mapping_to_spec(
         remote_method = config.get("remote_method")
         if mode is ExecutionMode.ACTOR and not remote_method:
             remote_method = "process"
-        # Default ID is "{module}:{entrypoint}"; handler_id overrides when set.
+        # Default ID is "{module}:{entrypoint}" for builtin workers, and
+        # "{plugin_id}:{entrypoint}" for uploaded plugin roots.
         if config.get("handler_id") is not None:
             name = str(config["handler_id"])
         else:
-            name = f"{path.stem}:{entrypoint}"
+            name = f"{_default_worker_id_prefix(path)}:{entrypoint}"
         resource_ids = tuple(str(item) for item in config.get("resources", ()))
         return HandlerSpec(
             name=name,
@@ -363,6 +366,12 @@ def _mapping_to_spec(
         )
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
         raise WorkerDiscoveryError(f"invalid HANDLERS entry in {path}: {exc}") from exc
+
+
+def _default_worker_id_prefix(path: Path) -> str:
+    if path.parent.parent.name in {"plugin_uploads", "plugin_active"}:
+        return path.parent.name
+    return path.stem
 
 
 def _batch_size_from_config(raw: Any) -> int | tuple[int | None, int | None]:

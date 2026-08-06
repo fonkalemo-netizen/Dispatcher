@@ -1,14 +1,16 @@
 # orders_filter_v1 Plugin Template
 
 This directory is a copyable example for authors who need to upload a Worker plugin.
-Upload `worker.py` with `plugin_id=orders_filter_v1`.
+Upload the `.py` file with `plugin_id=orders_filter_v1`. The file does not need
+to be named `worker.py`; the platform stores the original safe filename in
+plugin metadata.
 
 ## What To Change
 
-- Replace every `orders_filter_v1` prefix with your own `plugin_id`.
-- Keep `handler_id` explicit and prefixed: `{plugin_id}:{handler_name}`.
+- Pass your own `plugin_id` when uploading. It marks this Worker plugin.
 - Replace `SOURCES` with the source names and configs your handler reads.
 - Add `RESOURCES` only when your handler needs static config or a platform-managed snapshot.
+- Keep `entrypoint` pointing to a function or actor class in this module.
 - Return a small result dictionary from the handler.
 
 ## Required Shape
@@ -18,7 +20,6 @@ SOURCES = {...}       # optional only if all sources are injected by the platfor
 RESOURCES = {...}     # optional
 HANDLERS = [
     {
-        "handler_id": "your_plugin:run",
         "entrypoint": "run",
         "sources": ["source-name"],
         "resources": ["resource-name"],
@@ -30,7 +31,8 @@ def run(request, records, resources):
     ...
 ```
 
-`HANDLERS` must be non-empty. For uploaded plugins, `handler_id` must be explicit and must start with the upload `plugin_id`.
+`HANDLERS` must be non-empty. For uploaded plugins, do not set `handler_id`.
+The platform generates it as `{plugin_id}:{entrypoint}` after upload.
 
 ## Handler Signatures
 

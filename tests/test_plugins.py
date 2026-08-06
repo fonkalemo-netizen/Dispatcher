@@ -33,7 +33,6 @@ SOURCES = {{
 
 HANDLERS = [
     {{
-        "handler_id": "{plugin_id}:run",
         "entrypoint": "run",
         "sources": ["plugin-events"],
         "batch_size": [1, 10],
@@ -60,7 +59,6 @@ SOURCES = {
 
 HANDLERS = [
     {
-        "handler_id": "bad:run",
         "entrypoint": "run",
         "sources": ["plugin-events"],
         "batch_size": 1,
@@ -72,7 +70,7 @@ def run(request: Any, records: list[Any]) -> Any:
     return {}
 '''
 
-NO_PREFIX_PLUGIN = '''\
+USER_HANDLER_ID_PLUGIN = '''\
 from __future__ import annotations
 from typing import Any
 
@@ -134,7 +132,7 @@ def process(request: Any, records: list[Any]) -> dict[str, Any]:
 class ValidateWorkerPyTests(unittest.TestCase):
     def test_rejects_dangerous_code(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "worker.py"
+            path = Path(tmp) / "danger.py"
             path.write_text(DANGEROUS_PLUGIN, encoding="utf-8")
             result = validate_worker_py(path, plugin_id="bad", run_discover=False)
             self.assertFalse(result.ok)
@@ -157,13 +155,13 @@ class ValidateWorkerPyTests(unittest.TestCase):
         self.assertIn("orders_filter_v1:filter_orders", result.handler_ids)
         self.assertEqual([], result.warnings)
 
-    def test_rejects_handler_without_plugin_prefix(self) -> None:
+    def test_rejects_user_supplied_handler_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "worker.py"
-            path.write_text(NO_PREFIX_PLUGIN, encoding="utf-8")
+            path = Path(tmp) / "custom_name.py"
+            path.write_text(USER_HANDLER_ID_PLUGIN, encoding="utf-8")
             result = validate_worker_py(path, plugin_id="good", run_discover=False)
             self.assertFalse(result.ok)
-            self.assertTrue(any("must start with" in err for err in result.errors))
+            self.assertTrue(any("must not set handler_id" in err for err in result.errors))
 
 
 class PluginHotReloadTests(unittest.IsolatedAsyncioTestCase):
@@ -188,9 +186,12 @@ class PluginHotReloadTests(unittest.IsolatedAsyncioTestCase):
 
             plugin_id = "orders_v2"
             uploaded = await manager.upload(
-                plugin_id, SAFE_PLUGIN.format(plugin_id=plugin_id).encode("utf-8")
+                plugin_id,
+                SAFE_PLUGIN.format(plugin_id=plugin_id).encode("utf-8"),
+                filename="orders_custom.py",
             )
             self.assertTrue(uploaded.record.validation["ok"])
+            self.assertEqual("orders_custom.py", uploaded.record.filename)
             self.assertFalse(uploaded.record.desired_enabled)
             self.assertFalse(uploaded.record.effective_enabled)
             self.assertTrue(store.staging_path(plugin_id).is_file())

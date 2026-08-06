@@ -64,8 +64,14 @@ class PluginManager:
         await self.apply_pending_reloads()
         return notes
 
-    async def upload(self, plugin_id: str, content: bytes) -> PluginActionResult:
-        record = await self.store.upload(plugin_id, content)
+    async def upload(
+        self,
+        plugin_id: str,
+        content: bytes,
+        *,
+        filename: str | None = None,
+    ) -> PluginActionResult:
+        record = await self.store.upload(plugin_id, content, filename=filename)
         return PluginActionResult(record=record)
 
     async def get(self, plugin_id: str) -> PluginRecord:

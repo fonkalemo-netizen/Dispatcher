@@ -34,7 +34,11 @@ def create_plugin_router(manager: PluginManager) -> Any:
     ) -> dict[str, Any]:
         content = await file.read()
         try:
-            result = await manager.upload(plugin_id, content)
+            result = await manager.upload(
+                plugin_id,
+                content,
+                filename=file.filename,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except PluginStoreError as exc:

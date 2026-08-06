@@ -2,7 +2,7 @@
 
 本文说明用户上传 Worker 插件时，服务端经过哪些模块处理、插件文件如何被解析成 Dispatcher 可调度的 Handler，以及 HTTP / RPC 两种管理接口的调用样例。
 
-当前约定：上传物只支持单个 `worker.py` 文件；内置 Worker 仍来自 `workers/` 目录；用户插件进入独立的 `plugin_uploads/` / `plugin_active/` 目录，不直接写入内置目录。
+当前约定：上传物只支持单个安全的 `.py` 文件，文件名不要求是 `worker.py`；内置 Worker 仍来自 `workers/` 目录；用户插件进入独立的 `plugin_uploads/` / `plugin_active/` 目录，不直接写入内置目录。
 
 ## 1. 目录与元数据
 
@@ -12,9 +12,9 @@
 data/
 ├── workers/                    # 内置 Worker，发布物，不接受用户上传
 ├── plugin_uploads/{plugin_id}/ # staging：上传后默认 disabled
-│   └── worker.py
+│   └── {uploaded_filename}.py
 ├── plugin_active/{plugin_id}/  # active：enable 时校验通过后的生效候选副本
-│   └── worker.py
+│   └── {uploaded_filename}.py
 └── plugins.json                # 元数据唯一真相
 ```
 
@@ -28,7 +28,7 @@ data/
       "desired_enabled": true,
       "effective_enabled": false,
       "reload_pending": true,
-      "filename": "worker.py",
+      "filename": "orders_filter.py",
       "sha256": "....",
       "validation": {
         "ok": true,
@@ -66,7 +66,7 @@ reload_pending == false
 | 模块 | 代码位置 | 职责 |
 |---|---|---|
 | `PluginStore` | `outputs/ray_dispatcher/plugins/store.py` | 管理 staging / active 目录、读写 `plugins.json`、上传、校验、晋升 active、删除、启动 reconcile、生成插件状态指纹 |
-| `validate_worker_py()` | `outputs/ray_dispatcher/plugins/validate.py` | 对上传的 `worker.py` 做文件限制、AST 安全扫描、结构校验、子进程 discover 试加载 |
+| `validate_worker_py()` | `outputs/ray_dispatcher/plugins/validate.py` | 对上传的 `.py` 文件做文件限制、AST 安全扫描、结构校验、子进程 discover 试加载 |
 | `PluginManager` | `outputs/ray_dispatcher/plugins/manager.py` | 面向 HTTP / RPC 的编排层：upload / enable / disable / delete，并调用 `dispatcher.reload_workers()` |
 | `create_plugin_router()` | `outputs/ray_dispatcher/plugins/api.py` | 可选 FastAPI 管理路由，薄封装 `PluginManager` |
 | `discover_worker_roots()` | `outputs/ray_dispatcher/discovery.py` | 多目录 Worker 解析：内置目录 + 插件候选目录，合并 `SOURCES` / `RESOURCES` / `HANDLERS` |
@@ -106,14 +106,14 @@ await manager.startup()
 POST /api/plugins
   multipart:
     plugin_id=orders_filter_v1
-    file=@worker.py
+    file=@orders_filter.py
 ```
 
 内部流程：
 
 1. `PluginStore.upload(plugin_id, content)`
 2. 校验 `plugin_id` 与文件大小。
-3. 写入 `plugin_uploads/{plugin_id}/worker.py`。
+3. 写入 `plugin_uploads/{plugin_id}/{uploaded_filename}.py`，并在 metadata 中保存 `filename`。
 4. 调用 `validate_worker_py()`。
 5. 写入 `plugins.json`，默认：
 
@@ -134,7 +134,7 @@ POST /api/plugins/{plugin_id}/enable
 内部流程：
 
 1. `PluginStore.promote_active(plugin_id)` 再次校验 staging。
-2. 校验通过后，原子晋升到 `plugin_active/{plugin_id}/worker.py`。
+2. 校验通过后，原子晋升到 `plugin_active/{plugin_id}/{uploaded_filename}.py`。
 3. `PluginManager` 探测与内置 Worker / 其它候选插件的 handler/source/resource 冲突。
 4. 写入：
 
@@ -197,9 +197,9 @@ DELETE /api/plugins/{plugin_id}
 
 仅允许删除完全 disabled 且无 pending 的插件。否则返回 `409`。
 
-## 4. `worker.py` 编写与解析规则
+## 4. 插件 `.py` 编写与解析规则
 
-插件文件必须命名为 `worker.py`，必须导出非空 `HANDLERS`。`SOURCES` / `RESOURCES` 可选。
+插件文件必须是安全文件名的 `.py` 文件，必须导出非空 `HANDLERS`。`SOURCES` / `RESOURCES` 可选。用户上传时提供的 `plugin_id` 用来标记这个 Worker 插件；Handler 的内部唯一 ID 由平台生成。
 
 最小形态：
 
@@ -215,7 +215,6 @@ SOURCES = {
 
 HANDLERS = [
     {
-        "handler_id": "orders_filter_v1:filter_orders",
         "entrypoint": "filter_orders",
         "sources": ["plugin-orders"],
         "batch_size": [1, 1000],
@@ -245,7 +244,6 @@ RESOURCES = {
 
 HANDLERS = [
     {
-        "handler_id": "orders_filter_v1:filter_orders",
         "entrypoint": "filter_orders",
         "sources": ["plugin-orders"],
         "resources": ["allowed-users-v1"],
@@ -286,20 +284,19 @@ SOURCES = {
 `handler_id` 规则：
 
 ```text
-handler_id 必须显式声明，并且必须以 "{plugin_id}:" 开头
+上传插件中不要声明 handler_id；平台按 "{plugin_id}:{entrypoint}" 生成
 ```
 
-例如上传时 `plugin_id=orders_filter_v1`，则合法：
+例如上传时 `plugin_id=orders_filter_v1`，并且 `entrypoint=filter_orders`，内部生成：
 
 ```text
 orders_filter_v1:filter_orders
 ```
 
-不合法：
+用户插件中不应该写：
 
 ```text
-filter_orders
-orders_v2:filter_orders
+"handler_id": "orders_filter_v1:filter_orders"
 ```
 
 完整可复制样例见：
@@ -312,9 +309,9 @@ outputs/examples/plugins/orders_filter_v1/worker.py
 
 `validate_worker_py()` 做四层校验：
 
-1. 文件校验：必须叫 `worker.py`，非空，不超过大小上限。
+1. 文件校验：必须是 `.py`，文件名不能包含路径穿越，非空，不超过大小上限。
 2. AST 扫描：拒绝危险 import / 调用。
-3. 结构校验：检查 `HANDLERS`、`handler_id` 前缀、entrypoint、source/resource 引用。
+3. 结构校验：检查 `HANDLERS`、entrypoint 是否存在、source/resource 引用；handler_id 由平台生成。
 4. 子进程 discover：在隔离子进程中调用 `discover_workers(staging_dir)`，超时杀掉。
 
 允许的常见 import：
@@ -546,9 +543,9 @@ RPC 层建议只做薄封装：
 
 | 场景 | 结果 |
 |---|---|
-| 上传文件不叫 `worker.py` | `validation.ok=false` 或接口 `400` |
+| 上传文件不是 `.py` 或文件名不安全 | 接口 `400` 或 `validation.ok=false` |
 | AST 命中危险 API | `validation.ok=false`，不得 enable |
-| handler_id 没有 `{plugin_id}:` 前缀 | `validation.ok=false` |
+| 用户在 HANDLERS 中手写 handler_id | `validation.ok=false` |
 | 与内置或已启用插件 handler/source/resource 冲突 | enable 返回 `failed_conflict` |
 | enable 时有 in-flight | 返回 `pending_inflight`，metadata 保持 pending，等待下次 reload |
 | discover 失败 | 返回 `failed_discover`，pending 保留，方便修复后重试 |
@@ -558,9 +555,8 @@ RPC 层建议只做薄封装：
 ## 10. 推荐排查入口
 
 - 看插件状态：`GET /api/plugins/{plugin_id}`
-- 看 staging 文件：`data/plugin_uploads/{plugin_id}/worker.py`
-- 看 active 文件：`data/plugin_active/{plugin_id}/worker.py`
+- 看 staging 文件：`data/plugin_uploads/{plugin_id}/{filename}`
+- 看 active 文件：`data/plugin_active/{plugin_id}/{filename}`
 - 看元数据：`data/plugins.json`
 - 看 Dispatcher 错误：`dispatcher.state.loop_errors`
 - 看测试覆盖：`outputs/tests/test_plugins.py`
-

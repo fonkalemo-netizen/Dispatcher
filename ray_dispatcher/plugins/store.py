@@ -26,6 +26,18 @@ def _utc_now() -> str:
     )
 
 
+def _safe_plugin_filename(filename: str | None) -> str:
+    raw = (filename or "worker.py").strip()
+    if any(part in raw for part in ("/", "\\", "\x00")):
+        raise PluginStoreError("uploaded plugin filename must not contain path parts")
+    name = raw
+    if not name:
+        name = "worker.py"
+    if name in {"", ".", ".."} or Path(name).suffix != ".py":
+        raise PluginStoreError("uploaded plugin file must be a .py file")
+    return name
+
+
 @dataclass
 class PluginRecord:
     plugin_id: str
@@ -101,11 +113,15 @@ class PluginStore:
         if not self.state_path.exists():
             self._write_state({"plugins": {}})
 
+    def plugin_file_name(self, plugin_id: str) -> str:
+        record = self.get(plugin_id)
+        return record.filename if record is not None else "worker.py"
+
     def staging_path(self, plugin_id: str) -> Path:
-        return self.uploads_dir / plugin_id / "worker.py"
+        return self.uploads_dir / plugin_id / self.plugin_file_name(plugin_id)
 
     def active_path(self, plugin_id: str) -> Path:
-        return self.active_dir / plugin_id / "worker.py"
+        return self.active_dir / plugin_id / self.plugin_file_name(plugin_id)
 
     def active_root(self, plugin_id: str) -> Path:
         return self.active_dir / plugin_id
@@ -122,7 +138,7 @@ class PluginStore:
             if not record.validation.get("ok"):
                 continue
             root = self.active_root(plugin_id)
-            if root.is_dir() and (root / "worker.py").is_file():
+            if root.is_dir() and self.active_path(plugin_id).is_file():
                 roots.append(root)
         return sorted(roots)
 
@@ -141,7 +157,7 @@ class PluginStore:
             ):
                 continue
             root = self.active_root(plugin_id)
-            if root.is_dir() and (root / "worker.py").is_file():
+            if root.is_dir() and self.active_path(plugin_id).is_file():
                 roots.append(root)
         return sorted(roots)
 
@@ -168,7 +184,7 @@ class PluginStore:
             if not record.desired_enabled or not record.validation.get("ok"):
                 continue
             root = self.active_root(plugin_id)
-            if root.is_dir() and (root / "worker.py").is_file():
+            if root.is_dir() and self.active_path(plugin_id).is_file():
                 _add(root)
         return sorted(roots)
 
@@ -299,17 +315,25 @@ class PluginStore:
             self._write_state(state)
         return notes
 
-    async def upload(self, plugin_id: str, content: bytes) -> PluginRecord:
+    async def upload(
+        self,
+        plugin_id: str,
+        content: bytes,
+        *,
+        filename: str | None = None,
+    ) -> PluginRecord:
         validate_plugin_id(plugin_id)
+        safe_filename = _safe_plugin_filename(filename)
         if len(content) > self.max_bytes:
             raise PluginStoreError(
                 f"upload exceeds size limit ({len(content)} > {self.max_bytes})"
             )
         async with self._lock:
             staging_dir = self.uploads_dir / plugin_id
+            self._remove_path(staging_dir)
             staging_dir.mkdir(parents=True, exist_ok=True)
-            staging = staging_dir / "worker.py"
-            tmp = staging.with_suffix(".py.tmp")
+            staging = staging_dir / safe_filename
+            tmp = staging.with_name(f".{safe_filename}.tmp")
             tmp.write_bytes(content)
             os.replace(tmp, staging)
             result = validate_worker_py(
@@ -324,7 +348,7 @@ class PluginStore:
                     bool(existing.get("effective_enabled")) if existing else False
                 ),
                 reload_pending=False,
-                filename="worker.py",
+                filename=safe_filename,
                 sha256=result.sha256,
                 validation={
                     "ok": result.ok,
@@ -401,12 +425,14 @@ class PluginStore:
             self._write_state(state)
             raise PluginStoreError(f"validation failed: {record.last_error}")
 
+        state = self._read_state()
+        record = PluginRecord.from_dict(state["plugins"][plugin_id])
         active_root = self.active_root(plugin_id)
         tmp_root = self.active_dir / f".{plugin_id}.tmp-{os.getpid()}"
         if tmp_root.exists():
             shutil.rmtree(tmp_root)
         tmp_root.mkdir(parents=True, exist_ok=True)
-        target = tmp_root / "worker.py"
+        target = tmp_root / record.filename
         shutil.copy2(staging, target)
         # Atomic replace of directory: remove old then rename tmp.
         final = active_root
