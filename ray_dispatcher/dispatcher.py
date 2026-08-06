@@ -455,6 +455,7 @@ class RayDispatcher:
                     "priority": worker.priority,
                     "output": None if worker.output is None else dict(worker.output),
                     "resource_ids": list(worker.resource_ids),
+                    "external_kafka_json": worker.external_kafka_json,
                     "sources": [
                         source_canonical_dict(source) for source in worker.sources
                     ],
@@ -1933,8 +1934,9 @@ class RayDispatcher:
                 member, run_id, actor_progress_key
             )
             try:
+                data_ref = self._handler_data_ref(member, merge_run.ref)
                 ref = self.ray_adapter.submit(
-                    member, handler_request, merge_run.ref
+                    member, handler_request, data_ref
                 )
                 run = TaskRun(
                     run_id,
@@ -1942,7 +1944,7 @@ class RayDispatcher:
                     member.name,
                     handler_request,
                     ref,
-                    data_ref=merge_run.ref,
+                    data_ref=data_ref,
                 )
             except Exception as exc:
                 run = TaskRun(
@@ -2113,6 +2115,7 @@ class RayDispatcher:
                             data_ref = self.ray_adapter.submit_slice(
                                 data_ref, start_i, end_i
                             )
+                        data_ref = self._handler_data_ref(member, data_ref)
                         ref = self.ray_adapter.submit(
                             member, handler_request, data_ref
                         )
@@ -2142,6 +2145,17 @@ class RayDispatcher:
                     submitted.append(run_id)
         batch.reserved_handler_count = 0
         return submitted
+
+    def _handler_data_ref(self, member: HandlerSpec, data_ref: Any | None) -> Any | None:
+        if data_ref is None or not member.external_kafka_json:
+            return data_ref
+        decode = getattr(self.ray_adapter, "submit_decode_kafka_json", None)
+        if not callable(decode):
+            raise RuntimeError(
+                "external Kafka plugin handlers require ray_adapter."
+                "submit_decode_kafka_json()"
+            )
+        return decode(data_ref)
 
     async def _handle_failure(self, run: TaskRun, error: str) -> None:
         worker = self.workers[run.worker_name]

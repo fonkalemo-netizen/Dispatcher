@@ -9,6 +9,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+from ray_dispatcher.adapter import decode_kafka_json_records
 from ray_dispatcher.models import (
     DispatchRequest,
     KafkaSource,
@@ -102,6 +103,29 @@ class MergeFetchResultsTests(unittest.TestCase):
     def test_rejects_non_list_payload(self) -> None:
         with self.assertRaisesRegex(TypeError, "must be a list"):
             merge_fetch_results(("orders",), {"a": 1})
+
+
+class DecodeKafkaJsonRecordsTests(unittest.TestCase):
+    def test_decodes_single_source_bytes_to_dicts(self) -> None:
+        self.assertEqual(
+            [{"id": 1}, {"id": 2}],
+            decode_kafka_json_records([b'{"id": 1}', '{"id": 2}']),
+        )
+
+    def test_decodes_multisource_payloads(self) -> None:
+        self.assertEqual(
+            {"orders": [{"id": 1}], "payments": [{"id": "p1"}]},
+            decode_kafka_json_records(
+                {
+                    "orders": [b'{"id": 1}'],
+                    "payments": [b'{"id": "p1"}'],
+                }
+            ),
+        )
+
+    def test_rejects_non_object_json(self) -> None:
+        with self.assertRaisesRegex(TypeError, "object/dict"):
+            decode_kafka_json_records([b"[1, 2]"])
 
 
 class KafkaPayloadReaderTests(unittest.TestCase):

@@ -204,6 +204,8 @@ class PluginHotReloadTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(enabled.record.effective_enabled)
             self.assertFalse(enabled.record.reload_pending)
             self.assertIn(f"{plugin_id}:run", dispatcher.workers)
+            self.assertTrue(dispatcher.workers[f"{plugin_id}:run"].external_kafka_json)
+            self.assertFalse(dispatcher.workers["builtin-worker"].external_kafka_json)
             self.assertNotEqual(before, dispatcher._config_fingerprint)
             self.assertTrue(store.active_path(plugin_id).is_file())
 

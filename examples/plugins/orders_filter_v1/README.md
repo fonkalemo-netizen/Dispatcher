@@ -44,7 +44,11 @@ def run(request, records, resources):
     ...
 ```
 
-For a single source, `records` is a list. For a multi-source Kafka handler, `records` is a mapping like `{"orders": [...], "payments": [...]}`.
+For an uploaded plugin, Kafka records are decoded from JSON bytes/strings into
+`dict` items before the handler is called. A single Kafka source receives
+`list[dict]`; a multi-source Kafka handler receives a mapping like
+`{"orders": list[dict], "payments": list[dict]}`. Postgres sources already
+arrive as `list[dict]`.
 
 ## Handler Result
 

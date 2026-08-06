@@ -210,6 +210,15 @@ class FakeRayAdapter:
         self.values[ref] = merged
         return ref
 
+    def submit_decode_kafka_json(self, data_ref: Any) -> str:
+        from ray_dispatcher.adapter import decode_kafka_json_records
+
+        self.sequence += 1
+        ref = f"decode-ref-{self.sequence}"
+        self.values[ref] = decode_kafka_json_records(self.values.get(data_ref, []))
+        self.data_refs[ref] = data_ref
+        return ref
+
     def poll(self, refs: Mapping[str, Any]) -> Mapping[str, ExecutionResult]:
         results: dict[str, ExecutionResult] = {}
         for run_id, ref in refs.items():

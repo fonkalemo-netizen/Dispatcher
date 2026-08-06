@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any, Mapping, Protocol, Sequence
 
 from ray_dispatcher.models import (
@@ -21,6 +22,46 @@ def take_slice(records: Sequence[Any], start: int, end: int) -> list[Any]:
     """Return ``records[start:end]`` for Ray / local slice fanout."""
 
     return list(records[start:end])
+
+
+def decode_kafka_json_records(records: Any) -> Any:
+    """Decode uploaded-plugin Kafka payloads into dict records."""
+
+    if isinstance(records, Mapping):
+        return {
+            str(source_id): _decode_kafka_json_list(payload)
+            for source_id, payload in records.items()
+        }
+    return _decode_kafka_json_list(records)
+
+
+def _decode_kafka_json_list(records: Any) -> list[dict[str, Any]]:
+    if not isinstance(records, list):
+        raise TypeError(
+            f"external Kafka records must be a list, got {type(records).__name__}"
+        )
+    return [_decode_kafka_json_item(item) for item in records]
+
+
+def _decode_kafka_json_item(item: Any) -> dict[str, Any]:
+    if isinstance(item, dict):
+        return item
+    if isinstance(item, (bytes, bytearray, memoryview)):
+        text = bytes(item).decode("utf-8")
+    elif isinstance(item, str):
+        text = item
+    else:
+        raise TypeError(
+            "external Kafka record must be bytes, str, or dict, "
+            f"got {type(item).__name__}"
+        )
+    value = json.loads(text)
+    if not isinstance(value, dict):
+        raise TypeError(
+            "external Kafka record JSON must decode to an object/dict, "
+            f"got {type(value).__name__}"
+        )
+    return value
 
 
 class RayAdapter(Protocol):
@@ -67,6 +108,10 @@ class RayAdapter(Protocol):
         """Return a ref to ``records[start:end]`` without driver-side ``get``."""
         ...
 
+    def submit_decode_kafka_json(self, data_ref: Any) -> Any:
+        """Return a ref with uploaded-plugin Kafka payloads decoded to dicts."""
+        ...
+
     def poll(self, refs: Mapping[str, Any]) -> Any:
         """非阻塞检查一批引用。
 
@@ -107,6 +152,7 @@ class NativeRayAdapter:
         self._payload_fetch_remote = payload_fetch_remote
         self._merge_remote = None
         self._slice_remote = None
+        self._decode_kafka_json_remote = None
         self._resource_loader = resource_loader or ResourceLoader()
         # Task-mode shared puts: resource_ids tuple -> ObjectRef of load_many payload.
         self._resource_put_refs: dict[tuple[str, ...], Any] = {}
@@ -268,6 +314,17 @@ class NativeRayAdapter:
             data_ref, start, end
         )
 
+    def submit_decode_kafka_json(self, data_ref: Any) -> Any:
+        """Decode Kafka bytes/strings for uploaded plugin handlers."""
+
+        remote = self._decode_kafka_json_remote
+        if remote is None and self.ray is not None:
+            remote = self.ray.remote(max_retries=0)(decode_kafka_json_records)
+            self._decode_kafka_json_remote = remote
+        if remote is None:
+            raise RuntimeError("Kafka JSON decode remote is not configured")
+        return remote.options(num_cpus=0.05, max_retries=0).remote(data_ref)
+
     async def poll(self, refs: Mapping[str, Any]) -> Mapping[str, ExecutionResult]:
         """非阻塞轮询 ObjectRef；只返回已完成项的 ``ExecutionResult``。"""
 
@@ -305,4 +362,9 @@ class NativeRayAdapter:
         return float(self.ray.available_resources().get("CPU", 0.0))
 
 
-__all__ = ["NativeRayAdapter", "RayAdapter", "take_slice"]
+__all__ = [
+    "NativeRayAdapter",
+    "RayAdapter",
+    "decode_kafka_json_records",
+    "take_slice",
+]

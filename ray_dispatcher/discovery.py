@@ -351,10 +351,11 @@ def _mapping_to_spec(
         else:
             name = f"{_default_worker_id_prefix(path)}:{entrypoint}"
         resource_ids = tuple(str(item) for item in config.get("resources", ()))
+        sources_tuple = sources
         return HandlerSpec(
             name=name,
             worker=target,
-            sources=sources,
+            sources=sources_tuple,
             output=_output_from_config(config.get("output")),
             mode=mode,
             remote_method=remote_method,
@@ -363,15 +364,23 @@ def _mapping_to_spec(
             max_retries=int(config.get("max_retries", 2)),
             priority=int(config.get("priority", 0)),
             resource_ids=resource_ids,
+            external_kafka_json=(
+                _is_plugin_worker_path(path)
+                and all(isinstance(source, KafkaSource) for source in sources_tuple)
+            ),
         )
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
         raise WorkerDiscoveryError(f"invalid HANDLERS entry in {path}: {exc}") from exc
 
 
 def _default_worker_id_prefix(path: Path) -> str:
-    if path.parent.parent.name in {"plugin_uploads", "plugin_active"}:
+    if _is_plugin_worker_path(path):
         return path.parent.name
     return path.stem
+
+
+def _is_plugin_worker_path(path: Path) -> bool:
+    return path.parent.parent.name in {"plugin_uploads", "plugin_active"}
 
 
 def _batch_size_from_config(raw: Any) -> int | tuple[int | None, int | None]:

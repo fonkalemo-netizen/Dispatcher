@@ -265,6 +265,7 @@ class HandlerSpec:
     priority: int = 0
     output: Mapping[str, Any] | None = None
     resource_ids: tuple[str, ...] = ()
+    external_kafka_json: bool = False
 
     def __post_init__(self) -> None:
         if not self.name:

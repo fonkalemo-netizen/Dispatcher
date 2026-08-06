@@ -37,6 +37,8 @@ HTTP 管理面可选：`pip install -e ".[api]"`（FastAPI）。
 - `list_active_roots()` **只**返回 `effective_enabled=true`；pending enable 由 `list_pending_enable_roots()` / `list_candidate_plugin_roots()` 交给 `reload_workers(candidate_plugin_roots=...)`
 - metadata 只在 swap 成功后 `finalize_after_reload`；失败不 rollback
 - 当前插件样本不假设 `output` / sink 字段；Handler 返回结构化结果即可
+- 上传插件的 Kafka records 会在提交给 Handler 前按 JSON object 解码为 `list[dict]`；
+  内置 workers 仍收到原始 Kafka `message.value()`（通常是 `bytes`）
 - AST 仍支持受控写盘校验策略：禁 `subprocess`/`eval`/…；危险绝对路径拒绝，其它绝对路径 warning。若平台后续向插件开放 sink，应由运行时权限保证只能写 output 根
 - API：`PluginManager` + `create_plugin_router()`（`POST/GET /api/plugins`，enable/disable/delete）
 - 样本：[`examples/plugins/orders_filter_v1/worker.py`](./examples/plugins/orders_filter_v1/worker.py)
@@ -294,7 +296,9 @@ from ray_dispatcher import (
 def normalize_events(request, records):
     """业务 Handler：接收瘦 HandlerRequest + 已 fetch 的 message values。"""
     # request: dispatch_id / handler_id / output（Actor 首次可有 checkpoint_state）
-    # records: list[value]；不要在这里再开 Kafka Consumer
+    # 内置 Kafka records: list[value]，通常是 bytes。
+    # 上传插件 Kafka records: 框架先按 JSON object 解码成 list[dict]。
+    # 不要在这里再开 Kafka Consumer。
     for index, value in enumerate(records):
         persist_event(
             payload=value,
@@ -351,8 +355,10 @@ offset 边界；Postgres 含 `table`、游标边界；多源时间窗还可带
 Handler 签名为 `handler(request, records)`；声明了 `resources` 时 Task 为
 `handler(request, records, resources)`（第三参为共享 ObjectRef 解引用后的 dict）。
 Actor 应在 `__init__(self, resources)` 保存快照，`process(self, request, records)`
-不再接收 resources。Kafka 路径下 `records` 为 message value 列表
-（多源为 `dict[source_id, list[value]]`）；partition/offset 只用于 Dispatcher 调度与 checkpoint，
+不再接收 resources。内置 worker 的 Kafka 路径下 `records` 为 message value 列表
+（多源为 `dict[source_id, list[value]]`，通常 value 是 `bytes`）；上传插件的 Kafka records
+会先按 JSON object 解码为 `list[dict]` 或 `dict[source_id, list[dict]]`。
+partition/offset 只用于 Dispatcher 调度与 checkpoint，
 不塞进 payload。下游幂等由业务唯一键负责。
 
 `HANDLERS` 里的 `output` 是可选的**透传 mapping**（例如 `{"path": "..."}` 或带 `uri`），进入瘦

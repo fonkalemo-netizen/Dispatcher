@@ -262,6 +262,17 @@ def filter_orders(request, records, resources):
     }
 ```
 
+上传插件的 `records` 形态：
+
+| Source | 插件 Handler 收到的 records |
+|---|---|
+| Kafka 单源 | `list[dict]`，框架会把 Kafka `message.value()` 按 JSON object 解码 |
+| Kafka 多源 | `dict[str, list[dict]]`，key 是 `source_id` |
+| Postgres 单源 | `list[dict]` |
+
+这个转换只对上传插件生效。内置 `workers/` 里的 Kafka Handler 仍收到原始
+`message.value()` 列表，通常是 `list[bytes]`，保持向后兼容。
+
 Postgres source 样式：
 
 ```python
