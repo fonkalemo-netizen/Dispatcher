@@ -150,6 +150,49 @@ def events_to_csv(request, records):
     return write_csv_range(request, records)
 ```
 
+Resource 默认是 reload 快照语义：启动 / reload 时加载一次，handler 只读缓存。
+如果某个资源会低频变化，可以配置 TTL：
+
+```python
+RESOURCES = {
+    "rules-v1": {
+        "kind": "file",
+        "path": "/data/resources/rules.json",
+        "refresh_policy": {"type": "ttl", "seconds": 60},
+    },
+    "user-dim-v1": {
+        "kind": "postgres",
+        "dsn": "postgresql://user:password@pgbouncer-host:6432/appdb",
+        "query": "select id, name, tier from public.users where status = 'active'",
+        "key_column": "id",
+        "refresh_policy": {"type": "ttl", "seconds": 300},
+    },
+}
+```
+
+TTL 到期后不会立刻后台刷新，而是在下一次 handler 提交前检查并刷新。
+Task 会拿到新的共享 ObjectRef；Actor 会重建并在 `__init__(resources)` 收到新快照。
+
+如果资源加载后还需要统一转换，可以声明 `formatter`：
+
+```python
+RESOURCES = {
+    "user-dim-v1": {
+        "kind": "postgres",
+        "dsn": "postgresql://user:password@pgbouncer-host:6432/appdb",
+        "query": "select id, name, tier from public.users",
+        "key_column": "id",
+        "formatter": "format_user_dim",
+    },
+}
+
+
+def format_user_dim(rows):
+    return {user_id: row["tier"] for user_id, row in rows.items()}
+```
+
+formatter 在资源加载后、进入缓存前执行；TTL 刷新时也会重新执行。
+
 多源 Kafka 示例：
 
 ```python

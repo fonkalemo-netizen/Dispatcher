@@ -70,8 +70,36 @@ RESOURCES = {
             "u1": {"tier": "gold"},
             "u2": {"tier": "silver"},
         },
-    }
+    },
+    #
+    # 如果资源会低频变化，可以开启 TTL。到期后，框架会在下一次 handler
+    # 提交前重新加载资源；不需要 reload worker。
+    #
+    # "rules-v1": {
+    #     "kind": "file",
+    #     "path": "/data/resources/rules.json",
+    #     "refresh_policy": {"type": "ttl", "seconds": 60},
+    # },
+    #
+    # "user-dim-v1": {
+    #     "kind": "postgres",
+    #     "dsn": "postgresql://user:password@pgbouncer-host:6432/appdb",
+    #     "query": "select id, name, tier from public.users where status = 'active'",
+    #     "key_column": "id",
+    #     "formatter": "format_user_dim",
+    #     "refresh_policy": {"type": "ttl", "seconds": 300},
+    # },
 }
+
+
+def format_user_dim(rows: dict[Any, dict[str, Any]]) -> dict[Any, str]:
+    """可选 resource formatter：资源加载后、进入缓存前执行一次。
+
+    例如 Postgres resource 默认是 dict[id, row_dict]；如果 handler 只关心
+    tier，可以在这里转换成 dict[id, tier]，避免每个 handler 重复转换。
+    """
+
+    return {user_id: row.get("tier", "unknown") for user_id, row in rows.items()}
 
 
 HANDLERS = [

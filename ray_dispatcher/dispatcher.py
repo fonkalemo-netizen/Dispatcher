@@ -209,7 +209,10 @@ class RayDispatcher:
         self.source_registry = source_registry
         self.resource_registry = resource_registry
         self.payload_reader = payload_reader or CompositePayloadReader()
-        self.resource_loader = ResourceLoader(resource_registry)
+        self.resource_formatters: dict[str, Any] = {}
+        self.resource_loader = ResourceLoader(
+            resource_registry, formatters=self.resource_formatters
+        )
         self._workers_dir: Path | None = None
         self._plugin_store = plugin_store
 
@@ -240,7 +243,10 @@ class RayDispatcher:
             ray_adapter.resource_loader = self.resource_loader
 
         if isinstance(workers, (str, Path)):
-            from ray_dispatcher.discovery import discover_workers
+            from ray_dispatcher.discovery import (
+                discover_workers,
+                last_resource_formatters,
+            )
 
             self._workers_dir = Path(workers).expanduser().resolve()
             workers, merged_sources, merged_resources = discover_workers(
@@ -251,7 +257,10 @@ class RayDispatcher:
             )
             self.source_registry = merged_sources
             self.resource_registry = merged_resources
-            self.resource_loader = ResourceLoader(merged_resources)
+            self.resource_formatters = last_resource_formatters()
+            self.resource_loader = ResourceLoader(
+                merged_resources, formatters=self.resource_formatters
+            )
             if hasattr(ray_adapter, "resource_loader"):
                 ray_adapter.resource_loader = self.resource_loader
 
@@ -1930,10 +1939,12 @@ class RayDispatcher:
                 batch.window_start,
                 batch.window_end,
             )
-            handler_request = await self._build_handler_request(
-                member, run_id, actor_progress_key
-            )
+            handler_request = HandlerRequest(run_id, member.name, member.output)
             try:
+                await self._refresh_handler_resources(member)
+                handler_request = await self._build_handler_request(
+                    member, run_id, actor_progress_key
+                )
                 data_ref = self._handler_data_ref(member, merge_run.ref)
                 ref = self.ray_adapter.submit(
                     member, handler_request, data_ref
@@ -2106,11 +2117,13 @@ class RayDispatcher:
                         start_i,
                         end_i,
                     )
-                    handler_request = await self._build_handler_request(
-                        member, run_id, batch.source_state_key
-                    )
+                    handler_request = HandlerRequest(run_id, member.name, member.output)
                     data_ref = fetch_run.ref
                     try:
+                        await self._refresh_handler_resources(member)
+                        handler_request = await self._build_handler_request(
+                            member, run_id, batch.source_state_key
+                        )
                         if event_time and data_ref is not None:
                             data_ref = self.ray_adapter.submit_slice(
                                 data_ref, start_i, end_i
@@ -2145,6 +2158,16 @@ class RayDispatcher:
                     submitted.append(run_id)
         batch.reserved_handler_count = 0
         return submitted
+
+    async def _refresh_handler_resources(self, member: HandlerSpec) -> set[str]:
+        if not member.resource_ids:
+            return set()
+        refreshed = await self.resource_loader.refresh_expired(member.resource_ids)
+        if refreshed and member.mode is ExecutionMode.ACTOR:
+            drop = getattr(self.ray_adapter, "drop_actor", None)
+            if callable(drop):
+                drop(member.name)
+        return refreshed
 
     def _handler_data_ref(self, member: HandlerSpec, data_ref: Any | None) -> Any | None:
         if data_ref is None or not member.external_kafka_json:
@@ -2196,12 +2219,16 @@ class RayDispatcher:
                     )
                 elif run.data_ref is not None:
                     assert isinstance(run.request, HandlerRequest)
+                    if worker.mode is ExecutionMode.TASK:
+                        await self._refresh_handler_resources(worker)
                     run.request = self._handler_request_for_retry(run.request)
                     run.ref = self.ray_adapter.submit(
                         worker, run.request, run.data_ref
                     )
                 else:
                     assert isinstance(run.request, HandlerRequest)
+                    if worker.mode is ExecutionMode.TASK:
+                        await self._refresh_handler_resources(worker)
                     run.request = self._handler_request_for_retry(run.request)
                     run.ref = self.ray_adapter.submit(worker, run.request)
                 run.status = RunStatus.SUBMITTED
@@ -2709,7 +2736,7 @@ class RayDispatcher:
 
         if self._workers_dir is None:
             return False
-        from ray_dispatcher.discovery import discover_workers
+        from ray_dispatcher.discovery import discover_workers, last_resource_formatters
 
         store = self._plugin_store
         if candidate_plugin_roots is None:
@@ -2724,6 +2751,7 @@ class RayDispatcher:
                 source_registry=self._injected_source_registry,
                 resource_registry=self._injected_resource_registry,
             )
+            merged_formatters = last_resource_formatters()
         except Exception as exc:
             self.state.loop_errors.append(
                 f"workers_reload:discover:{type(exc).__name__}: {exc}"
@@ -2744,7 +2772,9 @@ class RayDispatcher:
             if self._has_inflight_work():
                 return False
 
-        new_loader = ResourceLoader(merged_resources)
+        new_loader = ResourceLoader(
+            merged_resources, formatters=merged_formatters
+        )
         try:
             await new_loader.preload()
         except Exception as exc:
@@ -2762,6 +2792,7 @@ class RayDispatcher:
             self._install_worker_groups(tuple(workers))
             self.source_registry = merged_sources
             self.resource_registry = merged_resources
+            self.resource_formatters = merged_formatters
             self.resource_loader = new_loader
             if hasattr(self.ray_adapter, "resource_loader"):
                 self.ray_adapter.resource_loader = new_loader

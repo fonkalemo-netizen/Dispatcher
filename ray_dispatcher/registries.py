@@ -18,6 +18,7 @@ from ray_dispatcher.models import (
 SourceRegistry = Mapping[str, SourceSpec]
 
 ResourceKind = Literal["static", "file", "postgres"]
+RefreshPolicy = Literal["manual", "ttl"]
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,9 @@ class ResourceSpec:
     key_column: str | None = None
     query: str | None = None
     table: str | None = None
+    refresh_policy: RefreshPolicy = "manual"
+    ttl_seconds: float | None = None
+    formatter: str | None = None
 
     def __post_init__(self) -> None:
         if not self.resource_id:
@@ -53,6 +57,13 @@ class ResourceSpec:
                 raise ValueError(
                     "postgres resource requires exactly one of query or table"
                 )
+        if self.refresh_policy not in ("manual", "ttl"):
+            raise ValueError("refresh_policy must be 'manual' or 'ttl'")
+        if self.refresh_policy == "ttl":
+            if self.ttl_seconds is None or self.ttl_seconds <= 0:
+                raise ValueError("ttl refresh_policy requires ttl_seconds > 0")
+        if self.formatter is not None and not self.formatter:
+            raise ValueError("formatter cannot be empty")
 
     def canonical_dict(self) -> dict[str, Any]:
         """Stable mapping used for merge equality checks."""
@@ -60,7 +71,12 @@ class ResourceSpec:
         payload: dict[str, Any] = {
             "resource_id": self.resource_id,
             "kind": self.kind,
+            "refresh_policy": self.refresh_policy,
         }
+        if self.ttl_seconds is not None:
+            payload["ttl_seconds"] = self.ttl_seconds
+        if self.formatter is not None:
+            payload["formatter"] = self.formatter
         if self.kind == "static":
             payload["data"] = self.data
         elif self.kind == "file":
@@ -142,17 +158,24 @@ def resource_from_mapping(raw: Mapping[str, Any]) -> ResourceSpec:
 
     kind = str(raw["kind"]).lower()
     resource_id = str(raw["resource_id"])
+    refresh_policy, ttl_seconds = _refresh_policy_from_mapping(raw)
     if kind == "static":
         return ResourceSpec(
             resource_id=resource_id,
             kind="static",
             data=raw["data"],
+            refresh_policy=refresh_policy,
+            ttl_seconds=ttl_seconds,
+            formatter=(str(raw["formatter"]) if raw.get("formatter") else None),
         )
     if kind == "file":
         return ResourceSpec(
             resource_id=resource_id,
             kind="file",
             path=str(raw["path"]),
+            refresh_policy=refresh_policy,
+            ttl_seconds=ttl_seconds,
+            formatter=(str(raw["formatter"]) if raw.get("formatter") else None),
         )
     if kind == "postgres":
         return ResourceSpec(
@@ -162,8 +185,40 @@ def resource_from_mapping(raw: Mapping[str, Any]) -> ResourceSpec:
             key_column=str(raw["key_column"]),
             query=(str(raw["query"]) if raw.get("query") is not None else None),
             table=(str(raw["table"]) if raw.get("table") is not None else None),
+            refresh_policy=refresh_policy,
+            ttl_seconds=ttl_seconds,
+            formatter=(str(raw["formatter"]) if raw.get("formatter") else None),
         )
     raise ValueError(f"unsupported resource kind: {kind!r}")
+
+
+def _refresh_policy_from_mapping(
+    raw: Mapping[str, Any],
+) -> tuple[RefreshPolicy, float | None]:
+    policy = raw.get("refresh_policy")
+    ttl_seconds = raw.get("ttl_seconds")
+    if policy is None:
+        return "manual", None
+    if isinstance(policy, str):
+        name = policy.lower()
+        if name in {"manual", "reload"}:
+            return "manual", None
+        if name == "ttl":
+            if ttl_seconds is None:
+                raise ValueError("ttl refresh_policy requires ttl_seconds")
+            return "ttl", float(ttl_seconds)
+        raise ValueError(f"unsupported refresh_policy: {policy!r}")
+    if isinstance(policy, Mapping):
+        name = str(policy.get("type", "manual")).lower()
+        if name in {"manual", "reload"}:
+            return "manual", None
+        if name == "ttl":
+            seconds = policy.get("seconds", policy.get("ttl_seconds", ttl_seconds))
+            if seconds is None:
+                raise ValueError("ttl refresh_policy requires seconds")
+            return "ttl", float(seconds)
+        raise ValueError(f"unsupported refresh_policy type: {name!r}")
+    raise TypeError("refresh_policy must be a string or mapping")
 
 
 def resolve_source(registry: SourceRegistry | None, name: str) -> SourceSpec:

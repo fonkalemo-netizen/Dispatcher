@@ -446,6 +446,11 @@ def _structure_from_ast(tree: ast.Module, plugin_id: str) -> dict[str, Any]:
                 source_ids.extend(_dict_string_keys(node.value))
             elif target.id == "RESOURCES" and isinstance(node.value, ast.Dict):
                 resource_ids.extend(_dict_string_keys(node.value))
+                parsed = _parse_resources_assign(
+                    node.value,
+                    top_level_symbols=top_level_symbols,
+                )
+                errors.extend(parsed["errors"])
 
     if not has_handlers:
         errors.append("module must assign HANDLERS")
@@ -468,6 +473,25 @@ def _dict_string_keys(node: ast.Dict) -> list[str]:
         if isinstance(key, ast.Constant) and isinstance(key.value, str):
             keys.append(key.value)
     return keys
+
+
+def _parse_resources_assign(
+    node: ast.Dict,
+    *,
+    top_level_symbols: set[str],
+) -> dict[str, Any]:
+    errors: list[str] = []
+    for index, value in enumerate(node.values):
+        if not isinstance(value, ast.Dict):
+            continue
+        mapping = _dict_literal_strings(value)
+        formatter = mapping.get("formatter")
+        if formatter and formatter not in top_level_symbols:
+            errors.append(
+                f"RESOURCES[{index}] formatter {formatter!r} is not defined "
+                "in this module"
+            )
+    return {"errors": errors}
 
 
 def _parse_handlers_assign(

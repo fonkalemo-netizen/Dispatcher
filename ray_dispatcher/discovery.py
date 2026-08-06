@@ -35,6 +35,15 @@ class WorkerDiscoveryError(RuntimeError):
     pass
 
 
+_LAST_RESOURCE_FORMATTERS: dict[str, Any] = {}
+
+
+def last_resource_formatters() -> dict[str, Any]:
+    """Return resource formatter callables from the last discovery pass."""
+
+    return dict(_LAST_RESOURCE_FORMATTERS)
+
+
 def discover_workers(
     directory: str | Path | Sequence[str | Path],
     *,
@@ -110,6 +119,10 @@ def discover_worker_roots(
         resource_registry,
         [(_module_resources(module, path), path) for path, module in loaded],
     )
+    resource_formatters = _collect_resource_formatters(
+        [(_module_resources(module, path), module, path) for path, module in loaded],
+        merged_resources,
+    )
 
     workers: list[HandlerSpec] = []
     for path, module in loaded:
@@ -138,6 +151,8 @@ def discover_worker_roots(
     names = [worker.name for worker in workers]
     if len(names) != len(set(names)):
         raise WorkerDiscoveryError(f"duplicate worker names discovered: {names}")
+    global _LAST_RESOURCE_FORMATTERS
+    _LAST_RESOURCE_FORMATTERS = resource_formatters
     return tuple(workers), merged_sources, merged_resources
 
 
@@ -234,6 +249,37 @@ def _module_resources(module: ModuleType, path: Path) -> Mapping[str, Any]:
     if not isinstance(raw, Mapping):
         raise WorkerDiscoveryError(f"RESOURCES in {path} must be a mapping")
     return raw
+
+
+def _collect_resource_formatters(
+    module_maps: Sequence[tuple[Mapping[str, Any], ModuleType, Path]],
+    merged_resources: Mapping[str, ResourceSpec],
+) -> dict[str, Any]:
+    formatters: dict[str, Any] = {}
+    for raw_map, module, path in module_maps:
+        for resource_id, raw in raw_map.items():
+            if not isinstance(raw, Mapping):
+                continue
+            formatter_name = raw.get("formatter")
+            if not formatter_name:
+                continue
+            resource_id = str(resource_id)
+            if resource_id not in merged_resources:
+                continue
+            formatter_name = str(formatter_name)
+            formatter = getattr(module, formatter_name, None)
+            if not callable(formatter):
+                raise WorkerDiscoveryError(
+                    f"resource {resource_id!r} in {path} references formatter "
+                    f"{formatter_name!r}, but it is missing or not callable"
+                )
+            existing = formatters.get(resource_id)
+            if existing is not None and existing is not formatter:
+                raise WorkerDiscoveryError(
+                    f"conflicting formatter for resource {resource_id!r} in {path}"
+                )
+            formatters[resource_id] = formatter
+    return formatters
 
 
 def _merge_source_registry(
@@ -595,5 +641,6 @@ __all__ = [
     "discover_worker_roots",
     "discover_workers",
     "file_sha256",
+    "last_resource_formatters",
     "worker_roots_code_fingerprint",
 ]

@@ -54,6 +54,83 @@ class ResourcePreloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("users", spec.table)
         self.assertIn("dsn", spec.canonical_dict())
 
+    def test_resource_from_mapping_ttl_policy(self) -> None:
+        spec = resource_from_mapping(
+            {
+                "resource_id": "rules",
+                "kind": "file",
+                "path": "/tmp/rules.json",
+                "refresh_policy": {"type": "ttl", "seconds": 30},
+            }
+        )
+        self.assertEqual("ttl", spec.refresh_policy)
+        self.assertEqual(30.0, spec.ttl_seconds)
+        self.assertEqual("ttl", spec.canonical_dict()["refresh_policy"])
+        self.assertEqual(30.0, spec.canonical_dict()["ttl_seconds"])
+
+    async def test_ttl_refresh_reloads_file_resource(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rules.json"
+            path.write_text('{"version": 1}', encoding="utf-8")
+            registry = build_resource_registry(
+                {
+                    "rules": {
+                        "kind": "file",
+                        "path": str(path),
+                        "refresh_policy": {"type": "ttl", "seconds": 60},
+                    }
+                }
+            )
+            loader = ResourceLoader(registry)
+            await loader.preload()
+            first_version = loader.version
+            self.assertEqual({"version": 1}, loader.get("rules"))
+
+            path.write_text('{"version": 2}', encoding="utf-8")
+            loader._loaded_at["rules"] -= 61
+            refreshed = await loader.refresh_expired(("rules",))
+
+            self.assertEqual({"rules"}, refreshed)
+            self.assertGreater(loader.version, first_version)
+            self.assertEqual({"version": 2}, loader.get("rules"))
+
+    async def test_resource_formatter_runs_after_load(self) -> None:
+        registry = build_resource_registry(
+            {
+                "users": {
+                    "kind": "static",
+                    "data": {
+                        "u1": {"id": "u1", "tier": "gold"},
+                        "u2": {"id": "u2", "tier": "silver"},
+                    },
+                    "formatter": "tiers_only",
+                }
+            }
+        )
+
+        def tiers_only(rows: dict[str, dict[str, Any]]) -> dict[str, str]:
+            return {key: row["tier"] for key, row in rows.items()}
+
+        loader = ResourceLoader(registry, formatters={"users": tiers_only})
+        await loader.preload()
+
+        self.assertEqual({"u1": "gold", "u2": "silver"}, loader.get("users"))
+
+    async def test_manual_policy_does_not_ttl_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rules.json"
+            path.write_text('{"version": 1}', encoding="utf-8")
+            registry = build_resource_registry(
+                {"rules": {"kind": "file", "path": str(path)}}
+            )
+            loader = ResourceLoader(registry)
+            await loader.preload()
+            path.write_text('{"version": 2}', encoding="utf-8")
+            loader._loaded_at["rules"] -= 3600
+
+            self.assertEqual(set(), await loader.refresh_expired(("rules",)))
+            self.assertEqual({"version": 1}, loader.get("rules"))
+
     async def test_preload_loads_static_and_mocked_postgres(self) -> None:
         registry = build_resource_registry(
             {

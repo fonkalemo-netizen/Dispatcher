@@ -154,8 +154,8 @@ class NativeRayAdapter:
         self._slice_remote = None
         self._decode_kafka_json_remote = None
         self._resource_loader = resource_loader or ResourceLoader()
-        # Task-mode shared puts: resource_ids tuple -> ObjectRef of load_many payload.
-        self._resource_put_refs: dict[tuple[str, ...], Any] = {}
+        # Task-mode shared puts: (loader version, resource_ids) -> ObjectRef.
+        self._resource_put_refs: dict[tuple[int, tuple[str, ...]], Any] = {}
 
     @property
     def resource_loader(self) -> ResourceLoader:
@@ -208,12 +208,16 @@ class NativeRayAdapter:
 
         if not spec.resource_ids:
             return None
-        key = spec.resource_ids
+        key = (self.resource_loader.version, spec.resource_ids)
         cached = self._resource_put_refs.get(key)
         if cached is not None:
             return cached
         payload = self._resources_payload(spec)
         assert payload is not None
+        key = (self.resource_loader.version, spec.resource_ids)
+        cached = self._resource_put_refs.get(key)
+        if cached is not None:
+            return cached
         put = getattr(self.ray, "put", None)
         if put is None:
             raise RuntimeError(

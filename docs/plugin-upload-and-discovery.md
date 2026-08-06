@@ -292,6 +292,65 @@ SOURCES = {
 }
 ```
 
+Resource TTL 样式：
+
+```python
+RESOURCES = {
+    "rules-v1": {
+        "kind": "file",
+        "path": "/data/resources/rules.json",
+        "refresh_policy": {"type": "ttl", "seconds": 60},
+    },
+    "active-users-v1": {
+        "kind": "postgres",
+        "dsn": "postgresql://user:password@pgbouncer-host:6432/appdb",
+        "query": """
+            select id, name, tier
+            from public.users
+            where status = 'active'
+        """,
+        "key_column": "id",
+        "refresh_policy": {"type": "ttl", "seconds": 300},
+    },
+}
+```
+
+不配置 `refresh_policy` 时等价于 manual/reload 快照：启动或 reload 时加载一次。
+配置 TTL 后，框架会在下一次 handler 提交前检查是否过期，过期才重新加载。
+Task handler 会收到新的共享资源引用；Actor handler 会重建 Actor，让
+`__init__(resources)` 注入新快照。
+
+Resource formatter 样式：
+
+```python
+RESOURCES = {
+    "active-users-v1": {
+        "kind": "postgres",
+        "dsn": "postgresql://user:password@pgbouncer-host:6432/appdb",
+        "query": "select id, name, tier from public.users where status = 'active'",
+        "key_column": "id",
+        "formatter": "format_user_dim",
+        "refresh_policy": {"type": "ttl", "seconds": 300},
+    },
+}
+
+
+def format_user_dim(rows):
+    # postgres resource 默认是 dict[key_column_value, row_dict]
+    # formatter 的返回值会成为 resources["active-users-v1"]
+    return {
+        user_id: {
+            "name": row["name"],
+            "tier": row["tier"],
+        }
+        for user_id, row in rows.items()
+    }
+```
+
+`formatter` 必须是当前插件模块里的可调用函数。它在资源加载后、写入
+ResourceLoader 缓存前执行；TTL 刷新时也会再次执行。这样 handler 拿到的就是
+转换后的结构，不需要每个 handler 重复清洗。
+
 `handler_id` 规则：
 
 ```text

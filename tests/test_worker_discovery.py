@@ -481,6 +481,48 @@ def process(request, records, resources):
             loaded = ResourceLoader(resources).get("user-dim-v1")
         self.assertEqual({"1": {"name": "alice"}}, loaded)
 
+    def test_resource_formatter_is_collected_from_module(self) -> None:
+        from ray_dispatcher.discovery import last_resource_formatters
+
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "enriched.py").write_text(
+                '''
+SOURCES = {
+    "orders": {
+        "kind": "kafka",
+        "brokers": ["broker:9092"],
+        "topic": "orders",
+    }
+}
+RESOURCES = {
+    "user-dim-v1": {
+        "kind": "static",
+        "data": {"u1": {"tier": "gold"}},
+        "formatter": "format_user_dim",
+    }
+}
+HANDLERS = [
+    {
+        "entrypoint": "process",
+        "sources": ["orders"],
+        "resources": ["user-dim-v1"],
+    },
+]
+
+def format_user_dim(rows):
+    return {key: row["tier"] for key, row in rows.items()}
+
+def process(request, records, resources):
+    return resources["user-dim-v1"]
+''',
+                encoding="utf-8",
+            )
+            _, _, resources = discover_workers(directory)
+            loaded = ResourceLoader(
+                resources, formatters=last_resource_formatters()
+            ).get("user-dim-v1")
+        self.assertEqual({"u1": "gold"}, loaded)
+
     def test_unknown_resource_name_raises(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             Path(directory, "missing.py").write_text(
