@@ -17,8 +17,9 @@ from ray_dispatcher.models import (
 
 SourceRegistry = Mapping[str, SourceSpec]
 
-ResourceKind = Literal["static", "file", "postgres"]
+ResourceKind = Literal["static", "file", "postgres", "eq_rule_labeler"]
 RefreshPolicy = Literal["manual", "ttl"]
+RuleRecordMode = Literal["attr", "dict"]
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,9 @@ class ResourceSpec:
     key_column: str | None = None
     query: str | None = None
     table: str | None = None
+    rules: Any | None = None
+    record_mode: RuleRecordMode = "attr"
+    multi_match: bool = True
     refresh_policy: RefreshPolicy = "manual"
     ttl_seconds: float | None = None
     formatter: str | None = None
@@ -40,8 +44,11 @@ class ResourceSpec:
     def __post_init__(self) -> None:
         if not self.resource_id:
             raise ValueError("resource_id cannot be empty")
-        if self.kind not in ("static", "file", "postgres"):
-            raise ValueError("resource kind must be 'static', 'file', or 'postgres'")
+        if self.kind not in ("static", "file", "postgres", "eq_rule_labeler"):
+            raise ValueError(
+                "resource kind must be 'static', 'file', 'postgres', "
+                "or 'eq_rule_labeler'"
+            )
         if self.kind == "static" and self.data is None:
             raise ValueError("static resource requires data")
         if self.kind == "file" and not self.path:
@@ -57,6 +64,11 @@ class ResourceSpec:
                 raise ValueError(
                     "postgres resource requires exactly one of query or table"
                 )
+        if self.kind == "eq_rule_labeler":
+            if self.rules is None and not self.path:
+                raise ValueError("eq_rule_labeler resource requires rules or path")
+            if self.record_mode not in ("attr", "dict"):
+                raise ValueError("record_mode must be 'attr' or 'dict'")
         if self.refresh_policy not in ("manual", "ttl"):
             raise ValueError("refresh_policy must be 'manual' or 'ttl'")
         if self.refresh_policy == "ttl":
@@ -81,13 +93,20 @@ class ResourceSpec:
             payload["data"] = self.data
         elif self.kind == "file":
             payload["path"] = self.path
-        else:
+        elif self.kind == "postgres":
             payload["dsn"] = self.dsn
             payload["key_column"] = self.key_column
             if self.query:
                 payload["query"] = self.query
             else:
                 payload["table"] = self.table
+        else:
+            if self.rules is not None:
+                payload["rules"] = self.rules
+            if self.path is not None:
+                payload["path"] = self.path
+            payload["record_mode"] = self.record_mode
+            payload["multi_match"] = self.multi_match
         return payload
 
 
@@ -185,6 +204,18 @@ def resource_from_mapping(raw: Mapping[str, Any]) -> ResourceSpec:
             key_column=str(raw["key_column"]),
             query=(str(raw["query"]) if raw.get("query") is not None else None),
             table=(str(raw["table"]) if raw.get("table") is not None else None),
+            refresh_policy=refresh_policy,
+            ttl_seconds=ttl_seconds,
+            formatter=(str(raw["formatter"]) if raw.get("formatter") else None),
+        )
+    if kind == "eq_rule_labeler":
+        return ResourceSpec(
+            resource_id=resource_id,
+            kind="eq_rule_labeler",
+            rules=raw.get("rules", raw.get("data")),
+            path=(str(raw["path"]) if raw.get("path") is not None else None),
+            record_mode=str(raw.get("record_mode", "attr")),  # type: ignore[arg-type]
+            multi_match=bool(raw.get("multi_match", True)),
             refresh_policy=refresh_policy,
             ttl_seconds=ttl_seconds,
             formatter=(str(raw["formatter"]) if raw.get("formatter") else None),
@@ -349,6 +380,7 @@ __all__ = [
     "ResourceKind",
     "ResourceRegistry",
     "ResourceSpec",
+    "RuleRecordMode",
     "SourceRegistry",
     "build_resource_registry",
     "build_source_registry",

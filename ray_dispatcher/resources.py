@@ -1,7 +1,10 @@
 """Resource loading for declarative resource specs.
 
 Resources are preloaded into an in-process cache after the final registry is
-merged (startup / hot-reload). Submit paths should hit the cache only.
+merged (startup / hot-reload). Per-resource load failures are isolated: other
+resources stay available, and only handlers that depend on a failed resource
+are blocked at submit time. Submit paths should hit the cache only after
+``ensure_available``.
 """
 
 from __future__ import annotations
@@ -11,9 +14,10 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from ray_dispatcher.registries import ResourceRegistry, ResourceSpec, resolve_resource
+from ray_dispatcher.rules import build_eq_rule_labeler
 
 _TABLE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -31,6 +35,7 @@ class ResourceLoader:
         self.formatters = formatters or {}
         self._cache: dict[str, Any] = {}
         self._loaded_at: dict[str, float] = {}
+        self._failed: dict[str, str] = {}
         self._preloaded = False
         self._version = 0
 
@@ -46,12 +51,14 @@ class ResourceLoader:
         self.formatters = formatters or {}
         self._cache.clear()
         self._loaded_at.clear()
+        self._failed.clear()
         self._preloaded = False
         self._version += 1
 
     def clear_cache(self) -> None:
         self._cache.clear()
         self._loaded_at.clear()
+        self._failed.clear()
         self._preloaded = False
         self._version += 1
 
@@ -61,44 +68,92 @@ class ResourceLoader:
 
         return self._version
 
-    async def preload(self) -> None:
-        """Load every registry entry into cache atomically.
+    @property
+    def failed_resources(self) -> Mapping[str, str]:
+        """resource_id -> last load error for resources not currently cached."""
 
-        On failure the previous cache is restored and the error is re-raised.
+        return dict(self._failed)
+
+    async def preload(self) -> dict[str, str]:
+        """Load every registry entry best-effort.
+
+        Successful entries populate the cache. Per-resource load failures are
+        recorded in ``failed_resources`` and omitted from the cache; they do
+        not raise. Returns ``{resource_id: error}`` for failures.
+
+        Structural registry errors (e.g. key/resource_id mismatch) still raise.
         """
 
         if not self.registry:
             self._cache = {}
+            self._loaded_at = {}
+            self._failed = {}
             self._preloaded = True
-            return
+            self._version += 1
+            return {}
 
-        previous = self._cache
-        previous_loaded_at = self._loaded_at
-        previous_flag = self._preloaded
         built: dict[str, Any] = {}
         loaded_at: dict[str, float] = {}
-        try:
-            for resource_id, spec in self.registry.items():
-                if spec.resource_id != resource_id:
-                    raise ValueError(
-                        f"resource registry key {resource_id!r} must equal "
-                        f"resource_id {spec.resource_id!r}"
-                    )
+        failed: dict[str, str] = {}
+        for resource_id, spec in self.registry.items():
+            if spec.resource_id != resource_id:
+                raise ValueError(
+                    f"resource registry key {resource_id!r} must equal "
+                    f"resource_id {spec.resource_id!r}"
+                )
+            try:
                 built[resource_id] = await self._load_and_format_async(spec)
                 loaded_at[resource_id] = time.monotonic()
-        except Exception:
-            self._cache = previous
-            self._loaded_at = previous_loaded_at
-            self._preloaded = previous_flag
-            raise
+            except Exception as exc:
+                failed[resource_id] = f"{type(exc).__name__}: {exc}"
+
         self._cache = built
         self._loaded_at = loaded_at
+        self._failed = failed
         self._preloaded = True
         self._version += 1
+        return dict(failed)
+
+    async def ensure_available(self, resource_ids: Sequence[str]) -> None:
+        """Ensure ``resource_ids`` are cached, retrying missing/failed loads.
+
+        Raises ``RuntimeError`` listing any resources that remain unavailable.
+        Handlers that do not depend on those ids are unaffected.
+        """
+
+        if not resource_ids:
+            return
+        errors: list[str] = []
+        changed = False
+        for resource_id in resource_ids:
+            if resource_id in self._cache:
+                continue
+            try:
+                spec = resolve_resource(self.registry, resource_id)
+                value = await self._load_and_format_async(spec)
+            except Exception as exc:
+                message = f"{type(exc).__name__}: {exc}"
+                self._failed[resource_id] = message
+                errors.append(f"{resource_id}: {message}")
+                continue
+            self._cache[resource_id] = value
+            self._loaded_at[resource_id] = time.monotonic()
+            self._failed.pop(resource_id, None)
+            changed = True
+        if changed:
+            self._version += 1
+        if errors:
+            raise RuntimeError(
+                "handler resources unavailable: " + "; ".join(errors)
+            )
 
     def get(self, resource_id: str) -> Any:
         if resource_id in self._cache:
             return self._cache[resource_id]
+        if resource_id in self._failed:
+            raise RuntimeError(
+                f"resource {resource_id!r} unavailable: {self._failed[resource_id]}"
+            )
         spec = resolve_resource(self.registry, resource_id)
         if spec.kind == "postgres":
             raise RuntimeError(
@@ -107,6 +162,7 @@ class ResourceLoader:
         value = self._load_and_format_sync(spec)
         self._cache[resource_id] = value
         self._loaded_at[resource_id] = time.monotonic()
+        self._failed.pop(resource_id, None)
         self._version += 1
         return value
 
@@ -116,8 +172,10 @@ class ResourceLoader:
     async def refresh_expired(self, resource_ids: tuple[str, ...]) -> set[str]:
         """Refresh TTL resources that expired before handler submission.
 
-        Returns the resource IDs that received a new value. If a refresh fails,
-        the previous cached value remains installed and the exception is raised.
+        Returns the resource IDs that received a new value. If a refresh fails
+        and a previous cached value exists, the cache is kept and the error is
+        recorded in ``failed_resources`` without raising. If refresh fails with
+        no cached value, the exception is raised (submit path isolates per handler).
         """
 
         if not resource_ids or not self.registry:
@@ -128,9 +186,20 @@ class ResourceLoader:
             spec = resolve_resource(self.registry, resource_id)
             if not self._should_refresh(spec, now):
                 continue
-            value = await self._load_and_format_async(spec)
+            previous = self._cache.get(resource_id)
+            try:
+                value = await self._load_and_format_async(spec)
+            except Exception as exc:
+                message = f"{type(exc).__name__}: {exc}"
+                self._failed[resource_id] = message
+                if previous is not None:
+                    continue
+                raise RuntimeError(
+                    f"resource {resource_id!r} unavailable: {message}"
+                ) from exc
             self._cache[resource_id] = value
             self._loaded_at[resource_id] = time.monotonic()
+            self._failed.pop(resource_id, None)
             refreshed.add(resource_id)
         if refreshed:
             self._version += 1
@@ -149,7 +218,7 @@ class ResourceLoader:
 
     @classmethod
     async def _load_async(cls, spec: ResourceSpec) -> Any:
-        if spec.kind in ("static", "file"):
+        if spec.kind in ("static", "file", "eq_rule_labeler"):
             return cls._load_sync(spec)
         if spec.kind == "postgres":
             return await cls._load_postgres(spec)
@@ -202,6 +271,16 @@ class ResourceLoader:
         if spec.kind == "file":
             path = Path(str(spec.path)).expanduser()
             return json.loads(path.read_text(encoding="utf-8"))
+        if spec.kind == "eq_rule_labeler":
+            payload = spec.rules
+            if payload is None:
+                path = Path(str(spec.path)).expanduser()
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            return build_eq_rule_labeler(
+                payload,
+                record_mode=spec.record_mode,
+                multi_match=spec.multi_match,
+            )
         raise ValueError(f"unsupported sync resource kind: {spec.kind!r}")
 
     @classmethod

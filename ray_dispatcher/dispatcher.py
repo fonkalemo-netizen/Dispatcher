@@ -2162,6 +2162,8 @@ class RayDispatcher:
     async def _refresh_handler_resources(self, member: HandlerSpec) -> set[str]:
         if not member.resource_ids:
             return set()
+        # Retry missing/failed resources for this handler only; others unaffected.
+        await self.resource_loader.ensure_available(member.resource_ids)
         refreshed = await self.resource_loader.refresh_expired(member.resource_ids)
         if refreshed and member.mode is ExecutionMode.ACTOR:
             drop = getattr(self.ray_adapter, "drop_actor", None)
@@ -2694,7 +2696,11 @@ class RayDispatcher:
 
         if self._tasks:
             return
-        await self.resource_loader.preload()
+        failed = await self.resource_loader.preload()
+        for resource_id, error in failed.items():
+            self.state.loop_errors.append(
+                f"resource_preload:{resource_id}: {error}"
+            )
         self._stopping.clear()
         loops: list[tuple[str, Callable[[], Any], float]] = [
             ("data_listener", self.data_listener, self.listener_interval),
@@ -2776,12 +2782,17 @@ class RayDispatcher:
             merged_resources, formatters=merged_formatters
         )
         try:
-            await new_loader.preload()
+            failed = await new_loader.preload()
         except Exception as exc:
+            # Structural registry errors still abort the swap.
             self.state.loop_errors.append(
                 f"workers_reload:preload:{type(exc).__name__}: {exc}"
             )
             return False
+        for resource_id, error in failed.items():
+            self.state.loop_errors.append(
+                f"workers_reload:resource_preload:{resource_id}: {error}"
+            )
 
         async with self._lock:
             if self._has_inflight_work():
@@ -2919,6 +2930,7 @@ class RayDispatcher:
                 for key, run in self.state.runs.items()
             },
             "loop_errors": list(self.state.loop_errors),
+            "failed_resources": dict(self.resource_loader.failed_resources),
             "failures": {
                 "store": type(self.failure_store).__name__,
             },

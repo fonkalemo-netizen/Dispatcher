@@ -351,6 +351,36 @@ def format_user_dim(rows):
 ResourceLoader 缓存前执行；TTL 刷新时也会再次执行。这样 handler 拿到的就是
 转换后的结构，不需要每个 handler 重复清洗。
 
+等值规则打标样式：
+
+```python
+RESOURCES = {
+    "order-labels-v1": {
+        "kind": "eq_rule_labeler",
+        # 插件 Kafka 默认会把 JSON records 交给 handler，所以通常用 dict。
+        # 内置高吞吐 worker 如果自己用 msgspec.Struct 解码，则用 attr。
+        "record_mode": "dict",
+        "multi_match": True,
+        "rules": [
+            {"when": {"status": "paid"}, "label": "已支付订单"},
+            {"when": {"status": "paid", "channel": "app"}, "label": "APP已支付订单"},
+        ],
+    }
+}
+
+
+def filter_orders(request, records, resources):
+    labeler = resources["order-labels-v1"]
+    for row, labels in zip(records, labeler.match_many(records)):
+        if labels:
+            row = {**row, "labels": labels}
+            ...
+```
+
+`eq_rule_labeler` 第一版只支持字段等于，不支持表达式、正则、范围、函数调用。
+规则会在资源加载时编译成哈希索引，运行时按字段组合查表，适合高吞吐场景。
+规则文件也可以走 `path` + `refresh_policy={"type": "ttl", "seconds": 60}`。
+
 `handler_id` 规则：
 
 ```text

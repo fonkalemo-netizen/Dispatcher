@@ -55,7 +55,7 @@ flowchart TD
    `WORKER_SPEC` / `get_worker_spec`。整目录至少一个 Handler，否则报错。
 5. `sources` / `resources` 为合并后注册表中的名字；禁止 HANDLERS 内联 source mapping。
    - **Source**：随时间增量变化、由 Dispatcher 追进度（checkpoint / 窗口）。
-   - **Resource**：快照旁路依赖（放进 `RESOURCES` 即快照语义）。`static` 仅小配置；大维表用 `file`；也可用 `postgres`（`query` 或 `table` + `key_column` + `dsn`）。合并完成后由 Dispatcher 在 `start()` 前统一 `ResourceLoader.preload()`；submit 热路径只读 cache。
+   - **Resource**：快照旁路依赖（放进 `RESOURCES` 即快照语义）。`static` 仅小配置；大维表用 `file`；也可用 `postgres`（`query` 或 `table` + `key_column` + `dsn`）。合并完成后由 Dispatcher 在 `start()` 前 `ResourceLoader.preload()`（**按 resource 尽力加载**：单个失败记入 `failed_resources` / `loop_errors`，不阻断启动）。submit 前对 handler 的 `resource_ids` 调用 `ensure_available`（可重试）；仍失败则仅该 handler 提交失败。
 6. `output` 为可选透传 mapping，进入瘦 `HandlerRequest.output`；框架不解释。面向目录投放时，业务依赖宜函数内 import，写出路径走 `output`。
 7. 普通函数通过 `ray.remote(max_retries=0)` 包装；Actor 类通过 `ray.remote(max_restarts=0)` 包装。
 8. 返回 `(handlers, source_registry, resource_registry)`；目录启动时 Dispatcher 用合并结果重建 `ResourceLoader`，并在进入调度循环前 preload 全部资源。
@@ -67,7 +67,7 @@ fetch/内部使用，数据经 `records` 传入。
 
 ## 2. 启动循环
 
-`start()` 先 `ResourceLoader.preload()`，再创建 asyncio Task：
+`start()` 先 `ResourceLoader.preload()`（单 resource 失败不阻断），再创建 asyncio Task：
 
 | 循环 | 默认周期 | 单次执行函数 | 备注 |
 |---|---:|---|---|
@@ -327,7 +327,7 @@ FailureStore（构造注入，默认 MemoryFailureStore）
 
 ## 8. 当前实现边界
 
-1. 热加载已实现（`reload_workers` / `reload_interval`）；有 in-flight 时不切换，preload 失败则保留旧配置。
+1. 热加载已实现（`reload_workers` / `reload_interval`）；有 in-flight 时不切换；preload 结构性错误保留旧配置，单 resource 加载失败仍可切换（失败 resource 记入 `loop_errors`）。
 2. data_listener、ray_trigger、ray_status 使用同一个状态锁。`data_listener` 的远程观察 IO，以及
    `ray_status` 的 checkpoint / failure 落盘，已在锁外执行（batch 经 `COMMITTING`/`SKIPPING` 中间态）。
    `ray_trigger` 的切分查询（`postgres_ranges` / `offsets_for_times`）仍可能在持锁期间 await。

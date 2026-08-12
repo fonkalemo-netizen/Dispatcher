@@ -94,6 +94,7 @@ from ray_dispatcher.registries import (
     source_from_mapping,
 )
 from ray_dispatcher.resources import ResourceLoader
+from ray_dispatcher.rules import EqRuleLabeler, build_eq_rule_labeler
 from ray_dispatcher.sources import (
     EmptyPostgresSource,
     SourceDependencyError,
@@ -118,6 +119,7 @@ __all__ = [
     "EVENT_TRIGGER_EVALUATED",
     "EVENT_WINDOW_OVER_CAPACITY",
     "EmptyPostgresSource",
+    "EqRuleLabeler",
     "EventLog",
     "EventLogError",
     "ExecutionMode",
@@ -167,6 +169,7 @@ __all__ = [
     "ValidationResult",
     "WorkerDiscoveryError",
     "build_resource_registry",
+    "build_eq_rule_labeler",
     "build_source_registry",
     "create_event_log",
     "create_plugin_router",

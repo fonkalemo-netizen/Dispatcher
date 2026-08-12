@@ -9,6 +9,7 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 from ray_dispatcher import (
+    EqRuleLabeler,
     HandlerSpec,
     KafkaSource,
     MemoryCheckpointStore,
@@ -154,7 +155,7 @@ class ResourcePreloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({1: {"id": 1, "name": "alice"}}, loader.get("users"))
         self.assertTrue(loader._preloaded)
 
-    async def test_preload_failure_restores_previous_cache(self) -> None:
+    async def test_preload_isolates_failed_resource(self) -> None:
         registry = build_resource_registry(
             {
                 "cfg": {"kind": "static", "data": {"ok": True}},
@@ -166,19 +167,53 @@ class ResourcePreloadTests(unittest.IsolatedAsyncioTestCase):
                 },
             }
         )
-        loader = ResourceLoader({"cfg": registry["cfg"]})
-        await loader.preload()
-        loader.replace_registry(registry)
+        loader = ResourceLoader(registry)
+        with patch.object(
+            ResourceLoader,
+            "_load_postgres",
+            new=AsyncMock(side_effect=OSError("Network is unreachable")),
+        ):
+            failed = await loader.preload()
+        self.assertTrue(loader._preloaded)
+        self.assertEqual({"ok": True}, loader.get("cfg"))
+        self.assertIn("users", failed)
+        self.assertIn("Network is unreachable", failed["users"])
+        self.assertEqual(failed, dict(loader.failed_resources))
+        with self.assertRaises(RuntimeError) as ctx:
+            loader.get("users")
+        self.assertIn("unavailable", str(ctx.exception))
+
+    async def test_ensure_available_retries_then_isolates(self) -> None:
+        registry = build_resource_registry(
+            {
+                "users": {
+                    "kind": "postgres",
+                    "dsn": "postgresql://db/app",
+                    "key_column": "id",
+                    "query": "select id from users",
+                },
+            }
+        )
+        loader = ResourceLoader(registry)
         with patch.object(
             ResourceLoader,
             "_load_postgres",
             new=AsyncMock(side_effect=RuntimeError("db down")),
         ):
-            with self.assertRaises(RuntimeError):
-                await loader.preload()
-        # replace_registry cleared cache; failed preload restores empty previous
-        self.assertFalse(loader._preloaded)
-        self.assertEqual({}, loader._cache)
+            await loader.preload()
+            with self.assertRaises(RuntimeError) as ctx:
+                await loader.ensure_available(("users",))
+        self.assertIn("handler resources unavailable", str(ctx.exception))
+        self.assertIn("users", loader.failed_resources)
+
+        with patch.object(
+            ResourceLoader,
+            "_load_postgres",
+            new=AsyncMock(return_value={1: {"id": 1}}),
+        ):
+            await loader.ensure_available(("users",))
+        self.assertEqual({1: {"id": 1}}, loader.get("users"))
+        self.assertEqual({}, dict(loader.failed_resources))
 
     async def test_dispatcher_start_preloads_resources(self) -> None:
         source = KafkaSource(
@@ -203,6 +238,59 @@ class ResourcePreloadTests(unittest.IsolatedAsyncioTestCase):
         try:
             self.assertTrue(dispatcher.resource_loader._preloaded)
             self.assertEqual({"x": 1}, dispatcher.resource_loader.get("dim"))
+        finally:
+            await dispatcher.stop()
+
+    async def test_dispatcher_start_isolates_failed_resource(self) -> None:
+        source = KafkaSource(
+            "events", ("broker",), "events", initial_offset="earliest"
+        )
+        resources = build_resource_registry(
+            {
+                "dim": {"kind": "static", "data": {"x": 1}},
+                "users": {
+                    "kind": "postgres",
+                    "dsn": "postgresql://db/app",
+                    "key_column": "id",
+                    "table": "users",
+                },
+            }
+        )
+        ok_worker = HandlerSpec(
+            "ok", object(), (source,), resource_ids=("dim",)
+        )
+        bad_worker = HandlerSpec(
+            "bad", object(), (source,), resource_ids=("users",)
+        )
+        backend = FakeRayAdapter()
+        dispatcher = RayDispatcher(
+            (ok_worker, bad_worker),
+            ray_adapter=backend,
+            resource_registry=resources,
+            event_log=create_event_log(default_logging=False),
+            event_log_interval=0,
+        )
+        with patch.object(
+            ResourceLoader,
+            "_load_postgres",
+            new=AsyncMock(side_effect=OSError("Network is unreachable")),
+        ):
+            await dispatcher.start()
+        try:
+            self.assertTrue(dispatcher.resource_loader._preloaded)
+            self.assertEqual({"x": 1}, dispatcher.resource_loader.get("dim"))
+            self.assertIn("users", dispatcher.resource_loader.failed_resources)
+            self.assertTrue(
+                any(
+                    item.startswith("resource_preload:users:")
+                    for item in dispatcher.state.loop_errors
+                )
+            )
+            await dispatcher.resource_loader.ensure_available(("dim",))
+            with self.assertRaises(RuntimeError):
+                await dispatcher.resource_loader.ensure_available(("users",))
+            snap = await dispatcher.snapshot()
+            self.assertIn("users", snap["failed_resources"])
         finally:
             await dispatcher.stop()
 
@@ -344,6 +432,114 @@ class SnapshotLockTests(unittest.IsolatedAsyncioTestCase):
         async with dispatcher._lock:
             locked = dispatcher._build_snapshot()
         self.assertEqual(snap["sources"].keys(), locked["sources"].keys())
+
+
+class EqRuleLabelerTests(unittest.IsolatedAsyncioTestCase):
+    def test_attr_mode_matches_without_dict_conversion(self) -> None:
+        class Order:
+            def __init__(self, status: str, channel: str, amount: int) -> None:
+                self.status = status
+                self.channel = channel
+                self.amount = amount
+
+        labeler = EqRuleLabeler(
+            [
+                {
+                    "when": {"status": "paid", "channel": "app"},
+                    "label": "app-paid",
+                },
+                {"when": {"status": "paid"}, "label": "paid"},
+            ]
+        )
+
+        self.assertEqual(
+            ("app-paid", "paid"),
+            labeler.match(Order("paid", "app", 100)),
+        )
+        self.assertEqual(("paid",), labeler.match(Order("paid", "web", 100)))
+        self.assertEqual((), labeler.match(Order("cancelled", "app", 100)))
+        self.assertEqual((("app-paid", "paid"), ()), tuple(labeler.match_many([
+            Order("paid", "app", 100),
+            Order("cancelled", "app", 100),
+        ])))
+
+    def test_dict_mode_and_first_match(self) -> None:
+        labeler = EqRuleLabeler(
+            [
+                {"when": {"type": "order"}, "label": "order"},
+                {"when": {"type": "order", "status": "paid"}, "label": "paid-order"},
+            ],
+            record_mode="dict",
+            multi_match=False,
+        )
+
+        self.assertEqual(
+            ("order",),
+            labeler.match({"type": "order", "status": "paid"}),
+        )
+        self.assertEqual((), labeler.match({"status": "paid"}))
+
+    async def test_resource_loader_builds_inline_rule_labeler(self) -> None:
+        registry = build_resource_registry(
+            {
+                "labels": {
+                    "kind": "eq_rule_labeler",
+                    "record_mode": "dict",
+                    "rules": [
+                        {"when": {"status": "paid"}, "label": "paid"},
+                    ],
+                }
+            }
+        )
+        loader = ResourceLoader(registry)
+        await loader.preload()
+
+        labeler = loader.get("labels")
+
+        self.assertIsInstance(labeler, EqRuleLabeler)
+        self.assertEqual(("paid",), labeler.match({"status": "paid"}))
+        self.assertEqual(
+            {
+                "kind": "eq_rule_labeler",
+                "resource_id": "labels",
+                "refresh_policy": "manual",
+                "rules": [{"when": {"status": "paid"}, "label": "paid"}],
+                "record_mode": "dict",
+                "multi_match": True,
+            },
+            registry["labels"].canonical_dict(),
+        )
+
+    async def test_ttl_refresh_reloads_rule_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rules.json"
+            path.write_text(
+                '{"rules": [{"when": {"status": "paid"}, "label": "v1"}]}',
+                encoding="utf-8",
+            )
+            registry = build_resource_registry(
+                {
+                    "labels": {
+                        "kind": "eq_rule_labeler",
+                        "record_mode": "dict",
+                        "path": str(path),
+                        "refresh_policy": {"type": "ttl", "seconds": 60},
+                    }
+                }
+            )
+            loader = ResourceLoader(registry)
+            await loader.preload()
+            self.assertEqual(("v1",), loader.get("labels").match({"status": "paid"}))
+
+            path.write_text(
+                '{"rules": [{"when": {"status": "paid"}, "label": "v2"}]}',
+                encoding="utf-8",
+            )
+            loader._loaded_at["labels"] -= 61
+            refreshed = await loader.refresh_expired(("labels",))
+
+            self.assertEqual({"labels"}, refreshed)
+            self.assertEqual(("v2",), loader.get("labels").match({"status": "paid"}))
 
 
 if __name__ == "__main__":

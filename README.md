@@ -193,6 +193,44 @@ def format_user_dim(rows):
 
 formatter 在资源加载后、进入缓存前执行；TTL 刷新时也会重新执行。
 
+等值规则打标可以直接用内置 `eq_rule_labeler` resource。开发者只写规则，
+框架在加载资源时把规则编译成哈希索引；handler 运行时不会逐条扫描全部规则。
+
+```python
+RESOURCES = {
+    "order-labels-v1": {
+        "kind": "eq_rule_labeler",
+        # msgspec.Struct / 普通对象用 attr；dict 记录用 dict。
+        "record_mode": "attr",
+        # True: 一条记录可返回多个标签；False: 命中第一个后立即返回。
+        "multi_match": True,
+        "rules": [
+            {"when": {"status": "paid"}, "label": "已支付订单"},
+            {"when": {"status": "paid", "channel": "app"}, "label": "APP已支付订单"},
+        ],
+    }
+}
+
+
+def normalize_orders(request, records, resources):
+    labeler = resources["order-labels-v1"]
+    labels_per_record = labeler.match_many(records)
+    ...
+```
+
+规则也可以放在 JSON 文件中，并配合 TTL 低频刷新：
+
+```python
+RESOURCES = {
+    "order-labels-v1": {
+        "kind": "eq_rule_labeler",
+        "record_mode": "attr",
+        "path": "/data/rules/order-labels-v1.json",
+        "refresh_policy": {"type": "ttl", "seconds": 60},
+    }
+}
+```
+
 多源 Kafka 示例：
 
 ```python
@@ -217,7 +255,7 @@ Worker 模块可导出 `HANDLERS` 以及旁路 `SOURCES` / `RESOURCES`（纯配�
 Handler 名字。
 
 - **Source**：增量数据、Dispatcher 追进度（观察 / fetch / checkpoint）。
-- **Resource**：快照旁路依赖；`static` 仅小配置，大维表用 `file`，也可用 `postgres`（全表或 SQL 一次快照）。注册表**合并完成后**由 `ResourceLoader.preload()` 统一加载进 cache；submit 只读 cache。
+- **Resource**：快照旁路依赖；`static` 仅小配置，大维表用 `file`，也可用 `postgres`（全表或 SQL 一次快照）。注册表**合并完成后**由 `ResourceLoader.preload()` 尽力加载进 cache（单个失败不阻断启动，记入 `failed_resources`）；submit 前对 handler 的 `resource_ids` `ensure_available`，仍失败则仅该 handler 提交失败。
 - **output**：可选透传 mapping → `HandlerRequest.output`；框架不解释。目录投放场景下业务依赖宜函数内
   import，写出路径走 `output`。
 - Handler 收到瘦 `HandlerRequest`（`dispatch_id` / `handler_id` / `output`；Actor 首次
