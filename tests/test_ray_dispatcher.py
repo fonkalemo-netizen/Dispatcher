@@ -2077,6 +2077,116 @@ class PostgresEventTimeModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, dispatcher.state.sources["shared:orders:orders"].backlog)
         self.assertEqual(1, len(await dispatcher.ray_trigger()))
 
+    async def test_shared_kafka_window_fetches_once_and_slices_by_handler_parallelism(self) -> None:
+        client = FakeSourceObserver()
+        backend = FakeRayAdapter(cpus=100.0)
+        source = KafkaSource("events", ("broker",), "events", initial_offset="earliest")
+        handler_a = HandlerSpec(
+            "a",
+            object(),
+            (source,),
+            batch_size=(1, 500),
+            max_parallelism=2,
+        )
+        handler_b = HandlerSpec(
+            "b",
+            object(),
+            (source,),
+            batch_size=(1, 1000),
+            max_parallelism=1,
+        )
+        checkpoints = MemoryCheckpointStore()
+        dispatcher = RayDispatcher(
+            (handler_a, handler_b),
+            ray_adapter=backend,
+            checkpoint_store=checkpoints,
+            config=DispatcherConfig(max_in_flight=16),
+        )
+        dispatcher.source_observer = client
+        client.kafka["events"] = {0: (0, 1000)}
+
+        await dispatcher.data_listener()
+        fetch_ids = await dispatcher.ray_trigger()
+
+        self.assertEqual(1, len(fetch_ids))
+        self.assertEqual(1, len(backend.fetch_submissions))
+        fetch_ref = backend.fetch_submissions[0][3]
+        backend.values[fetch_ref] = list(range(1000))
+        backend.finish(fetch_ref)
+
+        await dispatcher.ray_status()
+
+        self.assertEqual(3, len(backend.submissions))
+        slice_refs = []
+        full_refs = []
+        for _worker, _request, ref in backend.submissions:
+            data_ref = backend.data_refs[ref]
+            if str(data_ref).startswith("slice-ref-"):
+                slice_refs.append(backend.data_refs[data_ref])
+            else:
+                full_refs.append(data_ref)
+        self.assertCountEqual(
+            [(fetch_ref, 0, 500), (fetch_ref, 500, 1000)],
+            slice_refs,
+        )
+        self.assertEqual([fetch_ref], full_refs)
+
+        for _worker, _request, ref in backend.submissions:
+            backend.finish(ref, value={"ok": True})
+        await dispatcher.ray_status()
+
+        self.assertEqual(1000, checkpoints.values["shared:events:0"].progress)
+
+    async def test_shared_kafka_parallel_windows_commit_in_order(self) -> None:
+        client = FakeSourceObserver()
+        backend = FakeRayAdapter(cpus=1.25)
+        source = KafkaSource("events", ("broker",), "events", initial_offset="earliest")
+        worker = HandlerSpec(
+            "w",
+            object(),
+            (source,),
+            batch_size=(1, 500),
+            max_parallelism=2,
+        )
+        checkpoints = MemoryCheckpointStore()
+        dispatcher = RayDispatcher(
+            (worker,),
+            ray_adapter=backend,
+            checkpoint_store=checkpoints,
+            config=DispatcherConfig(max_in_flight=16),
+        )
+        dispatcher.source_observer = client
+        client.kafka["events"] = {0: (0, 1000)}
+
+        await dispatcher.data_listener()
+        first_fetch_ids = await dispatcher.ray_trigger()
+        second_fetch_ids = await dispatcher.ray_trigger()
+
+        self.assertEqual(1, len(first_fetch_ids))
+        self.assertEqual(1, len(second_fetch_ids))
+        self.assertEqual(2, len(backend.fetch_submissions))
+        first_fetch_ref = backend.fetch_submissions[0][3]
+        second_fetch_ref = backend.fetch_submissions[1][3]
+        backend.values[first_fetch_ref] = list(range(500))
+        backend.values[second_fetch_ref] = list(range(500, 1000))
+
+        backend.finish(second_fetch_ref)
+        await dispatcher.ray_status()
+        second_handler_ref = backend.submissions[-1][2]
+        backend.finish(second_handler_ref, value={"ok": True})
+        await dispatcher.ray_status()
+        self.assertEqual(0, checkpoints.values["shared:events:0"].progress)
+
+        backend.finish(first_fetch_ref)
+        await dispatcher.ray_status()
+        first_handler_ref = backend.submissions[-1][2]
+        backend.finish(first_handler_ref, value={"ok": True})
+        await dispatcher.ray_status()
+        self.assertEqual(500, checkpoints.values["shared:events:0"].progress)
+
+        await dispatcher.ray_status()
+        self.assertEqual(1000, checkpoints.values["shared:events:0"].progress)
+
     async def test_requires_initial_time_without_checkpoint(self) -> None:
         client = FakeSourceObserver()
         backend = FakeRayAdapter()

@@ -35,7 +35,7 @@ class ResourceSpec:
     query: str | None = None
     table: str | None = None
     rules: Any | None = None
-    record_mode: RuleRecordMode = "attr"
+    record_mode: RuleRecordMode = "dict"
     multi_match: bool = True
     refresh_policy: RefreshPolicy = "manual"
     ttl_seconds: float | None = None
@@ -214,7 +214,7 @@ def resource_from_mapping(raw: Mapping[str, Any]) -> ResourceSpec:
             kind="eq_rule_labeler",
             rules=raw.get("rules", raw.get("data")),
             path=(str(raw["path"]) if raw.get("path") is not None else None),
-            record_mode=str(raw.get("record_mode", "attr")),  # type: ignore[arg-type]
+            record_mode=str(raw.get("record_mode", "dict")),  # type: ignore[arg-type]
             multi_match=bool(raw.get("multi_match", True)),
             refresh_policy=refresh_policy,
             ttl_seconds=ttl_seconds,

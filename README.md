@@ -68,9 +68,9 @@ app/
 Handler 自动共享一次 fetch 与同一个 checkpoint。`entrypoint` 指向函数名；调度 ID 默认为
 `{文件名}:{entrypoint}`（可用 `handler_id` 覆盖）。
 
-**单源**（默认）：按 partition offset 调度；`batch_size` 是触发门槛 + 本批上限区间，
-Dispatcher **不按 batch_size 切多片**（每轮每源最多一波 fetch）。`handler(request, records)` 中
-`records` 为 `list`；若需再分片在 Handler 内自行处理。
+**单源 Kafka**（默认）：按 partition offset 调度；source window 只 fetch 一次，然后按各
+Handler 的 `batch_size` / `max_parallelism` 在内存中切 handler slice。`max_parallelism`
+默认 1；Task Handler 可设大于 1，Actor Handler 第一版固定 1。
 
 `batch_size` 写法：
 
@@ -80,6 +80,10 @@ Dispatcher **不按 batch_size 切多片**（每轮每源最多一波 fetch）�
 | `(None, n)` | `[,n]`：有数据即触发；本批最多 `n`，剩余下轮 |
 | `(n, m)` | `[n,m]`：`backlog >= n`；本批最多 `m` |
 | `0` | 等价 `(0, None)`：有 backlog 就一次吃光 |
+
+`max_parallelism` 是单个 Handler 在单个 source shard/partition/window 内同时运行的 slice
+上限。窗口提交仍按 checkpoint 顺序推进；后一个 window 先完成时会等待前一个 window 成功或
+记录失败后跳过。
 
 **多源**（`sources` 长度 ≥ 2，且必须全是 Kafka）：按 **event-time 时间窗** 对齐。右界来自
 `data_listener` 观察到的各源可对齐水位取 `min`，左界为组级 checkpoint
@@ -193,20 +197,28 @@ def format_user_dim(rows):
 
 formatter 在资源加载后、进入缓存前执行；TTL 刷新时也会重新执行。
 
-等值规则打标可以直接用内置 `eq_rule_labeler` resource。开发者只写规则，
-框架在加载资源时把规则编译成哈希索引；handler 运行时不会逐条扫描全部规则。
+规则打标可以直接用内置 `eq_rule_labeler` resource。开发者只写规则；
+等值部分会在加载资源时编译成哈希索引；如果所有规则都是纯 `contains`，
+会自动切到 contains-only 引擎，按字段归并关键词后匹配。
 
 ```python
 RESOURCES = {
     "order-labels-v1": {
         "kind": "eq_rule_labeler",
-        # msgspec.Struct / 普通对象用 attr；dict 记录用 dict。
-        "record_mode": "attr",
+        # 默认是 dict；内置高吞吐 worker 如果自己用 msgspec.Struct 解码，可改成 attr。
+        "record_mode": "dict",
         # True: 一条记录可返回多个标签；False: 命中第一个后立即返回。
         "multi_match": True,
         "rules": [
             {"when": {"status": "paid"}, "label": "已支付订单"},
             {"when": {"status": "paid", "channel": "app"}, "label": "APP已支付订单"},
+            {"contains": {"remark": "退款"}, "label": "退款关键词"},
+            {"contains": {"a": "t", "b": "g"}, "label": "a含t且b含g"},
+            {
+                "when": {"type": "order"},
+                "contains": {"remark": ["投诉", "破损"]},
+                "label": "订单风险",
+            },
         ],
     }
 }
@@ -224,7 +236,6 @@ def normalize_orders(request, records, resources):
 RESOURCES = {
     "order-labels-v1": {
         "kind": "eq_rule_labeler",
-        "record_mode": "attr",
         "path": "/data/rules/order-labels-v1.json",
         "refresh_policy": {"type": "ttl", "seconds": 60},
     }

@@ -449,7 +449,8 @@ class EqRuleLabelerTests(unittest.IsolatedAsyncioTestCase):
                     "label": "app-paid",
                 },
                 {"when": {"status": "paid"}, "label": "paid"},
-            ]
+            ],
+            record_mode="attr",
         )
 
         self.assertEqual(
@@ -479,12 +480,69 @@ class EqRuleLabelerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual((), labeler.match({"status": "paid"}))
 
+    def test_default_mode_is_dict(self) -> None:
+        labeler = EqRuleLabeler(
+            [{"when": {"status": "paid"}, "label": "paid"}]
+        )
+
+        self.assertEqual(("paid",), labeler.match({"status": "paid"}))
+
+    def test_contains_rules(self) -> None:
+        labeler = EqRuleLabeler(
+            [
+                {"contains": {"remark": "退款"}, "label": "refund-keyword"},
+                {
+                    "when": {"type": "order"},
+                    "contains": {"remark": ["投诉", "破损"]},
+                    "label": "order-risk",
+                },
+            ]
+        )
+
+        self.assertCountEqual(
+            ("refund-keyword", "order-risk"),
+            labeler.match({"type": "order", "remark": "用户投诉退款，商品破损"}),
+        )
+        self.assertEqual(
+            ("refund-keyword",),
+            labeler.match({"type": "refund", "remark": "申请退款"}),
+        )
+        self.assertEqual(
+            (),
+            labeler.match({"type": "order", "remark": "正常签收"}),
+        )
+        self.assertEqual("eq", labeler.engine)
+
+    def test_pure_contains_rules_use_contains_engine(self) -> None:
+        labeler = EqRuleLabeler(
+            [
+                {
+                    "contains": {"a": "t", "b": "g"},
+                    "label": "a-t-and-b-g",
+                },
+                {
+                    "contains": {"a": ["x", "y"], "b": "g"},
+                    "label": "a-x-or-y-and-b-g",
+                },
+            ]
+        )
+
+        self.assertEqual("contains", labeler.engine)
+        self.assertEqual(
+            ("a-t-and-b-g", "a-x-or-y-and-b-g"),
+            labeler.match({"a": "t/y", "b": "g"}),
+        )
+        self.assertEqual(
+            ("a-x-or-y-and-b-g",),
+            labeler.match({"a": "x", "b": "g"}),
+        )
+        self.assertEqual((), labeler.match({"a": "t", "b": "absent"}))
+
     async def test_resource_loader_builds_inline_rule_labeler(self) -> None:
         registry = build_resource_registry(
             {
                 "labels": {
                     "kind": "eq_rule_labeler",
-                    "record_mode": "dict",
                     "rules": [
                         {"when": {"status": "paid"}, "label": "paid"},
                     ],

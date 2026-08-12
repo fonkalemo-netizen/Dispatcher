@@ -178,16 +178,14 @@ retention_gap is None
 5. task 数约束（单源每波最多 1 个 fetch；容量不够则为 0）：
 
 ```text
-wave = 1 if free_slots / (1+N) and CPUs allow else 0
-backlog >= batch_window.min_items
-take = backlog if max_items is None else min(backlog, max_items)
+effective_cpus = ray_available_cpus - scheduler_reserved_cpus - external_baseline_cpus
+window_size = min(backlog, 各 Handler 当前可覆盖能力, 当前 CPU / in-flight 可承载能力)
+handler_capacity = handler.batch_size.slice_size * handler.remaining_parallel_slots
 ```
 
-同 `source_id` 的 Handler 中，一波预留 `1 个 fetch + N 个 Handler` in-flight slot。组内
-`batch_size` 区间取最严：`min_items = max(各 min)`，`max_items = min(各有限 max)`。
-
-`batch_size` 语义：`n` / `(n, None)` → `[n,]`；`(None, n)` → `[,n]`；`(n, m)` → `[n, m]`。
-Dispatcher 不按 batch_size 切多片；需要再分片在 Handler 内处理。
+同 `source_id` 的单源 Kafka Handler 中，一波仍只做 **一次 source window fetch**；fetch 成功后，
+各 Handler 按自己的 `batch_size` / `max_parallelism` 切 handler slice。`max_parallelism`
+默认 1，表示单个 Handler 在单个 source shard/window 内最多并行多少个 slice；Actor 第一版固定 1。
 
 排序之后，`TriggerPolicy`（主系统注入；默认 `HasBacklog → SourceIdle → HasCapacity`；多源另含
 `HasTimeWindow`）评估每个候选，输出 `TRIGGER | DEGRADE | SKIP | BLOCK`，并写入
@@ -213,17 +211,23 @@ task 数 `n`。Handler / HANDLERS 不配置触发策略。
 
 ### Kafka
 
-Kafka 使用半开区间。每轮对每个 source shard 最多提交 **一个** fetch：
-`[committed, committed+take)`（`take` 由 `batch_size` 区间的 max 决定；`None` 则吃到
-observed）。剩余 backlog 进入下一轮。例如 `batch_size=(None, 10)` 且 backlog=25：
+Kafka 使用半开区间。每轮对每个 source shard 提交 source window fetch：
+`[reserved_until, reserved_until+take)`；`reserved_until` 是已经切出去但尚未提交的最右边界，
+避免并行窗口重复消费。窗口内再给各 Handler 切 `records` 下标 slice。
+
+例如 backlog=1000：
 
 ```text
-[100, 125), max=10
--> [100, 110)   # 本波
-# 余 [110, 125) 下轮
+A: batch_size=(1, 500), max_parallelism=2
+B: batch_size=(1, 1000), max_parallelism=1
+
+fetch [0,1000) 一次
+A -> records[0:500], records[500:1000]
+B -> records[0:1000]
 ```
 
-整数 `batch_size=10` 等价 `[10,]`：backlog>=10 后一次取全部，例如 backlog=25 → `[100, 125)`。
+checkpoint 仍按 source window 顺序推进；后一个 window 先完成时只标记完成，等待前面的 window
+成功或永久失败并记录 skip 后再连续推进。
 
 每个 `DispatchRequest`（fetch/merge/内部）主要字段：
 

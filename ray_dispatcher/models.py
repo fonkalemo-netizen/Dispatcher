@@ -262,6 +262,7 @@ class HandlerSpec:
     batch_size: BatchSizeConfig = 10_000
     cpus_per_task: float = 1.0
     max_retries: int = 2
+    max_parallelism: int = 1
     priority: int = 0
     output: Mapping[str, Any] | None = None
     resource_ids: tuple[str, ...] = ()
@@ -274,8 +275,12 @@ class HandlerSpec:
         normalize_batch_size(self.batch_size)
         if self.cpus_per_task <= 0:
             raise ValueError("cpus_per_task must be positive")
+        if self.max_parallelism < 1:
+            raise ValueError("max_parallelism must be >= 1")
         if self.mode is ExecutionMode.ACTOR and not self.remote_method:
             raise ValueError("actor workers require remote_method")
+        if self.mode is ExecutionMode.ACTOR and self.max_parallelism != 1:
+            raise ValueError("actor workers require max_parallelism=1")
         if len(self.sources) < 1:
             raise ValueError("handlers must declare at least one source")
         if len(self.sources) > 1 and any(
@@ -369,6 +374,8 @@ class SourceState:
     last_observed_at: float = field(default_factory=time.monotonic)
     last_scheduled_at: float = field(default_factory=time.monotonic)
     active_batch_id: str | None = None
+    active_batch_ids: set[str] = field(default_factory=set)
+    reserved_until: int | PostgresCursor | datetime | None = None
     retention_gap: str | None = None
     over_capacity: bool = False
 
@@ -414,6 +421,7 @@ class BatchRun:
     group_key: str | None = None
     fetch_source_ids: tuple[str, ...] = ()
     failure_id: str | None = None
+    handler_slice_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass

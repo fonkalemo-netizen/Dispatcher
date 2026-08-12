@@ -274,6 +274,45 @@ class PluginHotReloadTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(record.effective_enabled)
             self.assertFalse(record.reload_pending)
 
+    async def test_uploaded_plugin_kafka_records_decode_to_dicts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            workers = base / "workers"
+            data = base / "data"
+            _write_builtin(workers)
+            store = PluginStore(data)
+            backend = FakeRayAdapter()
+            client = FakeSourceObserver()
+            dispatcher = RayDispatcher(
+                workers,
+                ray_adapter=backend,
+                checkpoint_store=MemoryCheckpointStore(),
+                event_log=create_event_log(default_logging=False),
+                event_log_interval=0,
+                plugin_store=store,
+            )
+            dispatcher.source_observer = client
+            manager = PluginManager(store, dispatcher)
+            plugin_id = "decode_v1"
+            await manager.upload(
+                plugin_id, SAFE_PLUGIN.format(plugin_id=plugin_id).encode("utf-8")
+            )
+            await manager.enable(plugin_id)
+            client.kafka["demo-orders"] = {0: (0, 0)}
+            client.kafka["plugin-events"] = {0: (0, 2)}
+
+            await dispatcher.data_listener()
+            await dispatcher.ray_trigger()
+            fetch_ref = backend.fetch_submissions[-1][3]
+            backend.values[fetch_ref] = [b'{"id": 1}', b'{"id": 2}']
+            backend.finish(fetch_ref)
+            await dispatcher.ray_status()
+
+            self.assertEqual(1, len(backend.submissions))
+            _worker, _request, handler_ref = backend.submissions[0]
+            decoded_ref = backend.data_refs[handler_ref]
+            self.assertEqual([{"id": 1}, {"id": 2}], backend.values[decoded_ref])
+
     async def test_pending_enable_roots_not_in_list_active(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)

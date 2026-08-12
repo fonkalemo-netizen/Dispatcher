@@ -151,7 +151,7 @@ class _PendingBatchDurability:
     """Checkpoint / failure IO prepared under lock, executed outside it."""
 
     batch_id: str
-    action: str  # "commit" | "skip"
+    action: str  # "commit" | "skip" | "skip_abort" | "defer"
     writes: dict[str, Any]
     failure_id: str | None = None
     source_state_key: str = ""
@@ -461,6 +461,7 @@ class RayDispatcher:
                     "batch_size": list(worker.batch_window),
                     "cpus_per_task": worker.cpus_per_task,
                     "max_retries": worker.max_retries,
+                    "max_parallelism": worker.max_parallelism,
                     "priority": worker.priority,
                     "output": None if worker.output is None else dict(worker.output),
                     "resource_ids": list(worker.resource_ids),
@@ -508,7 +509,10 @@ class RayDispatcher:
             batch.status is BatchStatus.RUNNING for batch in self.state.batches.values()
         ):
             return True
-        if any(state.active_batch_id for state in self.state.sources.values()):
+        if any(
+            state.active_batch_id or state.active_batch_ids
+            for state in self.state.sources.values()
+        ):
             return True
         if any(
             window.active_batch_id for window in self.state.multisource_windows.values()
@@ -919,14 +923,14 @@ class RayDispatcher:
                 raise KafkaRetentionGap(f"{item.key}: {message}")
 
             if item.reset_committed is not None:
-                if state.active_batch_id is not None:
+                if state.active_batch_id is not None or state.active_batch_ids:
                     message = item.retention_message or (
                         f"checkpoint {int(state.committed)} is outside watermarks"
                     )
                     state.retention_gap = message
                     raise KafkaRetentionGap(
                         f"{item.key}: {message}; cannot reset while batch "
-                        f"{state.active_batch_id} is active"
+                        f"{state.active_batch_id or sorted(state.active_batch_ids)} is active"
                     )
                 if int(state.committed) < item.low or int(state.committed) > item.high:
                     state.committed = item.reset_committed
@@ -1324,13 +1328,17 @@ class RayDispatcher:
             )
             free_slots = max(0, self.config.max_in_flight - active_global)
             available_cpus = self.ray_adapter.available_cpus()
+            available_cpus = self._effective_available_cpus(available_cpus)
             now = time.monotonic()
             # Coarse prefilter; TriggerPolicy is authoritative.
             candidates = [
                 state
                 for state in self.state.sources.values()
                 if state.backlog > 0
-                and state.active_batch_id is None
+                and (
+                    state.kind is SourceKind.KAFKA
+                    or state.active_batch_id is None
+                )
                 and not state.retention_gap
             ]
             candidates.sort(
@@ -1379,12 +1387,48 @@ class RayDispatcher:
                 # event_time: batch_size is shard size only; backlog>0 is enough.
                 if not event_time and source_state.backlog < min_items:
                     continue
-                n = self._shared_wave_slots(
-                    members,
-                    free_slots,
-                    available_cpus,
-                    handler_slots=handler_slots,
+                is_kafka_source = isinstance(representative.sources[0], KafkaSource)
+                start = self._source_schedule_start(source_state)
+                schedulable_backlog = (
+                    self._source_distance(start, source_state.observed)
+                    if is_kafka_source
+                    else source_state.backlog
                 )
+                if not event_time and schedulable_backlog < min_items:
+                    continue
+                if event_time or not is_kafka_source:
+                    n = self._shared_wave_slots(
+                        members,
+                        free_slots,
+                        available_cpus,
+                        handler_slots=handler_slots,
+                    )
+                    planned_take = None if event_time else max_items
+                    planned_slots = 1 + handler_slots if n else 0
+                    planned_cpus = (
+                        None
+                        if available_cpus is None or not n
+                        else max(
+                            0.0,
+                            available_cpus - self.config.fetch_cpus,
+                        )
+                    )
+                    planned_counts: dict[str, int] = {}
+                else:
+                    (
+                        planned_take,
+                        planned_slots,
+                        planned_cpus,
+                        planned_counts,
+                    ) = self._planned_shared_window_size(
+                        members,
+                        source_state,
+                        backlog=schedulable_backlog,
+                        max_items=None,
+                        free_slots=free_slots,
+                        available_cpus=available_cpus,
+                    )
+                    n = 1 if planned_take else 0
                 if (
                     decision.decision is Decision.DEGRADE
                     and decision.soft_action is SoftAction.THROTTLE
@@ -1396,20 +1440,13 @@ class RayDispatcher:
                 run_ids = await self._create_shared_batch(
                     members,
                     source_state,
-                    max_items=None if event_time else max_items,
+                    max_items=None if event_time else planned_take,
+                    handler_slice_counts=planned_counts,
                 )
                 submitted.extend(run_ids)
-                reserved = (
-                    (1 + handler_slots)
-                    if run_ids
-                    else 0
-                )
+                reserved = planned_slots if run_ids else 0
                 free_slots = max(0, free_slots - reserved)
-                if available_cpus is not None:
-                    available_cpus = max(
-                        0.0,
-                        available_cpus - len(run_ids) * self.config.fetch_cpus,
-                    )
+                available_cpus = planned_cpus
 
             for group_key, window in self.state.multisource_windows.items():
                 if free_slots <= 0:
@@ -1509,6 +1546,15 @@ class RayDispatcher:
         )
         return max(self.config.fetch_cpus, downstream_cpus)
 
+    def _effective_available_cpus(self, available_cpus: float | None) -> float | None:
+        if available_cpus is None:
+            return None
+        reserved = (
+            self.config.scheduler_reserved_cpus
+            + self.config.external_baseline_cpus
+        )
+        return max(0.0, available_cpus - reserved)
+
     @staticmethod
     def _is_postgres_event_time(handler: HandlerSpec) -> bool:
         source = handler.sources[0]
@@ -1548,18 +1594,117 @@ class RayDispatcher:
                 return 0
         return 1
 
+    def _member_active_slices_for_source(
+        self, source_state: SourceState, member: HandlerSpec
+    ) -> int:
+        active = 0
+        for batch_id in source_state.active_batch_ids:
+            batch = self.state.batches.get(batch_id)
+            if batch is None or batch.status is not BatchStatus.RUNNING:
+                continue
+            active += batch.handler_slice_counts.get(member.name, 0)
+        return active
+
+    @staticmethod
+    def _handler_slice_size(member: HandlerSpec, window_size: int | None = None) -> int:
+        min_items, max_items = member.batch_window
+        if max_items is not None:
+            return max(1, int(max_items))
+        if window_size is not None and window_size > 0:
+            return int(window_size)
+        return max(1, int(min_items), 1)
+
+    def _planned_shared_window_size(
+        self,
+        members: tuple[HandlerSpec, ...],
+        source_state: SourceState,
+        *,
+        backlog: int,
+        max_items: int | None,
+        free_slots: int,
+        available_cpus: float | None,
+    ) -> tuple[int, int, float | None, dict[str, int]]:
+        """Return feasible source-window size and planned slice counts."""
+
+        if backlog <= 0 or free_slots <= 1:
+            return 0, 0, available_cpus, {}
+        upper = backlog if max_items is None else min(backlog, max_items)
+        if upper <= 0:
+            return 0, 0, available_cpus, {}
+
+        def feasible(size: int) -> tuple[int, float, dict[str, int]] | None:
+            total_slots = 1
+            total_cpus = self.config.fetch_cpus
+            slice_counts: dict[str, int] = {}
+            for member in members:
+                shard = self._handler_slice_size(member, size)
+                needed = max(1, math.ceil(size / shard))
+                active = self._member_active_slices_for_source(source_state, member)
+                remaining = member.max_parallelism - active
+                if remaining < needed:
+                    return None
+                total_slots += needed
+                if member.mode is ExecutionMode.TASK:
+                    total_cpus += needed * member.cpus_per_task
+                slice_counts[member.name] = needed
+            if total_slots > free_slots:
+                return None
+            if available_cpus is not None and total_cpus > available_cpus:
+                return None
+            return total_slots, total_cpus, slice_counts
+
+        candidates = {upper}
+        for member in members:
+            shard = self._handler_slice_size(member, upper)
+            active = self._member_active_slices_for_source(source_state, member)
+            remaining = max(0, member.max_parallelism - active)
+            for n in range(1, remaining + 1):
+                candidates.add(min(upper, n * shard))
+        for size in sorted(candidates, reverse=True):
+            plan = feasible(size)
+            if plan is None:
+                continue
+            total_slots, total_cpus, slice_counts = plan
+            next_cpus = (
+                None
+                if available_cpus is None
+                else max(0.0, available_cpus - total_cpus)
+            )
+            return size, total_slots, next_cpus, slice_counts
+        return 0, 0, available_cpus, {}
+
+    @staticmethod
+    def _source_schedule_start(
+        source_state: SourceState,
+    ) -> int | PostgresCursor | datetime:
+        return source_state.reserved_until or source_state.committed
+
+    @staticmethod
+    def _source_distance(
+        start: int | PostgresCursor | datetime,
+        end: int | PostgresCursor | datetime,
+    ) -> int:
+        if isinstance(start, int) and isinstance(end, int):
+            return max(0, end - start)
+        return 0
+
     async def _create_shared_batch(
         self,
         members: tuple[HandlerSpec, ...],
         source_state: SourceState,
         *,
         max_items: int | None,
+        handler_slice_counts: dict[str, int] | None = None,
     ) -> list[str]:
         group = source_state.source_id
         representative = members[0]
         source = representative.sources[0]
-        start, observed = source_state.committed, source_state.observed
-        backlog = source_state.backlog
+        start, observed = self._source_schedule_start(source_state), source_state.observed
+        backlog = (
+            self._source_distance(start, observed)
+            if isinstance(source, KafkaSource)
+            else source_state.backlog
+        )
         take = backlog if max_items is None else min(backlog, max_items)
         if take <= 0:
             return []
@@ -1623,9 +1768,12 @@ class RayDispatcher:
             reserved_handler_count=handler_slots,
             window_start=window_start,
             window_end=window_end,
+            handler_slice_counts=dict(handler_slice_counts or {}),
         )
         self.state.batches[batch_id] = batch
         source_state.active_batch_id = batch_id
+        source_state.active_batch_ids.add(batch_id)
+        source_state.reserved_until = end
         source_state.last_scheduled_at = time.monotonic()
 
         for index, (chunk_start, chunk_end, _) in enumerate(ranges):
@@ -2065,9 +2213,11 @@ class RayDispatcher:
                 if not runs or not self._all_terminal(runs):
                     continue
                 if any(run.status is RunStatus.FAILED for run in runs):
-                    pending.append(self._begin_skip_failed_batch(batch))
+                    pending_item = self._begin_skip_failed_batch(batch)
                 else:
-                    pending.append(self._begin_commit_batch(batch))
+                    pending_item = self._begin_commit_batch(batch)
+                if pending_item.action != "defer":
+                    pending.append(pending_item)
 
         for item in pending:
             await self._persist_batch_durability(item)
@@ -2086,23 +2236,18 @@ class RayDispatcher:
             request = fetch_run.request
             for member in members:
                 shard_size = (
-                    handler_shard_size(member.batch_window) if event_time else None
+                    handler_shard_size(member.batch_window)
+                    if event_time
+                    else self._handler_slice_size(member, batch.item_count)
                 )
                 n_shards = (
                     max(1, math.ceil(batch.item_count / shard_size))
-                    if shard_size is not None and batch.item_count > 0
-                    else 1
+                    if batch.item_count > 0
+                    else 0
                 )
-                if batch.item_count == 0:
-                    n_shards = 0
                 for shard_index in range(n_shards):
-                    assert shard_size is not None or n_shards == 1
-                    start_i = shard_index * (shard_size or 0)
-                    end_i = (
-                        min(batch.item_count, start_i + shard_size)
-                        if shard_size is not None
-                        else batch.item_count
-                    )
+                    start_i = shard_index * shard_size
+                    end_i = min(batch.item_count, start_i + shard_size)
                     run_id = self._stable_id(
                         batch.batch_id,
                         member.name,
@@ -2124,7 +2269,10 @@ class RayDispatcher:
                         handler_request = await self._build_handler_request(
                             member, run_id, batch.source_state_key
                         )
-                        if event_time and data_ref is not None:
+                        if (
+                            data_ref is not None
+                            and (start_i != 0 or end_i != batch.item_count)
+                        ):
                             data_ref = self.ray_adapter.submit_slice(
                                 data_ref, start_i, end_i
                             )
@@ -2290,14 +2438,17 @@ class RayDispatcher:
             )
 
         source_state = self.state.sources[batch.source_state_key]
-        if (
-            source_state.active_batch_id != batch.batch_id
-            or source_state.committed != batch.start
-        ):
+        if batch.batch_id not in source_state.active_batch_ids:
             batch.status = BatchStatus.FAILED
             batch.finished_at = time.monotonic()
             raise StaleBatchError(
                 f"refusing stale commit for {batch.batch_id}: source cursor or generation changed"
+            )
+        if source_state.committed != batch.start:
+            return _PendingBatchDurability(
+                batch_id=batch.batch_id,
+                action="defer",
+                writes={},
             )
         writes = self._checkpoint_writes_for_batch(
             batch, progress_key=source_state.key, progress=batch.end
@@ -2384,7 +2535,7 @@ class RayDispatcher:
             )
 
         source_state = self.state.sources[batch.source_state_key]
-        if source_state.active_batch_id != batch.batch_id:
+        if batch.batch_id not in source_state.active_batch_ids:
             batch.status = BatchStatus.FAILED
             batch.finished_at = time.monotonic()
             return _PendingBatchDurability(
@@ -2393,12 +2544,9 @@ class RayDispatcher:
                 writes={},
             )
         if source_state.committed != batch.start:
-            batch.status = BatchStatus.FAILED
-            batch.finished_at = time.monotonic()
-            source_state.active_batch_id = None
             return _PendingBatchDurability(
                 batch_id=batch.batch_id,
-                action="skip_abort",
+                action="defer",
                 writes={},
             )
         batch.status = BatchStatus.SKIPPING
@@ -2417,7 +2565,7 @@ class RayDispatcher:
         )
 
     async def _persist_batch_durability(self, pending: _PendingBatchDurability) -> None:
-        if pending.action == "skip_abort":
+        if pending.action in ("skip_abort", "defer"):
             return
         try:
             if pending.action == "skip":
@@ -2468,7 +2616,7 @@ class RayDispatcher:
         batch = self.state.batches.get(pending.batch_id)
         if batch is None:
             return
-        if pending.action == "skip_abort":
+        if pending.action in ("skip_abort", "defer"):
             return
         if pending.persist_error is not None:
             self.state.loop_errors.append(
@@ -2496,7 +2644,7 @@ class RayDispatcher:
             return
         source_state = self.state.sources[batch.source_state_key]
         if (
-            source_state.active_batch_id != batch.batch_id
+            batch.batch_id not in source_state.active_batch_ids
             or source_state.committed != batch.start
             or batch.status is not BatchStatus.COMMITTING
         ):
@@ -2507,7 +2655,7 @@ class RayDispatcher:
             )
         source_state.committed = batch.end
         source_state.backlog = max(0, source_state.backlog - batch.item_count)
-        source_state.active_batch_id = None
+        self._release_source_batch(source_state, batch)
         elapsed = max(time.monotonic() - batch.started_at, 1e-6)
         measured = batch.item_count / elapsed
         source_state.processing_rate = self._ewma(
@@ -2575,6 +2723,26 @@ class RayDispatcher:
             run.ref = None
             run.data_ref = None
 
+    def _release_source_batch(
+        self, source_state: SourceState, batch: BatchRun
+    ) -> None:
+        source_state.active_batch_ids.discard(batch.batch_id)
+        if source_state.active_batch_id == batch.batch_id:
+            source_state.active_batch_id = (
+                next(iter(source_state.active_batch_ids), None)
+            )
+        if not source_state.active_batch_ids:
+            source_state.active_batch_id = None
+            source_state.reserved_until = source_state.committed
+            return
+        active_batches = [
+            self.state.batches[batch_id]
+            for batch_id in source_state.active_batch_ids
+            if batch_id in self.state.batches
+        ]
+        if active_batches and all(isinstance(item.end, int) for item in active_batches):
+            source_state.reserved_until = max(int(item.end) for item in active_batches)
+
     def _apply_skip_failed_batch(self, batch: BatchRun) -> None:
         """Advance past a poison range after durable skip IO succeeded."""
 
@@ -2583,18 +2751,18 @@ class RayDispatcher:
             return
         source_state = self.state.sources[batch.source_state_key]
         if (
-            source_state.active_batch_id != batch.batch_id
+            batch.batch_id not in source_state.active_batch_ids
             or source_state.committed != batch.start
             or batch.status is not BatchStatus.SKIPPING
         ):
             batch.status = BatchStatus.FAILED
             batch.finished_at = time.monotonic()
-            if source_state.active_batch_id == batch.batch_id:
-                source_state.active_batch_id = None
+            if batch.batch_id in source_state.active_batch_ids:
+                self._release_source_batch(source_state, batch)
             return
         source_state.committed = batch.end
         source_state.backlog = max(0, source_state.backlog - batch.item_count)
-        source_state.active_batch_id = None
+        self._release_source_batch(source_state, batch)
         batch.status = BatchStatus.FAILED
         batch.finished_at = time.monotonic()
         self._release_batch_refs(batch)

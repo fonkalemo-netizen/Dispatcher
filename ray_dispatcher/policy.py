@@ -49,6 +49,8 @@ class DispatcherConfig:
     fetch_cpus: float = 0.25
     fetch_max_retries: int = 2
     max_window_seconds: float = 60.0
+    scheduler_reserved_cpus: float = 0.0
+    external_baseline_cpus: float = 0.0
 
     def __post_init__(self) -> None:
         if self.max_in_flight < 1:
@@ -59,6 +61,10 @@ class DispatcherConfig:
             raise ValueError("fetch_cpus must be positive and fetch_max_retries non-negative")
         if self.max_window_seconds <= 0:
             raise ValueError("max_window_seconds must be positive")
+        if self.scheduler_reserved_cpus < 0 or self.external_baseline_cpus < 0:
+            raise ValueError(
+                "scheduler_reserved_cpus and external_baseline_cpus must be non-negative"
+            )
 
 
 @dataclass(frozen=True)
@@ -171,7 +177,11 @@ class SourceIdle:
             return ConditionResult(
                 self.name, ConditionVerdict.FAIL_SKIP, "no source state"
             )
-        if state.active_batch_id is not None:
+        if (
+            state.kind is not None
+            and state.kind.value != "kafka"
+            and state.active_batch_id is not None
+        ):
             return ConditionResult(
                 self.name,
                 ConditionVerdict.FAIL_SKIP,

@@ -408,6 +408,7 @@ def _mapping_to_spec(
             batch_size=_batch_size_from_config(config.get("batch_size", 10_000)),
             cpus_per_task=float(config.get("cpus_per_task", 1.0)),
             max_retries=int(config.get("max_retries", 2)),
+            max_parallelism=int(config.get("max_parallelism", 1)),
             priority=int(config.get("priority", 0)),
             resource_ids=resource_ids,
             external_kafka_json=(

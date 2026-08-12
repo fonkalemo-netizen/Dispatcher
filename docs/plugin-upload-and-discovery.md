@@ -357,13 +357,17 @@ ResourceLoader 缓存前执行；TTL 刷新时也会再次执行。这样 handle
 RESOURCES = {
     "order-labels-v1": {
         "kind": "eq_rule_labeler",
-        # 插件 Kafka 默认会把 JSON records 交给 handler，所以通常用 dict。
-        # 内置高吞吐 worker 如果自己用 msgspec.Struct 解码，则用 attr。
-        "record_mode": "dict",
+        # 插件 Kafka 默认会把 JSON records 解码为 list[dict]；record_mode 默认就是 dict。
         "multi_match": True,
         "rules": [
             {"when": {"status": "paid"}, "label": "已支付订单"},
             {"when": {"status": "paid", "channel": "app"}, "label": "APP已支付订单"},
+            {"contains": {"remark": "退款"}, "label": "退款关键词"},
+            {
+                "when": {"type": "order"},
+                "contains": {"remark": ["投诉", "破损"]},
+                "label": "订单风险",
+            },
         ],
     }
 }
@@ -377,9 +381,11 @@ def filter_orders(request, records, resources):
             ...
 ```
 
-`eq_rule_labeler` 第一版只支持字段等于，不支持表达式、正则、范围、函数调用。
-规则会在资源加载时编译成哈希索引，运行时按字段组合查表，适合高吞吐场景。
-规则文件也可以走 `path` + `refresh_policy={"type": "ttl", "seconds": 60}`。
+`eq_rule_labeler` 支持字段等于和关键词 `contains`，不支持表达式、正则、范围、
+函数调用。等值规则会在资源加载时编译成哈希索引；如果所有规则都是纯 `contains`，
+会自动切到 contains-only 引擎，按字段归并关键词后匹配。关键词数量特别大时，
+后续仍可独立做 AC 自动机型 resource。规则文件也可以走 `path` +
+`refresh_policy={"type": "ttl", "seconds": 60}`。
 
 `handler_id` 规则：
 
